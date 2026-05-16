@@ -3,7 +3,6 @@ const config = @import("config.zig");
 const doctor = @import("doctor.zig");
 const errors = @import("errors.zig");
 const glossary = @import("glossary.zig");
-const input = @import("input.zig");
 const lang = @import("lang.zig");
 const llama = @import("llama.zig");
 const memory = @import("memory.zig");
@@ -160,7 +159,7 @@ fn runTranslate(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []
         }
     }
     const cfg = try config.load(allocator, paths.config_file);
-    const kind = if (opts.file_path) |p| if (input.isMarkdown(p)) input.Kind.markdown else input.Kind.text else input.Kind.text;
+    const kind = translate.readKindForOptions(opts.format, opts.file_path);
     const res = try translate.run(allocator, cfg, paths.memory_file, paths.glossary_file, opts);
     if (try translate.writeFileIfNeeded(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;
     const fmt = opts.format orelse if (kind == .markdown) config.OutputFormat.markdown else cfg.default_output;

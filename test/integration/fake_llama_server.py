@@ -26,6 +26,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         prompt = payload.get("messages", [{}])[-1].get("content", "")
         text = prompt.split("Text:\n", 1)[-1]
+        text = text.replace("`kotoba translate`", "`translated command`")
         body = json.dumps({"choices": [{"message": {"content": "JA:" + text}}]}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")

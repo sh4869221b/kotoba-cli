@@ -36,7 +36,9 @@ pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
                 .{ r.source_lang.asText(), r.target_lang.asText(), r.mode.asText() },
             );
             try appendJsonString(&out, r.model_id);
-            try appendFmt(&out, ",\"runtime\":\"{s}\",\"server_url\":", .{r.runtime});
+            try out.appendSlice(",\"runtime\":");
+            try appendJsonString(&out, r.runtime);
+            try out.appendSlice(",\"server_url\":");
             try appendJsonString(&out, r.server_url);
             try appendFmt(&out, ",\"cached\":{},\"cache_status\":\"{s}\",\"cached_segments\":{d},\"total_segments\":{d},\"translated_text\":", .{ r.cached_segments == r.total_segments, cacheStatus(r), r.cached_segments, r.total_segments });
             try appendJsonString(&out, r.translated_text);

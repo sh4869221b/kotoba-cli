@@ -31,15 +31,14 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []
     const start = sys.millis();
     try llama.validateLocalServerUrl(cfg.server_url, opts.allow_remote_server);
     const read_result = try input.read(allocator, opts.text, opts.file_path);
+    const read_kind = readKindForOptions(opts.format, opts.file_path);
     const g = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, glossary_path) else glossary.Glossary{ .terms = &.{} };
     const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, read_result.text);
     const mode = opts.mode orelse cfg.default_mode;
-    const fmt = opts.format orelse if (read_result.kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
-    _ = fmt;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
 
     var protected_doc: ?markdown.Document = null;
-    const source_for_segments = if (read_result.kind == .markdown) blk: {
+    const source_for_segments = if (read_kind == .markdown) blk: {
         protected_doc = try markdown.protect(allocator, read_result.text);
         break :blk protected_doc.?.text;
     } else read_result.text;
@@ -104,6 +103,16 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []
     };
 }
 
+pub fn readKindForOptions(format: ?config.OutputFormat, file_path: ?[]const u8) input.Kind {
+    if (format) |fmt| {
+        if (fmt == .markdown) return .markdown;
+    }
+    if (file_path) |p| {
+        if (input.isMarkdown(p)) return .markdown;
+    }
+    return .text;
+}
+
 pub fn writeFileIfNeeded(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
     const target_path = explicit_output orelse if (read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else return false;
     if (!overwrite) {
@@ -111,4 +120,11 @@ pub fn writeFileIfNeeded(allocator: std.mem.Allocator, res: output.Result, read_
     }
     try sys.writeFile(target_path, res.translated_text);
     return true;
+}
+
+test "explicit markdown format controls read kind" {
+    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.markdown, null));
+    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.markdown, "notes.txt"));
+    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(null, "notes.md"));
+    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.plain, "notes.md"));
 }

@@ -40,24 +40,19 @@ pub fn healthCheck(allocator: std.mem.Allocator, server_url: []const u8, timeout
 
 pub fn translateSegment(allocator: std.mem.Allocator, req: Request) ![]const u8 {
     try validateLocalServerUrl(req.server_url, req.allow_remote_server);
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"model\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":",
-        .{req.model_id},
-    );
-    defer allocator.free(body);
     var json = std.array_list.Managed(u8).init(allocator);
     defer json.deinit();
-    try json.appendSlice(body);
-    try appendJsonString(allocator, &json, req.prompt);
+    try json.appendSlice("{\"model\":");
+    try appendJsonString(&json, req.model_id);
+    try json.appendSlice(",\"messages\":[{\"role\":\"user\",\"content\":");
+    try appendJsonString(&json, req.prompt);
     try json.appendSlice("}],\"temperature\":0.2}");
     const response = request(allocator, "POST", req.server_url, "/v1/chat/completions", json.items) catch return errors.Error.ServerUnreachable;
     defer allocator.free(response);
     return parseCompletion(allocator, response);
 }
 
-fn appendJsonString(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), text: []const u8) !void {
-    _ = allocator;
+fn appendJsonString(out: *std.array_list.Managed(u8), text: []const u8) !void {
     try out.append('"');
     for (text) |ch| {
         switch (ch) {
@@ -227,4 +222,11 @@ test "parse completion" {
     const out = try parseCompletion(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"こんにちは世界\"}}]}");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("こんにちは世界", out);
+}
+
+test "json string escaping" {
+    var out = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer out.deinit();
+    try appendJsonString(&out, "model\"id\\name\n");
+    try std.testing.expectEqualStrings("\"model\\\"id\\\\name\\n\"", out.items);
 }

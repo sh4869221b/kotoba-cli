@@ -34,6 +34,9 @@ direct="$("${ROOT}/zig-out/bin/kotoba" translate "Hello" --to ja)"
 stdin_out="$(printf 'Hello from stdin' | "${ROOT}/zig-out/bin/kotoba" translate --to ja --no-memory)"
 [[ "${stdin_out}" == "JA:Hello from stdin" ]]
 
+stdin_md="$(printf 'Use `kotoba translate`.' | "${ROOT}/zig-out/bin/kotoba" translate --to ja --format markdown --no-memory)"
+[[ "${stdin_md}" == 'JA:Use `kotoba translate`.' ]]
+
 printf 'Hello file' >"${TMP}/input.txt"
 txt_out="$("${ROOT}/zig-out/bin/kotoba" translate --file "${TMP}/input.txt" --to ja --format plain)"
 [[ "${txt_out}" == "JA:Hello file" ]]
