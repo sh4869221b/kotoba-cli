@@ -1,0 +1,114 @@
+const std = @import("std");
+const config = @import("config.zig");
+const errors = @import("errors.zig");
+const glossary = @import("glossary.zig");
+const input = @import("input.zig");
+const lang = @import("lang.zig");
+const llama = @import("llama.zig");
+const markdown = @import("markdown.zig");
+const memory = @import("memory.zig");
+const output = @import("output.zig");
+const prompt = @import("prompt.zig");
+const segment = @import("segment.zig");
+const sys = @import("sys.zig");
+
+pub const Options = struct {
+    text: ?[]const u8 = null,
+    file_path: ?[]const u8 = null,
+    source_lang: ?lang.Language = null,
+    target_lang: ?lang.Language = null,
+    mode: ?config.Mode = null,
+    format: ?config.OutputFormat = null,
+    include_source: bool = false,
+    output_path: ?[]const u8 = null,
+    overwrite: bool = false,
+    no_memory: bool = false,
+    no_glossary: bool = false,
+    allow_remote_server: bool = false,
+};
+
+pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []const u8, glossary_path: []const u8, opts: Options) !output.Result {
+    const start = sys.millis();
+    try llama.validateLocalServerUrl(cfg.server_url, opts.allow_remote_server);
+    const read_result = try input.read(allocator, opts.text, opts.file_path);
+    const g = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, glossary_path) else glossary.Glossary{ .terms = &.{} };
+    const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, read_result.text);
+    const mode = opts.mode orelse cfg.default_mode;
+    const fmt = opts.format orelse if (read_result.kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
+    _ = fmt;
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
+
+    var protected_doc: ?markdown.Document = null;
+    const source_for_segments = if (read_result.kind == .markdown) blk: {
+        protected_doc = try markdown.protect(allocator, read_result.text);
+        break :blk protected_doc.?.text;
+    } else read_result.text;
+
+    const segments = try segment.splitParagraphs(allocator, source_for_segments);
+    var db_opt: ?memory.Db = null;
+    if (cfg.memory_enabled and !opts.no_memory) {
+        db_opt = memory.open(allocator, xdg_memory_path) catch null;
+    }
+    defer if (db_opt) |*db| db.close();
+
+    var translated = std.array_list.Managed(u8).init(allocator);
+    var cached_segments: usize = 0;
+    const gh = glossary.hash(g);
+    for (segments) |seg| {
+        if (!seg.translatable) {
+            try translated.appendSlice(seg.text);
+            continue;
+        }
+        const key = memory.Key{ .source_text = seg.text, .source_lang = pair.source, .target_lang = pair.target, .mode = mode, .model_id = cfg.model_id, .glossary_hash = gh };
+        if (db_opt) |*db| {
+            if (try db.lookup(key)) |hit| {
+                defer allocator.free(hit.translated_text);
+                cached_segments += 1;
+                try translated.appendSlice(hit.translated_text);
+                continue;
+            }
+        }
+        const built_prompt = try prompt.build(allocator, pair.source, pair.target, mode, g, seg.text);
+        defer allocator.free(built_prompt);
+        const out = try llama.translateSegment(allocator, .{
+            .server_url = cfg.server_url,
+            .model_id = cfg.model_id,
+            .prompt = built_prompt,
+            .timeout_sec = cfg.timeout_sec,
+            .allow_remote_server = opts.allow_remote_server,
+        });
+        defer allocator.free(out);
+        if (db_opt) |*db| try db.upsert(key, out);
+        try translated.appendSlice(out);
+    }
+    var final_text = try translated.toOwnedSlice();
+    if (protected_doc) |doc| {
+        const restored = try markdown.restore(allocator, final_text, doc.protected, &warnings);
+        allocator.free(final_text);
+        final_text = restored;
+    }
+    const elapsed: u64 = sys.millis() - start;
+    return .{
+        .source_lang = pair.source,
+        .target_lang = pair.target,
+        .mode = mode,
+        .model_id = cfg.model_id,
+        .runtime = cfg.runtime,
+        .server_url = cfg.server_url,
+        .cached_segments = cached_segments,
+        .total_segments = segments.len,
+        .translated_text = final_text,
+        .warnings = try warnings.toOwnedSlice(),
+        .elapsed_ms = elapsed,
+        .source_text = read_result.text,
+    };
+}
+
+pub fn writeFileIfNeeded(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
+    const target_path = explicit_output orelse if (read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else return false;
+    if (!overwrite) {
+        if (sys.exists(target_path)) return errors.Error.OutputExists;
+    }
+    try sys.writeFile(target_path, res.translated_text);
+    return true;
+}

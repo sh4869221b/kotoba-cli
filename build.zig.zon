@@ -1,0 +1,7 @@
+.{
+    .name = .kotoba_cli,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0xd9041d94d6429767,
+}
