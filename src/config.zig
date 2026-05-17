@@ -52,6 +52,9 @@ pub const Config = struct {
     model_path: []const u8 = "",
     runtime: []const u8 = "llama_server",
     server_url: []const u8 = "http://127.0.0.1:8080",
+    server_autostart: bool = true,
+    llama_server_path: []const u8 = "llama-server",
+    server_startup_timeout_sec: u32 = 60,
     timeout_sec: u32 = 120,
     memory_enabled: bool = true,
     glossary_enabled: bool = true,
@@ -91,6 +94,12 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Config {
             cfg.runtime = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, p.key, "server_url")) {
             cfg.server_url = try allocator.dupe(u8, val);
+        } else if (std.mem.eql(u8, p.key, "server_autostart")) {
+            cfg.server_autostart = toml.boolValue(p.value) orelse return errors.Error.ConfigInvalid;
+        } else if (std.mem.eql(u8, p.key, "llama_server_path")) {
+            cfg.llama_server_path = try allocator.dupe(u8, val);
+        } else if (std.mem.eql(u8, p.key, "server_startup_timeout_sec")) {
+            cfg.server_startup_timeout_sec = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
         } else if (std.mem.eql(u8, p.key, "timeout_sec")) {
             cfg.timeout_sec = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
         } else if (std.mem.eql(u8, p.key, "memory_enabled")) {
@@ -116,6 +125,9 @@ pub fn save(path: []const u8, cfg: Config) !void {
         \\model_path = "{s}"
         \\runtime = "{s}"
         \\server_url = "{s}"
+        \\server_autostart = {}
+        \\llama_server_path = "{s}"
+        \\server_startup_timeout_sec = {d}
         \\timeout_sec = {d}
         \\memory_enabled = {}
         \\glossary_enabled = {}
@@ -131,6 +143,9 @@ pub fn save(path: []const u8, cfg: Config) !void {
         cfg.model_path,
         cfg.runtime,
         cfg.server_url,
+        cfg.server_autostart,
+        cfg.llama_server_path,
+        cfg.server_startup_timeout_sec,
         cfg.timeout_sec,
         cfg.memory_enabled,
         cfg.glossary_enabled,
@@ -142,7 +157,13 @@ pub fn save(path: []const u8, cfg: Config) !void {
 }
 
 pub fn setValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, value: []const u8) !void {
-    if (std.mem.eql(u8, key, "server_url")) cfg.server_url = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_id")) cfg.model_id = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_path")) cfg.model_path = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "memory_enabled")) cfg.memory_enabled = std.mem.eql(u8, value, "true") else if (std.mem.eql(u8, key, "glossary_enabled")) cfg.glossary_enabled = std.mem.eql(u8, value, "true") else if (std.mem.eql(u8, key, "default_source_lang")) cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_target_lang")) cfg.default_target_lang = try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_mode")) cfg.default_mode = try Mode.parse(value) else if (std.mem.eql(u8, key, "default_output")) cfg.default_output = try OutputFormat.parse(value) else if (std.mem.eql(u8, key, "timeout_sec")) cfg.timeout_sec = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "privacy_mode")) cfg.privacy_mode = std.mem.eql(u8, value, "true") else if (std.mem.eql(u8, key, "log_level")) cfg.log_level = try allocator.dupe(u8, value) else return errors.Error.InvalidArguments;
+    if (std.mem.eql(u8, key, "server_url")) cfg.server_url = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_id")) cfg.model_id = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_path")) cfg.model_path = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "runtime")) cfg.runtime = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "server_autostart")) cfg.server_autostart = try parseBool(value) else if (std.mem.eql(u8, key, "llama_server_path")) cfg.llama_server_path = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "server_startup_timeout_sec")) cfg.server_startup_timeout_sec = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "memory_enabled")) cfg.memory_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "glossary_enabled")) cfg.glossary_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "default_source_lang")) cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_target_lang")) cfg.default_target_lang = try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_mode")) cfg.default_mode = try Mode.parse(value) else if (std.mem.eql(u8, key, "default_output")) cfg.default_output = try OutputFormat.parse(value) else if (std.mem.eql(u8, key, "timeout_sec")) cfg.timeout_sec = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "privacy_mode")) cfg.privacy_mode = try parseBool(value) else if (std.mem.eql(u8, key, "log_level")) cfg.log_level = try allocator.dupe(u8, value) else return errors.Error.InvalidArguments;
+}
+
+fn parseBool(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return errors.Error.InvalidArguments;
 }
 
 test "config round trip parse" {
@@ -150,7 +171,14 @@ test "config round trip parse" {
         \\default_source_lang = ""
         \\default_target_lang = "ja"
         \\memory_enabled = true
+        \\server_autostart = false
+        \\llama_server_path = "/tmp/fake-llama-server"
+        \\server_startup_timeout_sec = 3
     );
+    defer std.testing.allocator.free(cfg.llama_server_path);
     try std.testing.expectEqual(lang.Language.ja, cfg.default_target_lang);
     try std.testing.expect(cfg.memory_enabled);
+    try std.testing.expect(!cfg.server_autostart);
+    try std.testing.expectEqualStrings("/tmp/fake-llama-server", cfg.llama_server_path);
+    try std.testing.expectEqual(@as(u32, 3), cfg.server_startup_timeout_sec);
 }

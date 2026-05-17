@@ -142,6 +142,12 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
     return db;
 }
 
+pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) !Db {
+    var handle: ?*c.sqlite3 = null;
+    if (c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READONLY, null) != c.SQLITE_OK) return errors.Error.SqliteFailed;
+    return .{ .handle = handle.?, .allocator = allocator };
+}
+
 pub fn sourceHash(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     return @import("sys.zig").hexSha256(allocator, text);
 }

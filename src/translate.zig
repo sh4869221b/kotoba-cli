@@ -9,8 +9,10 @@ const markdown = @import("markdown.zig");
 const memory = @import("memory.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
+const runtime = @import("runtime.zig");
 const segment = @import("segment.zig");
 const sys = @import("sys.zig");
+const xdg = @import("xdg.zig");
 
 pub const Options = struct {
     text: ?[]const u8 = null,
@@ -27,13 +29,13 @@ pub const Options = struct {
     allow_remote_server: bool = false,
 };
 
-pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []const u8, glossary_path: []const u8, opts: Options) !output.Result {
+pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: config.Config, opts: Options) !output.Result {
     const start = sys.millis();
-    try llama.validateLocalServerUrl(cfg.server_url, opts.allow_remote_server);
     const read_result = try input.read(allocator, opts.text, opts.file_path);
     const read_kind = readKindForOptions(opts.format, opts.file_path);
-    const g = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, glossary_path) else glossary.Glossary{ .terms = &.{} };
+    const g = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else glossary.Glossary{ .terms = &.{} };
     const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, read_result.text);
+    try llama.validateLocalServerUrl(cfg.server_url, opts.allow_remote_server);
     const mode = opts.mode orelse cfg.default_mode;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
 
@@ -46,13 +48,15 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []
     const segments = try segment.splitParagraphs(allocator, source_for_segments);
     var db_opt: ?memory.Db = null;
     if (cfg.memory_enabled and !opts.no_memory) {
-        db_opt = memory.open(allocator, xdg_memory_path) catch null;
+        db_opt = memory.open(allocator, paths.memory_file) catch null;
     }
     defer if (db_opt) |*db| db.close();
 
     var translated = std.array_list.Managed(u8).init(allocator);
     var cached_segments: usize = 0;
     const gh = glossary.hash(g);
+    var managed_server: ?runtime.ManagedServer = null;
+    defer if (managed_server) |*server| server.close();
     for (segments) |seg| {
         if (!seg.translatable) {
             try translated.appendSlice(seg.text);
@@ -69,6 +73,9 @@ pub fn run(allocator: std.mem.Allocator, cfg: config.Config, xdg_memory_path: []
         }
         const built_prompt = try prompt.build(allocator, pair.source, pair.target, mode, g, seg.text);
         defer allocator.free(built_prompt);
+        if (managed_server == null) {
+            managed_server = try runtime.ensureServer(allocator, paths, cfg, opts.allow_remote_server);
+        }
         const out = try llama.translateSegment(allocator, .{
             .server_url = cfg.server_url,
             .model_id = cfg.model_id,
