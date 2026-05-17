@@ -2,18 +2,20 @@
 
 Kotoba CLI is a local-first translation CLI written in Zig.
 
-`kotoba` talks to a user-managed llama.cpp-compatible server. It does not bundle
-or auto-start the runtime in v1.0.
+`kotoba` talks to a local llama.cpp-compatible server. By default it reuses an
+already-running loopback server, or starts `llama-server` for the current command
+when `runtime = "llama_server"`, `server_autostart = true`, `server_url` is a
+root loopback URL, `llama-server` is available on `PATH`, and `model_path`
+points to a model.
 
 ```bash
-llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080
 kotoba init --model-id custom --model-path /path/to/model.gguf --yes
 kotoba translate "Hello world" --to ja
 ```
 
 Translation requests are local-loopback only by default. Use
 `--allow-remote-server` only when you explicitly accept sending text to a
-non-local endpoint.
+non-local endpoint. Remote endpoints are never auto-started.
 
 JSON output omits source text unless `--include-source` is specified. Translation
 memory stores source and translated text unless memory is disabled.
@@ -30,6 +32,7 @@ kotoba models list
 kotoba memory status
 kotoba glossary validate
 kotoba config get server_url
+kotoba config set llama_server_path /path/to/llama-server
 ```
 
 Markdown translation protects code spans, code fences, URLs, frontmatter, and
@@ -42,3 +45,10 @@ Configuration follows XDG paths:
 - `~/.config/kotoba/models.toml`
 - `~/.config/kotoba/glossary.toml`
 - `~/.local/share/kotoba/memory.sqlite3`
+
+Runtime-related config keys:
+
+- `runtime = "llama_server"`
+- `server_autostart = true`
+- `llama_server_path = "llama-server"`
+- `server_startup_timeout_sec = 60`

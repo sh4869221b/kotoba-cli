@@ -7,7 +7,8 @@ translation only.
 ## Goals
 
 - Translate direct text, stdin, text files, and Markdown files.
-- Use a user-managed llama.cpp-compatible server.
+- Use a local llama.cpp-compatible server, with command-scoped autostart for the
+  standard `llama_server` runtime.
 - Keep translation-time requests local by default.
 - Preserve Markdown structure conservatively.
 - Reuse translations through SQLite translation memory.
@@ -15,7 +16,8 @@ translation only.
 
 ## Non-Goals
 
-- Bundling or auto-starting llama.cpp.
+- Bundling, installing, or managing llama.cpp beyond a command-scoped child
+  process.
 - Cloud translation APIs or cloud LLM backends.
 - GUI, OCR, audio, subtitle-specific optimization, or batch directory
   translation.
@@ -50,7 +52,7 @@ Kotoba follows XDG directories:
 
 ## Translation Flow
 
-1. Read config and validate the server endpoint.
+1. Read config and ensure the configured server is usable.
 2. Read direct text, stdin, or file input.
 3. Protect Markdown elements when translating Markdown.
 4. Split input into translatable segments.
@@ -64,3 +66,18 @@ Kotoba follows XDG directories:
 Kotoba protects code fences, inline code, URLs, frontmatter, HTML-like tags, and
 Markdown table lines. Tables are restored unchanged in v1 to avoid corrupting
 cell separators, escapes, links, and inline code.
+
+## Runtime Autostart
+
+For loopback root endpoints, Kotoba first checks `/health`. If no server is
+reachable and `server_autostart = true`, `runtime = "llama_server"`, and
+`model_path` exists, Kotoba resolves `llama_server_path` (default:
+`llama-server` on `PATH`) and starts:
+
+```text
+llama-server -m <model_path> --host <host> --port <port>
+```
+
+The process is owned by the current command and is terminated during cleanup.
+Remote endpoints and loopback URLs with a base path are treated as user-managed
+servers and are not auto-started.

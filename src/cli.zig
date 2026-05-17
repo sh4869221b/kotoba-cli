@@ -8,6 +8,7 @@ const llama = @import("llama.zig");
 const memory = @import("memory.zig");
 const models = @import("models.zig");
 const output = @import("output.zig");
+const runtime = @import("runtime.zig");
 const sys = @import("sys.zig");
 const translate = @import("translate.zig");
 const xdg = @import("xdg.zig");
@@ -86,14 +87,22 @@ fn runInit(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []const
     if (models.find(list, model_id)) |m| {
         try models.acquire(allocator, m, model_path, skip_download);
     }
-    var cfg = config.default();
+    var cfg = config.load(allocator, paths.config_file) catch config.default();
     cfg.server_url = server_url;
     cfg.model_id = model_id;
     cfg.model_path = model_path;
     try config.save(paths.config_file, cfg);
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
-    llama.validateLocalServerUrl(server_url, allow_remote) catch |err| return err;
+    var managed_server = runtime.ensureServer(allocator, paths, cfg, allow_remote) catch |err| switch (err) {
+        errors.Error.ServerNotLocal => return err,
+        errors.Error.Interrupted => return err,
+        else => {
+            sys.stderrPrint("warning: llama-server could not be started automatically ({s}). Run `kotoba doctor`.\n", .{@errorName(err)});
+            return 0;
+        },
+    };
+    defer managed_server.close();
     _ = llama.healthCheck(allocator, server_url, cfg.timeout_sec, allow_remote) catch {
         sys.stderrPrint("warning: server is not reachable at {s}. Start llama-server and run `kotoba doctor`.\n", .{server_url});
         return 0;
@@ -160,7 +169,7 @@ fn runTranslate(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []
     }
     const cfg = try config.load(allocator, paths.config_file);
     const kind = translate.readKindForOptions(opts.format, opts.file_path);
-    const res = try translate.run(allocator, cfg, paths.memory_file, paths.glossary_file, opts);
+    const res = try translate.run(allocator, paths, cfg, opts);
     if (try translate.writeFileIfNeeded(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;
     const fmt = opts.format orelse if (kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
     try output.write(fmt, res, opts.include_source);
@@ -191,7 +200,7 @@ fn runConfig(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []con
 }
 
 fn printConfigValue(cfg: config.Config, key: []const u8) !void {
-    if (std.mem.eql(u8, key, "server_url")) sys.stdoutPrint("{s}\n", .{cfg.server_url}) else if (std.mem.eql(u8, key, "model_id")) sys.stdoutPrint("{s}\n", .{cfg.model_id}) else if (std.mem.eql(u8, key, "model_path")) sys.stdoutPrint("{s}\n", .{cfg.model_path}) else if (std.mem.eql(u8, key, "default_target_lang")) sys.stdoutPrint("{s}\n", .{cfg.default_target_lang.asText()}) else if (std.mem.eql(u8, key, "default_source_lang")) sys.stdoutPrint("{s}\n", .{if (cfg.default_source_lang) |l| l.asText() else ""}) else if (std.mem.eql(u8, key, "memory_enabled")) sys.stdoutPrint("{}\n", .{cfg.memory_enabled}) else if (std.mem.eql(u8, key, "glossary_enabled")) sys.stdoutPrint("{}\n", .{cfg.glossary_enabled}) else if (std.mem.eql(u8, key, "privacy_mode")) sys.stdoutPrint("{}\n", .{cfg.privacy_mode}) else return errors.Error.InvalidArguments;
+    if (std.mem.eql(u8, key, "server_url")) sys.stdoutPrint("{s}\n", .{cfg.server_url}) else if (std.mem.eql(u8, key, "model_id")) sys.stdoutPrint("{s}\n", .{cfg.model_id}) else if (std.mem.eql(u8, key, "model_path")) sys.stdoutPrint("{s}\n", .{cfg.model_path}) else if (std.mem.eql(u8, key, "runtime")) sys.stdoutPrint("{s}\n", .{cfg.runtime}) else if (std.mem.eql(u8, key, "server_autostart")) sys.stdoutPrint("{}\n", .{cfg.server_autostart}) else if (std.mem.eql(u8, key, "llama_server_path")) sys.stdoutPrint("{s}\n", .{cfg.llama_server_path}) else if (std.mem.eql(u8, key, "server_startup_timeout_sec")) sys.stdoutPrint("{d}\n", .{cfg.server_startup_timeout_sec}) else if (std.mem.eql(u8, key, "default_target_lang")) sys.stdoutPrint("{s}\n", .{cfg.default_target_lang.asText()}) else if (std.mem.eql(u8, key, "default_source_lang")) sys.stdoutPrint("{s}\n", .{if (cfg.default_source_lang) |l| l.asText() else ""}) else if (std.mem.eql(u8, key, "memory_enabled")) sys.stdoutPrint("{}\n", .{cfg.memory_enabled}) else if (std.mem.eql(u8, key, "glossary_enabled")) sys.stdoutPrint("{}\n", .{cfg.glossary_enabled}) else if (std.mem.eql(u8, key, "privacy_mode")) sys.stdoutPrint("{}\n", .{cfg.privacy_mode}) else return errors.Error.InvalidArguments;
 }
 
 fn runModels(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []const u8) !u8 {

@@ -13,6 +13,7 @@ const memory = @import("memory.zig");
 const models = @import("models.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
+const runtime = @import("runtime.zig");
 const translate = @import("translate.zig");
 const xdg = @import("xdg.zig");
 const sys = @import("sys.zig");
@@ -47,6 +48,7 @@ test {
     std.testing.refAllDecls(models);
     std.testing.refAllDecls(output);
     std.testing.refAllDecls(prompt);
+    std.testing.refAllDecls(runtime);
     std.testing.refAllDecls(translate);
     std.testing.refAllDecls(xdg);
     std.testing.refAllDecls(sys);
