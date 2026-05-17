@@ -225,7 +225,9 @@ fn waitFd(fd: c_int, events: c_short, deadline: *RequestDeadline) !void {
     if (rc == 0) return errors.Error.Timeout;
     if (rc < 0 and std.c.errno(-1) == .INTR) return errors.Error.Interrupted;
     if (rc < 0) return errors.Error.ServerUnreachable;
-    if ((pfd.revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL)) != 0) return errors.Error.ServerUnreachable;
+    if ((pfd.revents & (c.POLLERR | c.POLLNVAL)) != 0) return errors.Error.ServerUnreachable;
+    if ((pfd.revents & c.POLLHUP) != 0 and (pfd.revents & events) == 0) return errors.Error.ServerUnreachable;
+    if ((pfd.revents & events) == 0) return errors.Error.ServerUnreachable;
 }
 
 fn connectWithTimeout(fd: c_int, addr: [*c]const c.sockaddr, len: c.socklen_t, deadline: *RequestDeadline) !void {
