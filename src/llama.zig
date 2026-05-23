@@ -1,385 +1,215 @@
 const std = @import("std");
+const backend = @import("backend.zig");
 const errors = @import("errors.zig");
+const sys = @import("sys.zig");
+
 const c = @cImport({
-    @cInclude("arpa/inet.h");
-    @cInclude("errno.h");
-    @cInclude("fcntl.h");
-    @cInclude("netinet/in.h");
-    @cInclude("poll.h");
-    @cInclude("sys/socket.h");
-    @cInclude("time.h");
-    @cInclude("unistd.h");
+    @cInclude("llama.h");
 });
 
-pub const HealthStatus = enum { ok };
-
-pub const Request = struct {
-    server_url: []const u8,
+pub const Options = struct {
+    model_path: []const u8,
     model_id: []const u8,
-    prompt: []const u8,
-    timeout_sec: u32 = 120,
-    allow_remote_server: bool = false,
+    context_length: u32,
+    threads: u32,
+    max_tokens: u32,
+    temperature: f32,
+    timeout_sec: u32,
 };
 
-const ParsedUrl = struct {
-    host: []const u8,
-    port: u16,
-    base_path: []const u8,
-};
+pub const Session = struct {
+    allocator: std.mem.Allocator,
+    opts: Options,
+    model: *c.llama_model,
+    ctx: *c.llama_context,
+    vocab: *const c.llama_vocab,
+    sampler: *c.llama_sampler,
+    abort_state: *AbortState,
 
-pub const LocalEndpoint = struct {
-    host: []const u8,
-    port: u16,
-    lock_key: []const u8,
-    autostartable: bool,
+    pub fn init(allocator: std.mem.Allocator, opts: Options) !Session {
+        if (opts.model_path.len == 0) return errors.Error.ModelNotSelected;
+        try validateOptions(opts);
+        if (!sys.exists(opts.model_path)) return errors.Error.ModelMissing;
 
-    pub fn deinit(self: LocalEndpoint, allocator: std.mem.Allocator) void {
-        allocator.free(self.lock_key);
-    }
-};
+        c.llama_backend_init();
+        errdefer c.llama_backend_free();
 
-pub fn validateLocalServerUrl(server_url: []const u8, allow_remote_server: bool) !void {
-    if (allow_remote_server) return;
-    const p = try parseHttpUrl(server_url);
-    if (isLoopbackHost(p.host)) return;
-    return errors.Error.ServerNotLocal;
-}
+        const path_z = try allocator.dupeZ(u8, opts.model_path);
+        defer allocator.free(path_z);
 
-pub fn healthCheck(allocator: std.mem.Allocator, server_url: []const u8, timeout_sec: u32, allow_remote_server: bool) !HealthStatus {
-    try validateLocalServerUrl(server_url, allow_remote_server);
-    const response = request(allocator, "GET", server_url, "/health", null, timeout_sec) catch |err| switch (err) {
-        errors.Error.Timeout => return errors.Error.Timeout,
-        errors.Error.Interrupted => return errors.Error.Interrupted,
-        else => return errors.Error.ServerUnreachable,
-    };
-    defer allocator.free(response);
-    return .ok;
-}
+        var model_params = c.llama_model_default_params();
+        model_params.n_gpu_layers = 0;
+        const model = c.llama_model_load_from_file(path_z.ptr, model_params) orelse return errors.Error.ModelLoadFailed;
+        errdefer c.llama_model_free(model);
 
-pub fn translateSegment(allocator: std.mem.Allocator, req: Request) ![]const u8 {
-    try validateLocalServerUrl(req.server_url, req.allow_remote_server);
-    var json = std.array_list.Managed(u8).init(allocator);
-    defer json.deinit();
-    try json.appendSlice("{\"model\":");
-    try appendJsonString(&json, req.model_id);
-    try json.appendSlice(",\"messages\":[{\"role\":\"user\",\"content\":");
-    try appendJsonString(&json, req.prompt);
-    try json.appendSlice("}],\"temperature\":0.2}");
-    const response = request(allocator, "POST", req.server_url, "/v1/chat/completions", json.items, req.timeout_sec) catch |err| switch (err) {
-        errors.Error.Timeout => return errors.Error.Timeout,
-        errors.Error.Interrupted => return errors.Error.Interrupted,
-        else => return errors.Error.ServerUnreachable,
-    };
-    defer allocator.free(response);
-    return parseCompletion(allocator, response);
-}
-
-fn appendJsonString(out: *std.array_list.Managed(u8), text: []const u8) !void {
-    try out.append('"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try out.appendSlice("\\\\"),
-            '"' => try out.appendSlice("\\\""),
-            '\n' => try out.appendSlice("\\n"),
-            '\r' => try out.appendSlice("\\r"),
-            '\t' => try out.appendSlice("\\t"),
-            else => try out.append(ch),
+        var ctx_params = c.llama_context_default_params();
+        ctx_params.n_ctx = opts.context_length;
+        ctx_params.n_batch = @min(opts.context_length, 512);
+        const abort_state = try allocator.create(AbortState);
+        errdefer allocator.destroy(abort_state);
+        abort_state.* = .{};
+        ctx_params.abort_callback = abortCallback;
+        ctx_params.abort_callback_data = abort_state;
+        if (opts.threads > 0) {
+            const threads: c_int = @intCast(opts.threads);
+            ctx_params.n_threads = threads;
+            ctx_params.n_threads_batch = threads;
         }
-    }
-    try out.append('"');
-}
+        const ctx = c.llama_init_from_model(model, ctx_params) orelse return errors.Error.LlamaInitFailed;
+        errdefer c.llama_free(ctx);
 
-pub fn localEndpoint(allocator: std.mem.Allocator, server_url: []const u8) !LocalEndpoint {
-    const p = try parseHttpUrl(server_url);
-    if (!isLoopbackHost(p.host)) return errors.Error.ServerNotLocal;
-    const host = if (std.mem.eql(u8, p.host, "localhost")) "127.0.0.1" else p.host;
-    const lock_host = if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host;
-    return .{
-        .host = host,
-        .port = p.port,
-        .lock_key = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ lock_host, p.port }),
-        .autostartable = p.base_path.len == 0,
-    };
-}
-
-pub fn isLoopbackUrl(server_url: []const u8) bool {
-    const p = parseHttpUrl(server_url) catch return false;
-    return isLoopbackHost(p.host);
-}
-
-fn isLoopbackHost(host: []const u8) bool {
-    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "::1");
-}
-
-fn parseHttpUrl(url: []const u8) !ParsedUrl {
-    if (!std.mem.startsWith(u8, url, "http://")) return errors.Error.ServerNotLocal;
-    var rest = url["http://".len..];
-    var path: []const u8 = "";
-    if (std.mem.indexOfScalar(u8, rest, '/')) |idx| {
-        path = rest[idx..];
-        rest = rest[0..idx];
-    }
-    if (std.mem.eql(u8, path, "/")) path = "";
-    var host = rest;
-    var port: u16 = 80;
-    if (std.mem.startsWith(u8, rest, "[")) {
-        const end = std.mem.indexOfScalar(u8, rest, ']') orelse return errors.Error.InvalidArguments;
-        host = rest[1..end];
-        if (end + 2 <= rest.len and rest[end + 1] == ':') port = try std.fmt.parseInt(u16, rest[end + 2 ..], 10);
-    } else if (std.mem.lastIndexOfScalar(u8, rest, ':')) |idx| {
-        host = rest[0..idx];
-        port = try std.fmt.parseInt(u16, rest[idx + 1 ..], 10);
-    }
-    return .{ .host = host, .port = port, .base_path = path };
-}
-
-fn request(allocator: std.mem.Allocator, method: []const u8, server_url: []const u8, path: []const u8, body: ?[]const u8, timeout_sec: u32) ![]const u8 {
-    const parsed = try parseHttpUrl(server_url);
-    var deadline = RequestDeadline.init(timeout_sec);
-    const fd = try connectLocal(parsed, &deadline);
-    defer _ = c.close(fd);
-
-    const target = try std.fmt.allocPrint(allocator, "{s}{s}", .{ if (parsed.base_path.len == 0) "" else parsed.base_path, path });
-    defer allocator.free(target);
-    const host_header = if (std.mem.eql(u8, parsed.host, "::1"))
-        try std.fmt.allocPrint(allocator, "[{s}]:{d}", .{ parsed.host, parsed.port })
-    else
-        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ parsed.host, parsed.port });
-    defer allocator.free(host_header);
-    const request_bytes = if (body) |b|
-        try std.fmt.allocPrint(allocator, "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ method, target, host_header, b.len, b })
-    else
-        try std.fmt.allocPrint(allocator, "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ method, target, host_header });
-    defer allocator.free(request_bytes);
-    try sendAll(fd, request_bytes, &deadline);
-    const raw = try recvAll(allocator, fd, 16 * 1024 * 1024, &deadline);
-    defer allocator.free(raw);
-    return parseHttpResponse(allocator, raw);
-}
-
-fn connectLocal(parsed: ParsedUrl, deadline: *RequestDeadline) !c_int {
-    if (std.mem.eql(u8, parsed.host, "::1")) return connectIpv6Loopback(parsed.port, deadline);
-    return connectIpv4(parsed, deadline);
-}
-
-fn connectIpv4(parsed: ParsedUrl, deadline: *RequestDeadline) !c_int {
-    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-    if (fd < 0) return errors.Error.ServerUnreachable;
-    errdefer _ = c.close(fd);
-    try makeNonBlocking(fd);
-    var addr: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = c.htons(parsed.port);
-    const host = if (std.mem.eql(u8, parsed.host, "localhost")) "127.0.0.1" else parsed.host;
-    var host_buf: [64:0]u8 = [_:0]u8{0} ** 64;
-    if (host.len >= host_buf.len) return errors.Error.ServerUnreachable;
-    @memcpy(host_buf[0..host.len], host);
-    if (c.inet_pton(c.AF_INET, &host_buf, &addr.sin_addr) != 1) return errors.Error.ServerUnreachable;
-    try connectWithTimeout(fd, @ptrCast(&addr), @sizeOf(c.sockaddr_in), deadline);
-    return fd;
-}
-
-fn connectIpv6Loopback(port: u16, deadline: *RequestDeadline) !c_int {
-    const fd = c.socket(c.AF_INET6, c.SOCK_STREAM, 0);
-    if (fd < 0) return errors.Error.ServerUnreachable;
-    errdefer _ = c.close(fd);
-    try makeNonBlocking(fd);
-    var addr: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
-    addr.sin6_family = c.AF_INET6;
-    addr.sin6_port = c.htons(port);
-    var host_buf: [4:0]u8 = [_:0]u8{ ':', ':', '1', 0 };
-    if (c.inet_pton(c.AF_INET6, &host_buf, &addr.sin6_addr) != 1) return errors.Error.ServerUnreachable;
-    try connectWithTimeout(fd, @ptrCast(&addr), @sizeOf(c.sockaddr_in6), deadline);
-    return fd;
-}
-
-fn makeNonBlocking(fd: c_int) !void {
-    const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
-    if (flags < 0) return errors.Error.ServerUnreachable;
-    if (c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0) return errors.Error.ServerUnreachable;
-}
-
-const RequestDeadline = struct {
-    deadline_ms: i64,
-
-    fn init(timeout_sec: u32) RequestDeadline {
-        const sec = if (timeout_sec == 0) 1 else timeout_sec;
-        const capped = @min(sec, @as(u32, 24 * 60 * 60));
-        return .{ .deadline_ms = nowMs() + @as(i64, @intCast(capped)) * 1000 };
-    }
-
-    fn remainingMs(self: RequestDeadline) !c_int {
-        const remaining = self.deadline_ms - nowMs();
-        if (remaining <= 0) return errors.Error.Timeout;
-        return @intCast(@min(remaining, @as(i64, std.math.maxInt(c_int))));
-    }
-
-    fn nowMs() i64 {
-        return @as(i64, @intCast(c.time(null))) * 1000;
-    }
-};
-
-fn waitFd(fd: c_int, events: c_short, deadline: *RequestDeadline) !void {
-    var pfd = c.pollfd{ .fd = fd, .events = events, .revents = 0 };
-    const rc = c.poll(&pfd, 1, try deadline.remainingMs());
-    if (rc == 0) return errors.Error.Timeout;
-    if (rc < 0 and std.c.errno(-1) == .INTR) return errors.Error.Interrupted;
-    if (rc < 0) return errors.Error.ServerUnreachable;
-    if ((pfd.revents & (c.POLLERR | c.POLLNVAL)) != 0) return errors.Error.ServerUnreachable;
-    if ((pfd.revents & c.POLLHUP) != 0 and (pfd.revents & events) == 0) return errors.Error.ServerUnreachable;
-    if ((pfd.revents & events) == 0) return errors.Error.ServerUnreachable;
-}
-
-fn connectWithTimeout(fd: c_int, addr: [*c]const c.sockaddr, len: c.socklen_t, deadline: *RequestDeadline) !void {
-    if (c.connect(fd, addr, len) == 0) return;
-    const err = std.c.errno(-1);
-    if (err == .INTR) return errors.Error.Interrupted;
-    if (err != .INPROGRESS and err != .AGAIN) return errors.Error.ServerUnreachable;
-    try waitFd(fd, c.POLLOUT, deadline);
-    var sock_err: c_int = 0;
-    var sock_len: c.socklen_t = @sizeOf(c_int);
-    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &sock_err, &sock_len) != 0) return errors.Error.ServerUnreachable;
-    if (sock_err != 0) return errors.Error.ServerUnreachable;
-}
-
-fn sendAll(fd: c_int, bytes: []const u8, deadline: *RequestDeadline) !void {
-    var sent: usize = 0;
-    while (sent < bytes.len) {
-        _ = try deadline.remainingMs();
-        const n = c.send(fd, bytes.ptr + sent, bytes.len - sent, 0);
-        if (n < 0) {
-            const err = std.c.errno(-1);
-            if (err == .AGAIN) {
-                try waitFd(fd, c.POLLOUT, deadline);
-                continue;
-            }
-            if (err == .INTR) return errors.Error.Interrupted;
-            return errors.Error.ServerUnreachable;
-        }
-        if (n == 0) return errors.Error.ServerUnreachable;
-        sent += @intCast(n);
-    }
-}
-
-fn recvAll(allocator: std.mem.Allocator, fd: c_int, limit: usize, deadline: *RequestDeadline) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        _ = try deadline.remainingMs();
-        const n = c.recv(fd, &buf, buf.len, 0);
-        if (n < 0) {
-            const err = std.c.errno(-1);
-            if (err == .AGAIN) {
-                try waitFd(fd, c.POLLIN, deadline);
-                continue;
-            }
-            if (err == .INTR) return errors.Error.Interrupted;
-            return errors.Error.ServerUnreachable;
-        }
-        if (n == 0) break;
-        const count: usize = @intCast(n);
-        if (out.items.len + count > limit) return errors.Error.ServerBadResponse;
-        try out.appendSlice(buf[0..count]);
-    }
-    return out.toOwnedSlice();
-}
-
-fn parseHttpResponse(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    if (!std.mem.startsWith(u8, raw, "HTTP/1.1 200") and !std.mem.startsWith(u8, raw, "HTTP/1.0 200")) return errors.Error.ServerBadResponse;
-    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return errors.Error.ServerBadResponse;
-    return allocator.dupe(u8, raw[header_end + 4 ..]);
-}
-
-pub fn parseCompletion(allocator: std.mem.Allocator, response: []const u8) ![]const u8 {
-    const marker = "\"content\"";
-    const idx = std.mem.indexOf(u8, response, marker) orelse return errors.Error.ServerBadResponse;
-    const after = response[idx + marker.len ..];
-    const colon = std.mem.indexOfScalar(u8, after, ':') orelse return errors.Error.ServerBadResponse;
-    const start_rel = std.mem.indexOfScalar(u8, after[colon + 1 ..], '"') orelse return errors.Error.ServerBadResponse;
-    const start = colon + 1 + start_rel + 1;
-    var end = start;
-    var escaped = false;
-    while (end < after.len) : (end += 1) {
-        if (!escaped and after[end] == '"') break;
-        escaped = !escaped and after[end] == '\\';
-        if (after[end] != '\\') escaped = false;
-    }
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-    var i: usize = start;
-    while (i < end) : (i += 1) {
-        if (after[i] == '\\' and i + 1 < end) {
-            i += 1;
-            switch (after[i]) {
-                'n' => try out.append('\n'),
-                'r' => try out.append('\r'),
-                't' => try out.append('\t'),
-                '"' => try out.append('"'),
-                '\\' => try out.append('\\'),
-                else => {
-                    try out.append('\\');
-                    try out.append(after[i]);
-                },
-            }
+        const vocab = c.llama_model_get_vocab(model) orelse return errors.Error.LlamaInitFailed;
+        const sampler = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return errors.Error.LlamaInitFailed;
+        errdefer c.llama_sampler_free(sampler);
+        if (opts.temperature <= 0) {
+            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_greedy());
         } else {
-            try out.append(after[i]);
+            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_temp(opts.temperature));
+            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_top_p(0.95, 1));
+            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_dist(0));
+        }
+
+        return .{ .allocator = allocator, .opts = opts, .model = model, .ctx = ctx, .vocab = vocab, .sampler = sampler, .abort_state = abort_state };
+    }
+
+    pub fn deinit(self: *Session) void {
+        c.llama_sampler_free(self.sampler);
+        c.llama_free(self.ctx);
+        c.llama_model_free(self.model);
+        self.allocator.destroy(self.abort_state);
+        c.llama_backend_free();
+    }
+
+    pub fn translate(self: *Session, allocator: std.mem.Allocator, req: backend.Request) ![]const u8 {
+        self.abort_state.setTimeout(if (req.timeout_sec > 0) req.timeout_sec else self.opts.timeout_sec);
+        defer self.abort_state.clear();
+        c.llama_memory_clear(c.llama_get_memory(self.ctx), true);
+        c.llama_sampler_reset(self.sampler);
+
+        const prompt_tokens = try tokenize(allocator, self.vocab, req.prompt);
+        defer allocator.free(prompt_tokens);
+        if (prompt_tokens.len == 0 or prompt_tokens.len >= self.opts.context_length) return errors.Error.LlamaDecodeFailed;
+
+        try self.decodeTokens(prompt_tokens);
+
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        var generated: u32 = 0;
+        while (generated < self.opts.max_tokens) : (generated += 1) {
+            if (self.abort_state.timedOut()) return errors.Error.Timeout;
+            const token = c.llama_sampler_sample(self.sampler, self.ctx, -1);
+            if (c.llama_vocab_is_eog(self.vocab, token)) break;
+            c.llama_sampler_accept(self.sampler, token);
+            try appendTokenPiece(allocator, &out, self.vocab, token);
+
+            var next_tokens = [_]c.llama_token{token};
+            try self.decodeTokens(&next_tokens);
+        }
+        return out.toOwnedSlice();
+    }
+
+    fn decodeTokens(self: *Session, tokens: []c.llama_token) errors.Error!void {
+        var start: usize = 0;
+        const limit = batchTokenLimit(self.opts.context_length);
+        while (start < tokens.len) {
+            const end = @min(start + limit, tokens.len);
+            const batch = c.llama_batch_get_one(tokens[start..end].ptr, @intCast(end - start));
+            if (c.llama_decode(self.ctx, batch) != 0) return self.decodeError();
+            start = end;
         }
     }
-    return out.toOwnedSlice();
+
+    fn decodeError(self: *Session) errors.Error {
+        return if (self.abort_state.timedOut()) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
+    }
+};
+
+pub fn validateOptions(opts: Options) !void {
+    if (opts.context_length == 0) return errors.Error.InvalidArguments;
+    const max_c_int: u32 = @intCast(std.math.maxInt(c_int));
+    if (opts.threads > max_c_int) return errors.Error.InvalidArguments;
 }
 
-test "local url validation" {
-    try validateLocalServerUrl("http://127.0.0.1:8080", false);
-    try validateLocalServerUrl("http://localhost:8080", false);
-    try validateLocalServerUrl("http://[::1]:8080", false);
-    try std.testing.expectError(errors.Error.ServerNotLocal, validateLocalServerUrl("https://example.com/v1", false));
-    try std.testing.expectError(errors.Error.ServerNotLocal, validateLocalServerUrl("http://192.168.1.10:8080", false));
+fn batchTokenLimit(context_length: u32) usize {
+    return @max(1, @as(usize, @intCast(@min(context_length, 512))));
 }
 
-test "local endpoint extraction" {
-    const a = std.testing.allocator;
-    const ep = try localEndpoint(a, "http://127.0.0.1:8080");
-    defer ep.deinit(a);
-    try std.testing.expectEqualStrings("127.0.0.1", ep.host);
-    try std.testing.expectEqual(@as(u16, 8080), ep.port);
-    try std.testing.expect(ep.autostartable);
+const AbortState = struct {
+    deadline_ms: u64 = 0,
 
-    const localhost = try localEndpoint(a, "http://localhost:18080");
-    defer localhost.deinit(a);
-    try std.testing.expectEqualStrings("127.0.0.1", localhost.host);
-    try std.testing.expectEqualStrings("127.0.0.1-18080", localhost.lock_key);
+    fn setTimeout(self: *AbortState, timeout_sec: u32) void {
+        self.deadline_ms = if (timeout_sec == 0) 0 else sys.millis() + @as(u64, timeout_sec) * 1000;
+    }
 
-    const ipv4 = try localEndpoint(a, "http://127.0.0.1:18080");
-    defer ipv4.deinit(a);
-    try std.testing.expectEqualStrings(ipv4.lock_key, localhost.lock_key);
+    fn clear(self: *AbortState) void {
+        self.deadline_ms = 0;
+    }
 
-    const ipv6 = try localEndpoint(a, "http://[::1]:18080");
-    defer ipv6.deinit(a);
-    try std.testing.expectEqualStrings("::1", ipv6.host);
-    try std.testing.expect(!std.mem.eql(u8, ipv6.lock_key, localhost.lock_key));
+    fn timedOut(self: *const AbortState) bool {
+        return self.deadline_ms != 0 and sys.millis() >= self.deadline_ms;
+    }
+};
 
-    const base = try localEndpoint(a, "http://127.0.0.1:8080/v1");
-    defer base.deinit(a);
-    try std.testing.expect(!base.autostartable);
-
-    const root_slash = try localEndpoint(a, "http://127.0.0.1:8080/");
-    defer root_slash.deinit(a);
-    try std.testing.expect(root_slash.autostartable);
-
-    try std.testing.expectError(errors.Error.ServerNotLocal, localEndpoint(a, "https://example.com/v1"));
-    try std.testing.expectError(errors.Error.ServerNotLocal, localEndpoint(a, "http://192.168.1.10:8080"));
+fn abortCallback(data: ?*anyopaque) callconv(.c) bool {
+    const ptr = data orelse return false;
+    const state: *AbortState = @ptrCast(@alignCast(ptr));
+    return state.timedOut();
 }
 
-test "parse completion" {
-    const out = try parseCompletion(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"こんにちは世界\"}}]}");
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("こんにちは世界", out);
+fn tokenize(allocator: std.mem.Allocator, vocab: *const c.llama_vocab, text: []const u8) ![]c.llama_token {
+    const text_len: c_int = @intCast(text.len);
+    var needed = c.llama_tokenize(vocab, text.ptr, text_len, null, 0, true, true);
+    if (needed == c.INT32_MIN) return errors.Error.LlamaDecodeFailed;
+    if (needed < 0) needed = -needed;
+    if (needed <= 0) return errors.Error.LlamaDecodeFailed;
+    const tokens = try allocator.alloc(c.llama_token, @intCast(needed));
+    errdefer allocator.free(tokens);
+    const actual = c.llama_tokenize(vocab, text.ptr, text_len, tokens.ptr, needed, true, true);
+    if (actual < 0) return errors.Error.LlamaDecodeFailed;
+    return tokens[0..@intCast(actual)];
 }
 
-test "json string escaping" {
-    var out = std.array_list.Managed(u8).init(std.testing.allocator);
-    defer out.deinit();
-    try appendJsonString(&out, "model\"id\\name\n");
-    try std.testing.expectEqualStrings("\"model\\\"id\\\\name\\n\"", out.items);
+fn appendTokenPiece(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), vocab: *const c.llama_vocab, token: c.llama_token) !void {
+    var stack_buf: [256]u8 = undefined;
+    var n = c.llama_token_to_piece(vocab, token, &stack_buf, stack_buf.len, 0, false);
+    if (n < 0) {
+        n = -n;
+        const buf = try allocator.alloc(u8, @intCast(n));
+        defer allocator.free(buf);
+        const actual = c.llama_token_to_piece(vocab, token, buf.ptr, n, 0, false);
+        if (actual < 0) return errors.Error.LlamaDecodeFailed;
+        try out.appendSlice(buf[0..@intCast(actual)]);
+        return;
+    }
+    try out.appendSlice(stack_buf[0..@intCast(n)]);
+}
+
+test "embedded session rejects missing model" {
+    try std.testing.expectError(errors.Error.ModelMissing, Session.init(std.testing.allocator, .{
+        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_id = "missing",
+        .context_length = 4096,
+        .threads = 0,
+        .max_tokens = 128,
+        .temperature = 0.2,
+        .timeout_sec = 1,
+    }));
+}
+
+test "embedded session validates context length and threads" {
+    var opts = Options{
+        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_id = "missing",
+        .context_length = 0,
+        .threads = 0,
+        .max_tokens = 128,
+        .temperature = 0.2,
+        .timeout_sec = 1,
+    };
+    try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
+    opts.context_length = 4096;
+    opts.threads = @as(u32, @intCast(std.math.maxInt(c_int))) + 1;
+    try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
+    opts.threads = @intCast(std.math.maxInt(c_int));
+    try validateOptions(opts);
 }

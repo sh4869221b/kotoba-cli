@@ -1,39 +1,55 @@
 # Kotoba CLI
 
-Kotoba CLI is a local-first translation CLI written in Zig.
-
-`kotoba` talks to a local llama.cpp-compatible server. By default it reuses an
-already-running loopback server, or starts `llama-server` for the current command
-when `runtime = "llama_server"`, `server_autostart = true`, `server_url` is a
-root loopback URL, `llama-server` is available on `PATH`, and `model_path`
-points to a model.
+Kotoba CLI is a local-first translation CLI written in Zig. It embeds the
+llama.cpp inference engine and runs translation in-process against a selected
+local GGUF model.
 
 ```bash
-kotoba init --model-id custom --model-path /path/to/model.gguf --yes
+kotoba models import --id local-ja --path /path/to/model.gguf --use
 kotoba translate "Hello world" --to ja
 ```
 
-Translation requests are local-loopback only by default. Use
-`--allow-remote-server` only when you explicitly accept sending text to a
-non-local endpoint. Remote endpoints are never auto-started.
+Normal translation performs no network request. Network access is used only
+when you explicitly run `kotoba models pull` for an HTTPS model source.
 
-JSON output omits source text unless `--include-source` is specified. Translation
-memory stores source and translated text unless memory is disabled.
+JSON output omits source text unless `--include-source` is specified.
+Translation memory stores source and translated text unless memory is disabled.
 
 ## Commands
 
 ```bash
-kotoba init [--server-url URL] [--model-id ID] [--model-path PATH] [--skip-download] [--yes]
+kotoba init [--model-id ID] [--model-path PATH] [--yes]
 kotoba translate [TEXT] --to ja
 kotoba translate --file README.md --to ja
 cat README.md | kotoba translate --to ja --format markdown
 kotoba doctor
+kotoba config list
+kotoba config get model_path
+kotoba config set max_tokens 512
 kotoba models list
+kotoba models info ID
+kotoba models import --id ID --path PATH [--name NAME] [--checksum SHA256] [--use]
+kotoba models pull ID [--output PATH] [--use]
+kotoba models pull --hf-repo USER/MODEL[:QUANT] [--hf-file FILE] [--id ID] [--use]
+kotoba models pull --model-url HTTPS_URL --id ID --checksum SHA256 [--use]
+kotoba models use ID
+kotoba models verify [ID]
+kotoba models remove ID --yes
 kotoba memory status
 kotoba glossary validate
-kotoba config get server_url
-kotoba config set llama_server_path /path/to/llama-server
 ```
+
+## Build
+
+Initialize the pinned llama.cpp submodule before building from a fresh clone:
+
+```bash
+git submodule update --init --recursive
+zig build
+```
+
+The embedded llama.cpp build is verified on Linux and has native macOS linker
+handling; other hosts are not wired yet.
 
 Markdown translation protects code spans, code fences, URLs, frontmatter, and
 Markdown tables. Tables are intentionally left untranslated in v1.0 to avoid
@@ -44,11 +60,15 @@ Configuration follows XDG paths:
 - `~/.config/kotoba/config.toml`
 - `~/.config/kotoba/models.toml`
 - `~/.config/kotoba/glossary.toml`
+- `~/.local/share/kotoba/models/`
 - `~/.local/share/kotoba/memory.sqlite3`
 
-Runtime-related config keys:
+Embedded runtime config keys include:
 
-- `runtime = "llama_server"`
-- `server_autostart = true`
-- `llama_server_path = "llama-server"`
-- `server_startup_timeout_sec = 60`
+- `model_id`
+- `model_path`
+- `context_length`
+- `threads`
+- `max_tokens`
+- `temperature`
+- `timeout_sec`
