@@ -20,6 +20,11 @@ env ZIG_GLOBAL_CACHE_DIR="${ROOT}/.zig-cache/global" zig build -Dtest-backend=tr
 
 BIN="${ROOT}/zig-out/bin/kotoba"
 
+if rg -n 'curl|findHfFileWithCurl|downloadWithCurl' "${ROOT}/src"; then
+  echo "runtime source should not depend on curl" >&2
+  exit 1
+fi
+
 "${BIN}" config list >/tmp/kotoba-smoke-config-list-preinit.out
 grep -q '^model_id$' /tmp/kotoba-smoke-config-list-preinit.out
 
@@ -116,6 +121,39 @@ TOML
 
 "${BIN}" models pull toy-pull --use
 "${BIN}" models verify toy-pull
+
+NO_CURL_BIN="${TMP}/no-curl-bin"
+mkdir -p "${NO_CURL_BIN}"
+cat >"${NO_CURL_BIN}/curl" <<'SH'
+#!/usr/bin/env bash
+echo "curl must not be called" >&2
+exit 127
+SH
+chmod +x "${NO_CURL_BIN}/curl"
+
+cat >>"${XDG_CONFIG_HOME}/kotoba/models.toml" <<TOML
+
+[[models]]
+id = "no-curl-pull"
+name = "No Curl Pull"
+profile = "test"
+languages = ["en", "ja"]
+format = "gguf"
+quantization = "test"
+context_length = 128
+size = "tiny"
+path = ""
+download_url = "file://${TMP}/toy-source.gguf"
+checksum = "${SUM}"
+license = ""
+recommended = false
+notes = "Smoke-test local pull without curl."
+TOML
+
+PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" config list >/tmp/kotoba-smoke-no-curl-config.out
+PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" models pull no-curl-pull --output "${TMP}/no-curl-file-pull.gguf" >/tmp/kotoba-smoke-no-curl-pull.out
+grep -q '^pulled no-curl-pull$' /tmp/kotoba-smoke-no-curl-pull.out
+
 "${BIN}" models remove toy-pull --yes
 if [[ -e "${XDG_DATA_HOME}/kotoba/models/toy-pull.gguf" ]]; then
   echo "managed model file should be removed" >&2
