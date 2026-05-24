@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
+const net = @import("net.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
 
@@ -300,26 +301,15 @@ pub fn resolveHfFile(allocator: std.mem.Allocator, hf: HfSpec, explicit_file: []
         try validateSingleHfGgufFilename(explicit_file);
         return allocator.dupe(u8, explicit_file);
     }
-    return findHfFileWithCurl(allocator, hf.repo, hf.quant);
+    return findHfFile(allocator, hf.repo, hf.quant);
 }
 
-fn findHfFileWithCurl(allocator: std.mem.Allocator, repo: []const u8, quant: []const u8) ![]const u8 {
+fn findHfFile(allocator: std.mem.Allocator, repo: []const u8, quant: []const u8) ![]const u8 {
     const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}", .{repo});
     defer allocator.free(url);
-    const result = try std.process.run(allocator, sys.io(), .{ .argv = &.{ "curl", "--fail", "--location", "--proto", "=https", "--tlsv1.2", url }, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(64 * 1024) });
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(result.stdout);
-            return errors.Error.ModelRegistryInvalid;
-        },
-        else => {
-            allocator.free(result.stdout);
-            return errors.Error.ModelRegistryInvalid;
-        },
-    }
-    defer allocator.free(result.stdout);
-    if (try findFilenameInHfJson(allocator, result.stdout, quant, true)) |name| {
+    const body = net.fetchAlloc(allocator, url, 16 * 1024 * 1024) catch return errors.Error.ModelRegistryInvalid;
+    defer allocator.free(body);
+    if (try findFilenameInHfJson(allocator, body, quant, true)) |name| {
         errdefer allocator.free(name);
         try validateSingleHfGgufFilename(name);
         return name;
@@ -358,7 +348,19 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+const Downloader = *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!void;
+
 pub fn acquire(allocator: std.mem.Allocator, m: Model, dest_path: []const u8, skip_download: bool) !void {
+    return acquireWithDownloader(allocator, m, dest_path, skip_download, downloadHttps);
+}
+
+fn acquireWithDownloader(
+    allocator: std.mem.Allocator,
+    m: Model,
+    dest_path: []const u8,
+    skip_download: bool,
+    downloader: Downloader,
+) !void {
     if (skip_download or m.download_url.len == 0) return;
     if (dest_path.len == 0) return errors.Error.InvalidArguments;
     const temp_path = try tempPath(allocator, dest_path);
@@ -367,7 +369,7 @@ pub fn acquire(allocator: std.mem.Allocator, m: Model, dest_path: []const u8, sk
     if (std.fs.path.dirname(temp_path)) |dir| try sys.makePath(dir);
     if (std.mem.startsWith(u8, m.download_url, "http://")) return errors.Error.InvalidArguments;
     if (std.mem.startsWith(u8, m.download_url, "https://")) {
-        try downloadWithCurl(allocator, m.download_url, temp_path);
+        try downloader(allocator, m.download_url, temp_path);
     } else if (std.mem.startsWith(u8, m.download_url, "file://")) {
         try copyFile(m.download_url["file://".len..], temp_path);
     } else {
@@ -396,14 +398,8 @@ fn tempPath(allocator: std.mem.Allocator, dest_path: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.tmp-{x}", .{ dest_path, nonce });
 }
 
-fn downloadWithCurl(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {
-    const result = try std.process.run(allocator, sys.io(), .{ .argv = &.{ "curl", "--fail", "--location", "--proto", "=https", "--tlsv1.2", "--output", dest, url }, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return errors.Error.ModelRegistryInvalid,
-        else => return errors.Error.ModelRegistryInvalid,
-    }
+fn downloadHttps(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {
+    net.downloadToFile(allocator, url, dest) catch return errors.Error.ModelRegistryInvalid;
 }
 
 pub fn verifySha256(allocator: std.mem.Allocator, path: []const u8, expected_hex: []const u8) !void {
@@ -503,6 +499,13 @@ test "hugging face spec and url helpers" {
     try std.testing.expectError(errors.Error.SplitModelUnsupported, hfDownloadUrl(std.testing.allocator, hf.repo, "Example-Q4_K_M-00001-of-00002.gguf"));
 }
 
+test "resolveHfFile returns explicit file without metadata lookup" {
+    const hf = try parseHfRepo("owner/repo:Q4_K_M");
+    const file = try resolveHfFile(std.testing.allocator, hf, "nested/model-Q4_K_M.gguf");
+    defer std.testing.allocator.free(file);
+    try std.testing.expectEqualStrings("nested/model-Q4_K_M.gguf", file);
+}
+
 test "hugging face json selects quantized gguf" {
     const json =
         \\{"siblings":[{"rfilename":"README.md"},{"rfilename":"Model-F16.gguf"},{"rfilename":"Model-Q4_K_M.gguf"}]}
@@ -571,6 +574,39 @@ test "acquire local file rejects checksum mismatch" {
     const download_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{src});
     defer std.testing.allocator.free(download_url);
     try std.testing.expectError(errors.Error.ChecksumFailed, acquire(std.testing.allocator, .{ .id = "local", .download_url = download_url, .checksum = "deadbeef" }, dest, false));
+}
+
+fn fakeDownloader(_: std.mem.Allocator, _: []const u8, dest: []const u8) !void {
+    try sys.writeFile(dest, "remote bytes");
+}
+
+fn failingDownloader(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+    return errors.Error.ModelRegistryInvalid;
+}
+
+test "acquire https streams through downloader and verifies checksum" {
+    const dest = "/tmp/kotoba-model-acquire-https-dest.gguf";
+    sys.deleteFile(dest);
+    const checksum = try sys.hexSha256(std.testing.allocator, "remote bytes");
+    defer std.testing.allocator.free(checksum);
+    try acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+        .checksum = checksum,
+    }, dest, false, fakeDownloader);
+    const copied = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("remote bytes", copied);
+}
+
+test "acquire https failure does not leave final file" {
+    const dest = "/tmp/kotoba-model-acquire-https-fail.gguf";
+    sys.deleteFile(dest);
+    try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+    }, dest, false, failingDownloader));
+    try std.testing.expect(!sys.exists(dest));
 }
 
 test "acquire skip download does not require destination" {

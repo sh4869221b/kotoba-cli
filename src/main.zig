@@ -12,6 +12,7 @@ const llama = @import("llama.zig");
 const markdown = @import("markdown.zig");
 const memory = @import("memory.zig");
 const models = @import("models.zig");
+const net = @import("net.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
 const translate = @import("translate.zig");
@@ -47,6 +48,7 @@ test {
     std.testing.refAllDecls(markdown);
     std.testing.refAllDecls(memory);
     std.testing.refAllDecls(models);
+    std.testing.refAllDecls(net);
     std.testing.refAllDecls(output);
     std.testing.refAllDecls(prompt);
     std.testing.refAllDecls(translate);
