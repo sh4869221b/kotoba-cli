@@ -8,6 +8,7 @@ pub const Paths = struct {
     state_dir: []const u8,
     config_file: []const u8,
     models_file: []const u8,
+    models_dir: []const u8,
     glossary_file: []const u8,
     memory_file: []const u8,
 };
@@ -38,6 +39,7 @@ pub fn paths(allocator: std.mem.Allocator) !Paths {
         .state_dir = state_dir,
         .config_file = try std.fs.path.join(allocator, &.{ config_dir, "config.toml" }),
         .models_file = try std.fs.path.join(allocator, &.{ config_dir, "models.toml" }),
+        .models_dir = try std.fs.path.join(allocator, &.{ data_dir, "models" }),
         .glossary_file = try std.fs.path.join(allocator, &.{ config_dir, "glossary.toml" }),
         .memory_file = try std.fs.path.join(allocator, &.{ data_dir, "memory.sqlite3" }),
     };
@@ -46,6 +48,7 @@ pub fn paths(allocator: std.mem.Allocator) !Paths {
 pub fn ensureDirs(p: Paths) !void {
     try sys.makePath(p.config_dir);
     try sys.makePath(p.data_dir);
+    try sys.makePath(p.models_dir);
     try sys.makePath(p.cache_dir);
     try sys.makePath(p.state_dir);
     if (std.fs.path.dirname(p.memory_file)) |dir| try sys.makePath(dir);

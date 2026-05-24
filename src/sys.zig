@@ -22,6 +22,18 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
     try file.writeStreamingAll(io(), data);
 }
 
+pub fn copyFile(src: []const u8, dest: []const u8) !void {
+    try std.Io.Dir.copyFile(cwd(), src, cwd(), dest, io(), .{ .make_path = true, .replace = true });
+}
+
+pub fn renameFile(src: []const u8, dest: []const u8) !void {
+    try cwd().rename(src, cwd(), dest, io());
+}
+
+pub fn realPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
+    return cwd().realPathFileAlloc(io(), path, allocator);
+}
+
 pub fn exists(path: []const u8) bool {
     cwd().access(io(), path, .{}) catch return false;
     return true;

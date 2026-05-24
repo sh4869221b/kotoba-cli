@@ -9,7 +9,6 @@ pub const Result = struct {
     mode: config.Mode,
     model_id: []const u8,
     runtime: []const u8,
-    server_url: []const u8,
     cached_segments: usize,
     total_segments: usize,
     translated_text: []const u8,
@@ -38,8 +37,6 @@ pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
             try appendJsonString(&out, r.model_id);
             try out.appendSlice(",\"runtime\":");
             try appendJsonString(&out, r.runtime);
-            try out.appendSlice(",\"server_url\":");
-            try appendJsonString(&out, r.server_url);
             try appendFmt(&out, ",\"cached\":{},\"cache_status\":\"{s}\",\"cached_segments\":{d},\"total_segments\":{d},\"translated_text\":", .{ r.cached_segments == r.total_segments, cacheStatus(r), r.cached_segments, r.total_segments });
             try appendJsonString(&out, r.translated_text);
             try out.appendSlice(",\"warnings\":[");
