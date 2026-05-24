@@ -55,6 +55,22 @@ test "fetchAlloc enforces max bytes without unbounded growth" {
     try std.testing.expectError(error.StreamTooLong, fetchAlloc(std.testing.allocator, url, 5));
 }
 
+test "downloadToFile streams response body to destination" {
+    var server = try TestHttpServer.start("download bytes");
+    defer server.stop();
+    const url = try server.url(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    const dest = "/tmp/kotoba-net-download-to-file-test.bin";
+    sys.deleteFile(dest);
+    defer sys.deleteFile(dest);
+
+    try downloadToFile(std.testing.allocator, url, dest);
+
+    const downloaded = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
+    defer std.testing.allocator.free(downloaded);
+    try std.testing.expectEqualStrings("download bytes", downloaded);
+}
+
 const TestHttpServer = struct {
     state: *State,
 
