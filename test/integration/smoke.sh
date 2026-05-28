@@ -24,6 +24,8 @@ if rg -n 'curl|findHfFileWithCurl|downloadWithCurl' "${ROOT}/src"; then
   echo "runtime source should not depend on curl" >&2
   exit 1
 fi
+rg -n 'llama_log_set' "${ROOT}/src/llama.zig" >/tmp/kotoba-smoke-llama-log-set.out
+rg -n 'progress_callback' "${ROOT}/src/llama.zig" >/tmp/kotoba-smoke-llama-progress-callback.out
 
 "${BIN}" config list >/tmp/kotoba-smoke-config-list-preinit.out
 grep -q '^model_id$' /tmp/kotoba-smoke-config-list-preinit.out
@@ -325,15 +327,60 @@ grep -q 'ok: model_checksum: configured model checksum matches registry' /tmp/ko
 "${BIN}" models list >/tmp/kotoba-smoke-model-list.out
 grep -q $'toy\tToy Local\tlocal\tcurrent' /tmp/kotoba-smoke-model-list.out
 
-direct="$("${BIN}" translate "Hello" --to ja --no-memory)"
-[[ "${direct}" == "JA:Hello" ]]
+"${BIN}" translate "Hello" --to ja --no-memory \
+  >/tmp/kotoba-smoke-translate-direct.out \
+  2>/tmp/kotoba-smoke-translate-direct.err
+[[ "$(cat /tmp/kotoba-smoke-translate-direct.out)" == "JA:Hello" ]]
+[[ ! -s /tmp/kotoba-smoke-translate-direct.err ]]
 
-stdin_out="$(printf 'Hello from stdin' | "${BIN}" translate --to ja --no-memory)"
-[[ "${stdin_out}" == "JA:Hello from stdin" ]]
+printf 'Hello from stdin' | "${BIN}" translate --to ja --no-memory \
+  >/tmp/kotoba-smoke-translate-stdin.out \
+  2>/tmp/kotoba-smoke-translate-stdin.err
+[[ "$(cat /tmp/kotoba-smoke-translate-stdin.out)" == "JA:Hello from stdin" ]]
+[[ ! -s /tmp/kotoba-smoke-translate-stdin.err ]]
 
-json_out="$("${BIN}" translate "Hello" --to ja --format json --no-memory)"
+printf '# Hello\n' | "${BIN}" translate --to ja --format markdown --no-memory \
+  >/tmp/kotoba-smoke-translate-markdown.out \
+  2>/tmp/kotoba-smoke-translate-markdown.err
+[[ "$(cat /tmp/kotoba-smoke-translate-markdown.out)" == "JA:# Hello" ]]
+[[ ! -s /tmp/kotoba-smoke-translate-markdown.err ]]
+
+"${BIN}" translate "Hello" --to ja --format json --no-memory \
+  >/tmp/kotoba-smoke-translate-json.out \
+  2>/tmp/kotoba-smoke-translate-json.err
+json_out="$(cat /tmp/kotoba-smoke-translate-json.out)"
 [[ "${json_out}" == *'"runtime":"embedded"'* ]]
+[[ "${json_out}" == *'"translated_text":"JA:Hello"'* ]]
 [[ "${json_out}" != *'"server_url"'* ]]
+[[ "${json_out}" != *'"source_text"'* ]]
+[[ ! -s /tmp/kotoba-smoke-translate-json.err ]]
+
+"${BIN}" translate "Hello" --to ja --format json --include-source --no-memory \
+  >/tmp/kotoba-smoke-translate-json-source.out \
+  2>/tmp/kotoba-smoke-translate-json-source.err
+json_source_out="$(cat /tmp/kotoba-smoke-translate-json-source.out)"
+[[ "${json_source_out}" == *'"source_text":"Hello"'* ]]
+[[ ! -s /tmp/kotoba-smoke-translate-json-source.err ]]
+
+if command -v script >/dev/null 2>&1 && script --version >/dev/null 2>&1; then
+  script -q -e -c "\"${BIN}\" translate \"Hello\" --to ja --no-memory" /tmp/kotoba-smoke-translate-pty.raw >/dev/null
+  tr -d '\r' </tmp/kotoba-smoke-translate-pty.raw | sed '/^$/d; /^Script started /d; /^Script done /d' >/tmp/kotoba-smoke-translate-pty.out
+  [[ "$(cat /tmp/kotoba-smoke-translate-pty.out)" == "JA:Hello" ]]
+fi
+
+"${BIN}" translate "Hello" --to ja --debug --no-memory \
+  >/tmp/kotoba-smoke-translate-debug.out \
+  2>/tmp/kotoba-smoke-translate-debug.err
+[[ "$(cat /tmp/kotoba-smoke-translate-debug.out)" == "JA:Hello" ]]
+grep -q 'diagnostics enabled' /tmp/kotoba-smoke-translate-debug.err
+
+"${BIN}" config set log_level debug
+"${BIN}" translate "Hello" --to ja --no-memory \
+  >/tmp/kotoba-smoke-translate-config-debug.out \
+  2>/tmp/kotoba-smoke-translate-config-debug.err
+[[ "$(cat /tmp/kotoba-smoke-translate-config-debug.out)" == "JA:Hello" ]]
+grep -q 'diagnostics enabled' /tmp/kotoba-smoke-translate-config-debug.err
+"${BIN}" config set log_level warn
 
 if "${BIN}" translate "Hello" --to ja --allow-remote-server >/tmp/kotoba-smoke-remote.out 2>/tmp/kotoba-smoke-remote.err; then
   echo "removed --allow-remote-server option should be rejected" >&2

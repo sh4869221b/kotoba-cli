@@ -15,6 +15,7 @@ pub const Options = struct {
     max_tokens: u32,
     temperature: f32,
     timeout_sec: u32,
+    diagnostics_enabled: bool = false,
 };
 
 pub const Session = struct {
@@ -31,6 +32,8 @@ pub const Session = struct {
         try validateOptions(opts);
         if (!sys.exists(opts.model_path)) return errors.Error.ModelMissing;
 
+        configureDiagnostics(opts.diagnostics_enabled);
+        errdefer resetDiagnostics();
         c.llama_backend_init();
         errdefer c.llama_backend_free();
 
@@ -39,6 +42,10 @@ pub const Session = struct {
 
         var model_params = c.llama_model_default_params();
         model_params.n_gpu_layers = 0;
+        if (!opts.diagnostics_enabled) {
+            model_params.progress_callback = quietProgressCallback;
+            model_params.progress_callback_user_data = null;
+        }
         const model = c.llama_model_load_from_file(path_z.ptr, model_params) orelse return errors.Error.ModelLoadFailed;
         errdefer c.llama_model_free(model);
 
@@ -78,6 +85,7 @@ pub const Session = struct {
         c.llama_model_free(self.model);
         self.allocator.destroy(self.abort_state);
         c.llama_backend_free();
+        resetDiagnostics();
     }
 
     pub fn translate(self: *Session, allocator: std.mem.Allocator, req: backend.Request) ![]const u8 {
@@ -156,6 +164,30 @@ fn abortCallback(data: ?*anyopaque) callconv(.c) bool {
     return state.timedOut();
 }
 
+fn quietLogCallback(level: c.ggml_log_level, text: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
+    _ = level;
+    _ = text;
+    _ = user_data;
+}
+
+fn quietProgressCallback(progress: f32, user_data: ?*anyopaque) callconv(.c) bool {
+    _ = progress;
+    _ = user_data;
+    return true;
+}
+
+fn configureDiagnostics(enabled: bool) void {
+    if (enabled) {
+        resetDiagnostics();
+    } else {
+        c.llama_log_set(quietLogCallback, null);
+    }
+}
+
+fn resetDiagnostics() void {
+    c.llama_log_set(null, null);
+}
+
 fn tokenize(allocator: std.mem.Allocator, vocab: *const c.llama_vocab, text: []const u8) ![]c.llama_token {
     const text_len: c_int = @intCast(text.len);
     var needed = c.llama_tokenize(vocab, text.ptr, text_len, null, 0, true, true);
@@ -193,6 +225,7 @@ test "embedded session rejects missing model" {
         .max_tokens = 128,
         .temperature = 0.2,
         .timeout_sec = 1,
+        .diagnostics_enabled = false,
     }));
 }
 
@@ -205,6 +238,7 @@ test "embedded session validates context length and threads" {
         .max_tokens = 128,
         .temperature = 0.2,
         .timeout_sec = 1,
+        .diagnostics_enabled = false,
     };
     try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
     opts.context_length = 4096;
@@ -212,4 +246,11 @@ test "embedded session validates context length and threads" {
     try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
     opts.threads = @intCast(std.math.maxInt(c_int));
     try validateOptions(opts);
+}
+
+test "diagnostics callbacks can be toggled without model load" {
+    configureDiagnostics(false);
+    resetDiagnostics();
+    configureDiagnostics(true);
+    resetDiagnostics();
 }

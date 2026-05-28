@@ -25,6 +25,7 @@ pub const Options = struct {
     overwrite: bool = false,
     no_memory: bool = false,
     no_glossary: bool = false,
+    debug: bool = false,
 };
 
 pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: config.Config, opts: Options) !output.Result {
@@ -71,7 +72,7 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: config.Config, o
         }
         const built_prompt = try prompt.build(allocator, pair.source, pair.target, mode, g, seg.text);
         defer allocator.free(built_prompt);
-        if (session == null) session = try backend.init(allocator, cfg);
+        if (session == null) session = try backend.init(allocator, cfg, diagnosticsEnabled(cfg, opts));
         const out = try session.?.translate(allocator, .{
             .model_id = cfg.model_id,
             .prompt = built_prompt,
@@ -113,6 +114,10 @@ pub fn readKindForOptions(format: ?config.OutputFormat, file_path: ?[]const u8) 
     return .text;
 }
 
+pub fn diagnosticsEnabled(cfg: config.Config, opts: Options) bool {
+    return opts.debug or std.mem.eql(u8, cfg.log_level, "debug");
+}
+
 pub fn writeFileIfNeeded(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
     const target_path = explicit_output orelse if (read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else return false;
     if (!overwrite) {
@@ -150,4 +155,13 @@ test "translate rejects missing model before segment filtering" {
         .no_memory = true,
         .no_glossary = true,
     }));
+}
+
+test "diagnostics enabled by debug flag or config" {
+    var cfg = config.default();
+    try std.testing.expect(!diagnosticsEnabled(cfg, .{}));
+    try std.testing.expect(diagnosticsEnabled(cfg, .{ .debug = true }));
+
+    cfg.log_level = "debug";
+    try std.testing.expect(diagnosticsEnabled(cfg, .{}));
 }

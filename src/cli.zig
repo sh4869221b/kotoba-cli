@@ -160,12 +160,15 @@ fn runTranslate(allocator: std.mem.Allocator, paths: xdg.Paths, args: []const []
             i += 1;
             if (i >= args.len) return errors.Error.InvalidArguments;
             opts.output_path = args[i];
-        } else if (std.mem.eql(u8, a, "--overwrite")) opts.overwrite = true else if (std.mem.eql(u8, a, "--no-memory")) opts.no_memory = true else if (std.mem.eql(u8, a, "--no-glossary")) opts.no_glossary = true else {
+        } else if (std.mem.eql(u8, a, "--overwrite")) opts.overwrite = true else if (std.mem.eql(u8, a, "--no-memory")) opts.no_memory = true else if (std.mem.eql(u8, a, "--no-glossary")) opts.no_glossary = true else if (std.mem.eql(u8, a, "--debug")) opts.debug = true else {
             if (opts.text != null) return errors.Error.InvalidArguments;
             opts.text = a;
         }
     }
     const cfg = try config.load(allocator, paths.config_file);
+    if (translate.diagnosticsEnabled(cfg, opts)) {
+        sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
+    }
     const kind = translate.readKindForOptions(opts.format, opts.file_path);
     const res = try translate.run(allocator, paths, cfg, opts);
     if (try translate.writeFileIfNeeded(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;
