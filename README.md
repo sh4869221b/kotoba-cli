@@ -15,13 +15,24 @@ when you explicitly run `kotoba models pull` for an HTTPS model source.
 JSON output omits source text unless `--include-source` is specified.
 Translation memory stores source and translated text unless memory is disabled.
 
+## Output Contract
+
+`kotoba translate` is quiet by default. For `plain` and `markdown` output,
+stdout contains only the translated text, even when running interactively in a
+terminal. Diagnostics, model-load details, and progress output are suppressed
+unless debug output is explicitly requested.
+
+Use `--format json` when callers need metadata such as cache status, warnings,
+runtime, or elapsed time. Use `--debug` only when diagnosing runtime behavior;
+debug output may be written to stderr and never changes translated stdout.
+
 ## Commands
 
 ```bash
 kotoba init [--model-id ID] [--model-path PATH] [--yes]
-kotoba translate [TEXT] --to ja
-kotoba translate --file README.md --to ja
-cat README.md | kotoba translate --to ja --format markdown
+kotoba translate [TEXT] --to ja [--debug]
+kotoba translate --file README.md --to ja [--debug]
+cat README.md | kotoba translate --to ja --format markdown [--debug]
 kotoba doctor
 kotoba config list
 kotoba config get model_path

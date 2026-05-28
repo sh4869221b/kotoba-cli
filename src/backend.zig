@@ -12,9 +12,11 @@ pub const Request = struct {
 
 pub const Session = if (build_options.test_backend) TestSession else llama.Session;
 
-pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Session {
+pub fn init(allocator: std.mem.Allocator, cfg: config.Config, diagnostics_enabled: bool) !Session {
     if (cfg.model_id.len == 0 or cfg.model_path.len == 0) return errors.Error.ModelNotSelected;
-    if (build_options.test_backend) return TestSession.init(cfg);
+    if (build_options.test_backend) {
+        return TestSession.init(cfg);
+    }
     return llama.Session.init(allocator, .{
         .model_path = cfg.model_path,
         .model_id = cfg.model_id,
@@ -23,6 +25,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: config.Config) !Session {
         .max_tokens = cfg.max_tokens,
         .temperature = cfg.temperature,
         .timeout_sec = cfg.timeout_sec,
+        .diagnostics_enabled = diagnostics_enabled,
     });
 }
 

@@ -9,6 +9,10 @@ Kotoba CLI is designed for local-first translation.
 - Normal translation performs no network request.
 - Network access can occur only when the user explicitly runs
   `kotoba models pull` for an HTTPS model source.
+- `kotoba translate` suppresses diagnostics by default; interactive terminal
+  use still prints only translated text for plain and Markdown output.
+- Debug output is opt-in and is written to stderr. It must not include source or
+  translated bodies.
 - JSON output omits `source_text` unless `--include-source` is specified.
 - Logs do not persist source or translated bodies by default.
 - SQLite translation memory stores source and translated text when enabled.

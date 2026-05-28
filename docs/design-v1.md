@@ -26,8 +26,8 @@ translation only.
 
 ```text
 kotoba init [--model-id ID] [--model-path PATH] [--yes]
-kotoba translate [TEXT] [--from en|ja] [--to ja|en] [--mode default|technical]
-kotoba translate --file PATH --to ja|en [--output PATH] [--overwrite]
+kotoba translate [TEXT] [--from en|ja] [--to ja|en] [--mode default|technical] [--debug]
+kotoba translate --file PATH --to ja|en [--output PATH] [--overwrite] [--debug]
 kotoba doctor [--format json]
 kotoba config list
 kotoba config get KEY
@@ -46,6 +46,11 @@ kotoba memory clear --yes
 kotoba glossary validate
 kotoba version
 ```
+
+For `plain` and `markdown`, successful translate stdout is only translated
+text. TTY detection must not enable extra output. Diagnostics are opt-in through
+`--debug` or `log_level = "debug"` and go to stderr. JSON output remains the
+only stdout format that includes metadata.
 
 ## Data Locations
 
