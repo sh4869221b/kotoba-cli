@@ -18,24 +18,149 @@ pub const Options = struct {
     diagnostics_enabled: bool = false,
 };
 
+const Backend = struct {
+    pub fn init() Backend {
+        c.llama_backend_init();
+        return .{};
+    }
+    pub fn deinit(self: Backend) void {
+        _ = self;
+        c.llama_backend_free();
+    }
+};
+
+const DiagnosticsMode = enum { default, quiet };
+var diagnostics_mode: DiagnosticsMode = .default;
+
+const DiagnosticsGuard = struct {
+    previous: DiagnosticsMode,
+
+    pub fn init(enabled: bool) DiagnosticsGuard {
+        const previous = diagnostics_mode;
+        configureDiagnostics(enabled);
+        return .{ .previous = previous };
+    }
+    pub fn deinit(self: DiagnosticsGuard) void {
+        applyDiagnosticsMode(self.previous);
+    }
+};
+
+const Model = struct {
+    ptr: *c.llama_model,
+
+    pub fn loadFromFile(path: [*:0]const u8, params: c.llama_model_params) !Model {
+        const ptr = c.llama_model_load_from_file(path, params) orelse return errors.Error.ModelLoadFailed;
+        return .{ .ptr = ptr };
+    }
+
+    pub fn deinit(self: Model) void {
+        c.llama_model_free(self.ptr);
+    }
+
+    pub fn getVocab(self: Model) !*const c.llama_vocab {
+        return c.llama_model_get_vocab(self.ptr) orelse return errors.Error.LlamaInitFailed;
+    }
+};
+
+const Context = struct {
+    ptr: *c.llama_context,
+
+    pub fn initFromModel(model: *c.llama_model, params: c.llama_context_params) !Context {
+        const ptr = c.llama_init_from_model(model, params) orelse return errors.Error.LlamaInitFailed;
+        return .{ .ptr = ptr };
+    }
+
+    pub fn deinit(self: Context) void {
+        c.llama_free(self.ptr);
+    }
+
+    pub fn clearMemory(self: Context) void {
+        c.llama_memory_clear(c.llama_get_memory(self.ptr), true);
+    }
+};
+
+const Sampler = struct {
+    ptr: *c.llama_sampler,
+
+    pub fn initChainDefault() !Sampler {
+        const ptr = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return errors.Error.LlamaInitFailed;
+        return .{ .ptr = ptr };
+    }
+
+    pub fn deinit(self: Sampler) void {
+        c.llama_sampler_free(self.ptr);
+    }
+
+    pub fn reset(self: Sampler) void {
+        c.llama_sampler_reset(self.ptr);
+    }
+
+    pub fn sample(self: Sampler, ctx: *c.llama_context, idx: i32) c.llama_token {
+        return c.llama_sampler_sample(self.ptr, ctx, idx);
+    }
+
+    pub fn accept(self: Sampler, token: c.llama_token) void {
+        c.llama_sampler_accept(self.ptr, token);
+    }
+
+    pub fn addGreedy(self: Sampler) void {
+        c.llama_sampler_chain_add(self.ptr, c.llama_sampler_init_greedy());
+    }
+
+    pub fn addTemp(self: Sampler, t: f32) void {
+        c.llama_sampler_chain_add(self.ptr, c.llama_sampler_init_temp(t));
+    }
+
+    pub fn addTopP(self: Sampler, p: f32, min_keep: usize) void {
+        c.llama_sampler_chain_add(self.ptr, c.llama_sampler_init_top_p(p, min_keep));
+    }
+
+    pub fn addDist(self: Sampler, seed: u32) void {
+        c.llama_sampler_chain_add(self.ptr, c.llama_sampler_init_dist(seed));
+    }
+};
+
+pub const BackendGuard = Backend;
+pub const ModelGuard = Model;
+pub const ContextGuard = Context;
+pub const SamplerGuard = Sampler;
+
+const AbortGuard = struct {
+    allocator: std.mem.Allocator,
+    state: *AbortState,
+
+    pub fn init(allocator: std.mem.Allocator) !AbortGuard {
+        const state = try allocator.create(AbortState);
+        state.* = .{};
+        return .{ .allocator = allocator, .state = state };
+    }
+
+    pub fn deinit(self: AbortGuard) void {
+        self.allocator.destroy(self.state);
+    }
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     opts: Options,
-    model: *c.llama_model,
-    ctx: *c.llama_context,
+    model: Model,
+    ctx: Context,
     vocab: *const c.llama_vocab,
-    sampler: *c.llama_sampler,
-    abort_state: *AbortState,
+    sampler: Sampler,
+    abort_guard: AbortGuard,
+    backend: Backend,
+    diag_guard: DiagnosticsGuard,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) !Session {
         if (opts.model_path.len == 0) return errors.Error.ModelNotSelected;
         try validateOptions(opts);
         if (!sys.exists(opts.model_path)) return errors.Error.ModelMissing;
 
-        configureDiagnostics(opts.diagnostics_enabled);
-        errdefer resetDiagnostics();
-        c.llama_backend_init();
-        errdefer c.llama_backend_free();
+        const diag_guard = DiagnosticsGuard.init(opts.diagnostics_enabled);
+        errdefer diag_guard.deinit();
+
+        const backend_state = Backend.init();
+        errdefer backend_state.deinit();
 
         const path_z = try allocator.dupeZ(u8, opts.model_path);
         defer allocator.free(path_z);
@@ -46,53 +171,64 @@ pub const Session = struct {
             model_params.progress_callback = quietProgressCallback;
             model_params.progress_callback_user_data = null;
         }
-        const model = c.llama_model_load_from_file(path_z.ptr, model_params) orelse return errors.Error.ModelLoadFailed;
-        errdefer c.llama_model_free(model);
+        const model = try Model.loadFromFile(path_z.ptr, model_params);
+        errdefer model.deinit();
+
+        const abort_guard = try AbortGuard.init(allocator);
+        errdefer abort_guard.deinit();
 
         var ctx_params = c.llama_context_default_params();
         ctx_params.n_ctx = opts.context_length;
         ctx_params.n_batch = @min(opts.context_length, 512);
-        const abort_state = try allocator.create(AbortState);
-        errdefer allocator.destroy(abort_state);
-        abort_state.* = .{};
         ctx_params.abort_callback = abortCallback;
-        ctx_params.abort_callback_data = abort_state;
+        ctx_params.abort_callback_data = abort_guard.state;
         if (opts.threads > 0) {
             const threads: c_int = @intCast(opts.threads);
             ctx_params.n_threads = threads;
             ctx_params.n_threads_batch = threads;
         }
-        const ctx = c.llama_init_from_model(model, ctx_params) orelse return errors.Error.LlamaInitFailed;
-        errdefer c.llama_free(ctx);
+        const ctx = try Context.initFromModel(model.ptr, ctx_params);
+        errdefer ctx.deinit();
 
-        const vocab = c.llama_model_get_vocab(model) orelse return errors.Error.LlamaInitFailed;
-        const sampler = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return errors.Error.LlamaInitFailed;
-        errdefer c.llama_sampler_free(sampler);
+        const vocab = try model.getVocab();
+
+        const sampler = try Sampler.initChainDefault();
+        errdefer sampler.deinit();
         if (opts.temperature <= 0) {
-            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_greedy());
+            sampler.addGreedy();
         } else {
-            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_temp(opts.temperature));
-            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_top_p(0.95, 1));
-            c.llama_sampler_chain_add(sampler, c.llama_sampler_init_dist(0));
+            sampler.addTemp(opts.temperature);
+            sampler.addTopP(0.95, 1);
+            sampler.addDist(0);
         }
 
-        return .{ .allocator = allocator, .opts = opts, .model = model, .ctx = ctx, .vocab = vocab, .sampler = sampler, .abort_state = abort_state };
+        return .{
+            .allocator = allocator,
+            .opts = opts,
+            .model = model,
+            .ctx = ctx,
+            .vocab = vocab,
+            .sampler = sampler,
+            .abort_guard = abort_guard,
+            .backend = backend_state,
+            .diag_guard = diag_guard,
+        };
     }
 
     pub fn deinit(self: *Session) void {
-        c.llama_sampler_free(self.sampler);
-        c.llama_free(self.ctx);
-        c.llama_model_free(self.model);
-        self.allocator.destroy(self.abort_state);
-        c.llama_backend_free();
-        resetDiagnostics();
+        self.sampler.deinit();
+        self.ctx.deinit();
+        self.model.deinit();
+        self.abort_guard.deinit();
+        self.backend.deinit();
+        self.diag_guard.deinit();
     }
 
     pub fn translate(self: *Session, allocator: std.mem.Allocator, req: backend.Request) ![]const u8 {
-        self.abort_state.setTimeout(if (req.timeout_sec > 0) req.timeout_sec else self.opts.timeout_sec);
-        defer self.abort_state.clear();
-        c.llama_memory_clear(c.llama_get_memory(self.ctx), true);
-        c.llama_sampler_reset(self.sampler);
+        self.abort_guard.state.setTimeout(if (req.timeout_sec > 0) req.timeout_sec else self.opts.timeout_sec);
+        defer self.abort_guard.state.clear();
+        self.ctx.clearMemory();
+        self.sampler.reset();
 
         const prompt_tokens = try tokenize(allocator, self.vocab, req.prompt);
         defer allocator.free(prompt_tokens);
@@ -104,10 +240,10 @@ pub const Session = struct {
         errdefer out.deinit();
         var generated: u32 = 0;
         while (generated < self.opts.max_tokens) : (generated += 1) {
-            if (self.abort_state.timedOut()) return errors.Error.Timeout;
-            const token = c.llama_sampler_sample(self.sampler, self.ctx, -1);
+            if (self.abort_guard.state.timedOut()) return errors.Error.Timeout;
+            const token = self.sampler.sample(self.ctx.ptr, -1);
             if (c.llama_vocab_is_eog(self.vocab, token)) break;
-            c.llama_sampler_accept(self.sampler, token);
+            self.sampler.accept(token);
             try appendTokenPiece(allocator, &out, self.vocab, token);
 
             var next_tokens = [_]c.llama_token{token};
@@ -122,18 +258,19 @@ pub const Session = struct {
         while (start < tokens.len) {
             const end = @min(start + limit, tokens.len);
             const batch = c.llama_batch_get_one(tokens[start..end].ptr, @intCast(end - start));
-            if (c.llama_decode(self.ctx, batch) != 0) return self.decodeError();
+            if (c.llama_decode(self.ctx.ptr, batch) != 0) return self.decodeError();
             start = end;
         }
     }
 
     fn decodeError(self: *Session) errors.Error {
-        return if (self.abort_state.timedOut()) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
+        return if (self.abort_guard.state.timedOut()) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
     }
 };
 
 pub fn validateOptions(opts: Options) !void {
     if (opts.context_length == 0) return errors.Error.InvalidArguments;
+    if (opts.max_tokens == 0) return errors.Error.InvalidArguments;
     const max_c_int: u32 = @intCast(std.math.maxInt(c_int));
     if (opts.threads > max_c_int) return errors.Error.InvalidArguments;
 }
@@ -177,15 +314,19 @@ fn quietProgressCallback(progress: f32, user_data: ?*anyopaque) callconv(.c) boo
 }
 
 fn configureDiagnostics(enabled: bool) void {
-    if (enabled) {
-        resetDiagnostics();
-    } else {
-        c.llama_log_set(quietLogCallback, null);
-    }
+    applyDiagnosticsMode(if (enabled) .default else .quiet);
 }
 
 fn resetDiagnostics() void {
-    c.llama_log_set(null, null);
+    applyDiagnosticsMode(.default);
+}
+
+fn applyDiagnosticsMode(mode: DiagnosticsMode) void {
+    switch (mode) {
+        .default => c.llama_log_set(null, null),
+        .quiet => c.llama_log_set(quietLogCallback, null),
+    }
+    diagnostics_mode = mode;
 }
 
 fn tokenize(allocator: std.mem.Allocator, vocab: *const c.llama_vocab, text: []const u8) ![]c.llama_token {
@@ -248,9 +389,32 @@ test "embedded session validates context length and threads" {
     try validateOptions(opts);
 }
 
+test "embedded session validates generation limits" {
+    var opts = Options{
+        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_id = "missing",
+        .context_length = 4096,
+        .threads = 0,
+        .max_tokens = 0,
+        .temperature = 0.2,
+        .timeout_sec = 1,
+        .diagnostics_enabled = false,
+    };
+    try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
+    opts.max_tokens = 1;
+    try validateOptions(opts);
+}
+
 test "diagnostics callbacks can be toggled without model load" {
-    configureDiagnostics(false);
-    resetDiagnostics();
-    configureDiagnostics(true);
-    resetDiagnostics();
+    const quiet = DiagnosticsGuard.init(false);
+    quiet.deinit();
+    const enabled = DiagnosticsGuard.init(true);
+    enabled.deinit();
+}
+
+test "FFI resources expose guard wrappers" {
+    try std.testing.expect(@hasDecl(@This(), "ModelGuard"));
+    try std.testing.expect(@hasDecl(@This(), "ContextGuard"));
+    try std.testing.expect(@hasDecl(@This(), "SamplerGuard"));
+    try std.testing.expect(@hasDecl(@This(), "DiagnosticsGuard"));
 }

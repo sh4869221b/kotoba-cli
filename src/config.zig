@@ -173,6 +173,25 @@ pub fn setValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, val
     if (std.mem.eql(u8, key, "model_id")) cfg.model_id = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_path")) cfg.model_path = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "context_length")) cfg.context_length = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "threads")) cfg.threads = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "max_tokens")) cfg.max_tokens = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "temperature")) cfg.temperature = try std.fmt.parseFloat(f32, value) else if (std.mem.eql(u8, key, "memory_enabled")) cfg.memory_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "glossary_enabled")) cfg.glossary_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "default_source_lang")) cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_target_lang")) cfg.default_target_lang = try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_mode")) cfg.default_mode = try Mode.parse(value) else if (std.mem.eql(u8, key, "default_output")) cfg.default_output = try OutputFormat.parse(value) else if (std.mem.eql(u8, key, "timeout_sec")) cfg.timeout_sec = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "privacy_mode")) cfg.privacy_mode = try parseBool(value) else if (std.mem.eql(u8, key, "log_level")) cfg.log_level = try allocator.dupe(u8, value) else return errors.Error.InvalidArguments;
 }
 
+pub fn getValue(allocator: std.mem.Allocator, cfg: *const Config, key: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, key, "model_id")) return allocator.dupe(u8, cfg.model_id);
+    if (std.mem.eql(u8, key, "model_path")) return allocator.dupe(u8, cfg.model_path);
+    if (std.mem.eql(u8, key, "context_length")) return try std.fmt.allocPrint(allocator, "{d}", .{cfg.context_length});
+    if (std.mem.eql(u8, key, "threads")) return try std.fmt.allocPrint(allocator, "{d}", .{cfg.threads});
+    if (std.mem.eql(u8, key, "max_tokens")) return try std.fmt.allocPrint(allocator, "{d}", .{cfg.max_tokens});
+    if (std.mem.eql(u8, key, "temperature")) return try std.fmt.allocPrint(allocator, "{d}", .{cfg.temperature});
+    if (std.mem.eql(u8, key, "timeout_sec")) return try std.fmt.allocPrint(allocator, "{d}", .{cfg.timeout_sec});
+    if (std.mem.eql(u8, key, "default_target_lang")) return allocator.dupe(u8, cfg.default_target_lang.asText());
+    if (std.mem.eql(u8, key, "default_source_lang")) return allocator.dupe(u8, if (cfg.default_source_lang) |l| l.asText() else "");
+    if (std.mem.eql(u8, key, "default_mode")) return allocator.dupe(u8, cfg.default_mode.asText());
+    if (std.mem.eql(u8, key, "default_output")) return allocator.dupe(u8, cfg.default_output.asText());
+    if (std.mem.eql(u8, key, "memory_enabled")) return allocator.dupe(u8, if (cfg.memory_enabled) "true" else "false");
+    if (std.mem.eql(u8, key, "glossary_enabled")) return allocator.dupe(u8, if (cfg.glossary_enabled) "true" else "false");
+    if (std.mem.eql(u8, key, "privacy_mode")) return allocator.dupe(u8, if (cfg.privacy_mode) "true" else "false");
+    if (std.mem.eql(u8, key, "log_level")) return allocator.dupe(u8, cfg.log_level);
+    return errors.Error.InvalidArguments;
+}
+
 fn parseBool(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
