@@ -27,51 +27,138 @@ pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
     switch (fmt) {
         .plain, .markdown => sys.stdoutPrint("{s}\n", .{r.translated_text}),
         .json => {
-            var out = std.array_list.Managed(u8).init(std.heap.page_allocator);
-            defer out.deinit();
-            try appendFmt(
-                &out,
-                "{{\"source_lang\":\"{s}\",\"target_lang\":\"{s}\",\"mode\":\"{s}\",\"model_id\":",
-                .{ r.source_lang.asText(), r.target_lang.asText(), r.mode.asText() },
-            );
-            try appendJsonString(&out, r.model_id);
-            try out.appendSlice(",\"runtime\":");
-            try appendJsonString(&out, r.runtime);
-            try appendFmt(&out, ",\"cached\":{},\"cache_status\":\"{s}\",\"cached_segments\":{d},\"total_segments\":{d},\"translated_text\":", .{ r.cached_segments == r.total_segments, cacheStatus(r), r.cached_segments, r.total_segments });
-            try appendJsonString(&out, r.translated_text);
-            try out.appendSlice(",\"warnings\":[");
-            for (r.warnings, 0..) |warning, i| {
-                if (i > 0) try out.append(',');
-                try appendJsonString(&out, warning);
-            }
-            try appendFmt(&out, "],\"elapsed_ms\":{d}", .{r.elapsed_ms});
-            if (include_source) {
-                try out.appendSlice(",\"source_text\":");
-                try appendJsonString(&out, r.source_text orelse "");
-            }
-            try out.appendSlice("}\n");
-            sys.stdoutWrite(out.items);
+            const json = try renderJson(std.heap.page_allocator, r, include_source);
+            defer std.heap.page_allocator.free(json);
+            sys.stdoutWrite(json);
         },
     }
 }
 
-fn appendFmt(out: *std.array_list.Managed(u8), comptime fmt: []const u8, args: anytype) !void {
-    const text = try std.fmt.allocPrint(out.allocator, fmt, args);
-    defer out.allocator.free(text);
-    try out.appendSlice(text);
+fn renderJson(allocator: std.mem.Allocator, r: Result, include_source: bool) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    const cached_segs = try std.fmt.allocPrint(allocator, "{}", .{r.cached_segments});
+    defer allocator.free(cached_segs);
+    const total_segs = try std.fmt.allocPrint(allocator, "{}", .{r.total_segments});
+    defer allocator.free(total_segs);
+    const elapsed = try std.fmt.allocPrint(allocator, "{}", .{r.elapsed_ms});
+    defer allocator.free(elapsed);
+
+    try out.appendSlice("{\"source_lang\":\"");
+    try escapeJsonString(r.source_lang.asText(), &out);
+    try out.appendSlice("\",\"target_lang\":\"");
+    try escapeJsonString(r.target_lang.asText(), &out);
+    try out.appendSlice("\",\"mode\":\"");
+    try escapeJsonString(r.mode.asText(), &out);
+    try out.appendSlice("\",\"model_id\":\"");
+    try escapeJsonString(r.model_id, &out);
+    try out.appendSlice("\",\"runtime\":\"");
+    try escapeJsonString(r.runtime, &out);
+    try out.appendSlice("\",\"cached\":");
+    try out.appendSlice(if (r.cached_segments == r.total_segments) "true" else "false");
+    try out.appendSlice(",\"cache_status\":\"");
+    try out.appendSlice(cacheStatus(r));
+    try out.appendSlice("\",\"cached_segments\":");
+    try out.appendSlice(cached_segs);
+    try out.appendSlice(",\"total_segments\":");
+    try out.appendSlice(total_segs);
+    try out.appendSlice(",\"translated_text\":\"");
+    try escapeJsonString(r.translated_text, &out);
+    try out.appendSlice("\",\"warnings\":[");
+    for (r.warnings, 0..) |warning, i| {
+        if (i > 0) try out.append(',');
+        try out.append('"');
+        try escapeJsonString(warning, &out);
+        try out.append('"');
+    }
+    try out.appendSlice("],\"elapsed_ms\":");
+    try out.appendSlice(elapsed);
+    if (include_source) {
+        try out.appendSlice(",\"source_text\":\"");
+        try escapeJsonString(r.source_text orelse "", &out);
+        try out.append('"');
+    }
+    try out.append('}');
+    try out.append('\n');
+
+    return out.toOwnedSlice();
 }
 
-fn appendJsonString(out: *std.array_list.Managed(u8), text: []const u8) !void {
-    try out.append('"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try out.appendSlice("\\\\"),
+fn escapeJsonString(s: []const u8, out: *std.array_list.Managed(u8)) !void {
+    for (s) |c| {
+        switch (c) {
             '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
             '\n' => try out.appendSlice("\\n"),
             '\r' => try out.appendSlice("\\r"),
             '\t' => try out.appendSlice("\\t"),
-            else => try out.append(ch),
+            else => try out.append(c),
         }
     }
-    try out.append('"');
+}
+
+test "cacheStatus reports none partial full" {
+    const base: Result = .{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .default,
+        .model_id = "m",
+        .runtime = "embedded",
+        .cached_segments = 0,
+        .total_segments = 3,
+        .translated_text = "こんにちは",
+        .elapsed_ms = 1,
+    };
+    try std.testing.expectEqualStrings("none", cacheStatus(base));
+
+    var partial = base;
+    partial.cached_segments = 1;
+    try std.testing.expectEqualStrings("partial", cacheStatus(partial));
+
+    var full = base;
+    full.cached_segments = 3;
+    try std.testing.expectEqualStrings("full", cacheStatus(full));
+}
+
+test "renderJson escapes quotes backslashes and control characters" {
+    const r: Result = .{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .default,
+        .model_id = "model\"\\id",
+        .runtime = "rt\n\t",
+        .cached_segments = 1,
+        .total_segments = 2,
+        .translated_text = "line1\nline2\t\\\"",
+        .warnings = &.{ "warn\"1", "back\\slash" },
+        .elapsed_ms = 42,
+        .source_text = "src\rtext",
+    };
+
+    const json = try renderJson(std.testing.allocator, r, true);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expectEqualStrings("{\"source_lang\":\"en\",\"target_lang\":\"ja\",\"mode\":\"default\",\"model_id\":\"model\\\"\\\\id\",\"runtime\":\"rt\\n\\t\",\"cached\":false,\"cache_status\":\"partial\",\"cached_segments\":1,\"total_segments\":2,\"translated_text\":\"line1\\nline2\\t\\\\\\\"\",\"warnings\":[\"warn\\\"1\",\"back\\\\slash\"],\"elapsed_ms\":42,\"source_text\":\"src\\rtext\"}\n", json);
+}
+
+test "renderJson omits source_text when include_source is false" {
+    const r: Result = .{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .technical,
+        .model_id = "m",
+        .runtime = "embedded",
+        .cached_segments = 1,
+        .total_segments = 1,
+        .translated_text = "translated",
+        .warnings = &.{},
+        .elapsed_ms = 0,
+        .source_text = "should not appear",
+    };
+
+    const json = try renderJson(std.testing.allocator, r, false);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expectEqualStrings("{\"source_lang\":\"en\",\"target_lang\":\"ja\",\"mode\":\"technical\",\"model_id\":\"m\",\"runtime\":\"embedded\",\"cached\":true,\"cache_status\":\"full\",\"cached_segments\":1,\"total_segments\":1,\"translated_text\":\"translated\",\"warnings\":[],\"elapsed_ms\":0}\n", json);
 }

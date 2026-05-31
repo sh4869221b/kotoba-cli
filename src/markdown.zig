@@ -21,7 +21,15 @@ pub const Document = struct {
 
 pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
     var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     var protected = std.array_list.Managed(Protected).init(allocator);
+    errdefer {
+        for (protected.items) |p| {
+            allocator.free(p.token);
+            allocator.free(p.original);
+        }
+        protected.deinit();
+    }
     var line_no: usize = 0;
     var in_fence = false;
     var frontmatter = false;
@@ -35,9 +43,7 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
         if (frontmatter or in_fence or std.mem.startsWith(u8, line, "```") or isTableLine(line)) {
             if (std.mem.startsWith(u8, line, "```")) in_fence = !in_fence;
             if (frontmatter and line_no > 0 and std.mem.eql(u8, line, "---")) frontmatter = false;
-            const token = try std.fmt.allocPrint(allocator, "KOTOBA_PROTECT_{d:0>6}", .{protected.items.len + 1});
-            try protected.append(.{ .token = token, .original = try allocator.dupe(u8, line) });
-            try out.appendSlice(token);
+            try addProtected(allocator, &out, &protected, line);
         } else {
             try protectInline(allocator, &out, &protected, line);
         }
@@ -130,4 +136,84 @@ test "protects frontmatter image html and links" {
     try std.testing.expect(std.mem.indexOf(u8, doc.text, "![logo](./logo.png)") == null);
     try std.testing.expect(std.mem.indexOf(u8, doc.text, "<kbd>") == null);
     try std.testing.expect(doc.protected.len >= 6);
+}
+
+test "protect and restore round trip preserves protected edge tokens" {
+    const source =
+        \\---
+        \\title: Doc
+        \\---
+        \\
+        \\Use `inline and https://example.com/path?q=1 plus <kbd>Ctrl</kbd> and ![img](./img.png)
+    ;
+    const doc = try protect(std.testing.allocator, source);
+    defer doc.deinit(std.testing.allocator);
+
+    var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer warnings.deinit();
+    const restored = try restore(std.testing.allocator, doc.text, doc.protected, &warnings);
+    defer std.testing.allocator.free(restored);
+
+    try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+    try std.testing.expectEqualStrings(source, restored);
+}
+
+test "restore appends warning when token missing" {
+    const doc = try protect(std.testing.allocator, "`code` and https://example.com");
+    defer doc.deinit(std.testing.allocator);
+
+    var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer warnings.deinit();
+    const restored = try restore(std.testing.allocator, "translation without protected tokens", doc.protected, &warnings);
+    defer std.testing.allocator.free(restored);
+
+    try std.testing.expect(warnings.items.len >= 1);
+    try std.testing.expectEqualStrings("protected token missing from translation", warnings.items[0]);
+}
+
+test "protect handles empty input" {
+    const doc = try protect(std.testing.allocator, "");
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", doc.text);
+    try std.testing.expectEqual(@as(usize, 0), doc.protected.len);
+}
+
+test "protect handles unmatched backtick gracefully" {
+    const doc = try protect(std.testing.allocator, "`unclosed");
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expect(doc.protected.len >= 1);
+}
+
+test "protect handles unmatched html tag gracefully" {
+    const doc = try protect(std.testing.allocator, "<unclosed");
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expect(doc.protected.len >= 1);
+}
+
+test "protect handles unmatched link gracefully" {
+    const doc = try protect(std.testing.allocator, "![unclosed");
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), doc.protected.len);
+}
+
+test "protect and restore preserves nested markdown" {
+    const source =
+        \\# Title
+        \\
+        \\`code with [link](https://example.com)`
+        \\
+        \\| Table | Col |
+        \\|-------|-----|
+        \\| A     | B   |
+    ;
+    const doc = try protect(std.testing.allocator, source);
+    defer doc.deinit(std.testing.allocator);
+
+    var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer warnings.deinit();
+    const restored = try restore(std.testing.allocator, doc.text, doc.protected, &warnings);
+    defer std.testing.allocator.free(restored);
+
+    try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+    try std.testing.expectEqualStrings(source, restored);
 }
