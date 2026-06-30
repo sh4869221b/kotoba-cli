@@ -3,9 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="${TMPDIR:-/tmp}/kotoba-smoke-$$"
+BENCH_JSON="/tmp/kotoba-smoke-bench.json"
 
 cleanup() {
   rm -rf "${TMP}"
+  rm -f "${BENCH_JSON}"
 }
 trap cleanup EXIT
 
@@ -33,11 +35,20 @@ grep -q '^model_id$' /tmp/kotoba-smoke-config-list-preinit.out
 "${BIN}" init --yes >/tmp/kotoba-smoke-init.out
 "${BIN}" config list >/tmp/kotoba-smoke-config-list.out
 grep -q '^model_id$' /tmp/kotoba-smoke-config-list.out
+grep -q '^gpu_layers$' /tmp/kotoba-smoke-config-list.out
 grep -q '^context_length$' /tmp/kotoba-smoke-config-list.out
 if grep -Eq 'server_url|runtime|server_autostart|llama_server_path|server_startup_timeout_sec' /tmp/kotoba-smoke-config-list.out; then
   echo "config list exposes removed server keys" >&2
   exit 1
 fi
+"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-default.out
+[[ "$(cat /tmp/kotoba-smoke-gpu-layers-default.out)" == "-1" ]]
+"${BIN}" config set gpu_layers 0
+"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-zero.out
+[[ "$(cat /tmp/kotoba-smoke-gpu-layers-zero.out)" == "0" ]]
+"${BIN}" config set gpu_layers -2
+"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-negative.out
+[[ "$(cat /tmp/kotoba-smoke-gpu-layers-negative.out)" == "-2" ]]
 
 if "${BIN}" config set server_url http://127.0.0.1:8080 >/tmp/kotoba-smoke-server-url.out 2>/tmp/kotoba-smoke-server-url.err; then
   echo "removed server_url key should be rejected" >&2
@@ -387,6 +398,13 @@ if "${BIN}" translate "Hello" --to ja --allow-remote-server >/tmp/kotoba-smoke-r
   exit 1
 fi
 grep -q 'invalid_arguments' /tmp/kotoba-smoke-remote.err
+
+bash "${ROOT}/test/integration/bench.sh" >"${BENCH_JSON}"
+grep -q '"benchmark":"translate"' "${BENCH_JSON}"
+grep -q '"backend":"test"' "${BENCH_JSON}"
+grep -q '"iterations":5' "${BENCH_JSON}"
+grep -q '"warmup_iterations":1' "${BENCH_JSON}"
+echo "benchmark assertions ok"
 
 "${BIN}" models use toy
 "${BIN}" models remove toy --yes

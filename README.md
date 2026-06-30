@@ -59,8 +59,45 @@ git submodule update --init --recursive
 zig build
 ```
 
+The default build is CPU-only and does not require CUDA. To build an
+opt-in CUDA-enabled binary, install the CUDA Toolkit and run:
+
+```bash
+zig build -Dcuda=true
+```
+
+On Linux, the CUDA build links the llama.cpp CUDA backend and the CUDA shared
+libraries dynamically. If your Toolkit libraries are outside the standard
+search paths, pass an absolute library directory:
+
+```bash
+zig build -Dcuda=true -Dcuda-lib-dir=/absolute/path/to/cuda/lib64
+```
+
+Requesting `-Dcuda=true` is strict: the build fails when the CUDA Toolkit or
+required CUDA libraries are unavailable. The default `zig build` path remains
+CPU-only and continues to work without CUDA. A CUDA-linked binary still needs
+the CUDA shared libraries available to the dynamic loader at run time; use the
+default build or set `gpu_layers = 0` when you want CPU execution.
+
+Run the deterministic translation benchmark with:
+
+```bash
+zig build bench
+bash test/integration/bench.sh
+```
+
+Real CUDA QA is guarded so non-CUDA machines can run it safely:
+
+```bash
+KOTOBA_CUDA_MODEL=/path/to/model.gguf bash test/integration/cuda_smoke.sh
+```
+
+If `KOTOBA_CUDA_MODEL` or `nvidia-smi` is unavailable, the CUDA smoke script
+prints a skip message and exits successfully.
+
 The embedded llama.cpp build is verified on Linux and has native macOS linker
-handling; other hosts are not wired yet.
+handling for the default CPU path; other hosts are not wired yet.
 
 Markdown translation protects code spans, code fences, URLs, frontmatter, and
 Markdown tables. Tables are intentionally left untranslated in v1.0 to avoid
@@ -78,8 +115,14 @@ Embedded runtime config keys include:
 
 - `model_id`
 - `model_path`
+- `gpu_layers`
 - `context_length`
 - `threads`
 - `max_tokens`
 - `temperature`
 - `timeout_sec`
+
+`gpu_layers` is a signed integer. Negative values, including the default `-1`,
+request all model layers to be offloaded when the binary has a GPU backend
+available. `0` forces CPU execution, and positive values request that exact
+number of layers.

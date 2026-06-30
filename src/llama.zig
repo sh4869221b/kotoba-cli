@@ -10,6 +10,7 @@ const c = @cImport({
 pub const Options = struct {
     model_path: []const u8,
     model_id: []const u8,
+    gpu_layers: i32,
     context_length: u32,
     threads: u32,
     max_tokens: u32,
@@ -165,12 +166,7 @@ pub const Session = struct {
         const path_z = try allocator.dupeZ(u8, opts.model_path);
         defer allocator.free(path_z);
 
-        var model_params = c.llama_model_default_params();
-        model_params.n_gpu_layers = 0;
-        if (!opts.diagnostics_enabled) {
-            model_params.progress_callback = quietProgressCallback;
-            model_params.progress_callback_user_data = null;
-        }
+        const model_params = modelParamsForOptions(opts);
         const model = try Model.loadFromFile(path_z.ptr, model_params);
         errdefer model.deinit();
 
@@ -275,6 +271,16 @@ pub fn validateOptions(opts: Options) !void {
     if (opts.threads > max_c_int) return errors.Error.InvalidArguments;
 }
 
+fn modelParamsForOptions(opts: Options) c.llama_model_params {
+    var model_params = c.llama_model_default_params();
+    model_params.n_gpu_layers = opts.gpu_layers;
+    if (!opts.diagnostics_enabled) {
+        model_params.progress_callback = quietProgressCallback;
+        model_params.progress_callback_user_data = null;
+    }
+    return model_params;
+}
+
 fn batchTokenLimit(context_length: u32) usize {
     return @max(1, @as(usize, @intCast(@min(context_length, 512))));
 }
@@ -361,6 +367,7 @@ test "embedded session rejects missing model" {
     try std.testing.expectError(errors.Error.ModelMissing, Session.init(std.testing.allocator, .{
         .model_path = "/tmp/kotoba-missing-model.gguf",
         .model_id = "missing",
+        .gpu_layers = -1,
         .context_length = 4096,
         .threads = 0,
         .max_tokens = 128,
@@ -374,6 +381,7 @@ test "embedded session validates context length and threads" {
     var opts = Options{
         .model_path = "/tmp/kotoba-missing-model.gguf",
         .model_id = "missing",
+        .gpu_layers = -1,
         .context_length = 0,
         .threads = 0,
         .max_tokens = 128,
@@ -393,6 +401,7 @@ test "embedded session validates generation limits" {
     var opts = Options{
         .model_path = "/tmp/kotoba-missing-model.gguf",
         .model_id = "missing",
+        .gpu_layers = -1,
         .context_length = 4096,
         .threads = 0,
         .max_tokens = 0,
@@ -403,6 +412,24 @@ test "embedded session validates generation limits" {
     try std.testing.expectError(errors.Error.InvalidArguments, validateOptions(opts));
     opts.max_tokens = 1;
     try validateOptions(opts);
+}
+
+test "model params preserve signed gpu layer offload values" {
+    for ([_]i32{ -2, -1, 0, 1 }) |layers| {
+        const opts = Options{
+            .model_path = "/tmp/kotoba-missing-model.gguf",
+            .model_id = "missing",
+            .gpu_layers = layers,
+            .context_length = 4096,
+            .threads = 0,
+            .max_tokens = 128,
+            .temperature = 0.2,
+            .timeout_sec = 1,
+            .diagnostics_enabled = false,
+        };
+        try validateOptions(opts);
+        try std.testing.expectEqual(layers, modelParamsForOptions(opts).n_gpu_layers);
+    }
 }
 
 test "diagnostics callbacks can be toggled without model load" {
