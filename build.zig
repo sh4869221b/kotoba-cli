@@ -5,10 +5,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .whitelist = &native_only });
     const optimize = b.standardOptimizeOption(.{});
     const test_backend = b.option(bool, "test-backend", "Use deterministic test translation backend") orelse false;
+    const cuda = b.option(bool, "cuda", "Build embedded llama.cpp with CUDA support") orelse false;
+    const cuda_lib_dir = b.option([]const u8, "cuda-lib-dir", "Absolute CUDA Toolkit library directory");
+    if (cuda_lib_dir) |dir| {
+        if (!std.fs.path.isAbsolute(dir)) @panic("cuda-lib-dir must be an absolute path");
+    }
+    const llama_options = LlamaBuildOptions{
+        .cuda = cuda,
+        .build_dir = if (cuda) "vendor/llama.cpp/build-kotoba-cuda" else "vendor/llama.cpp/build-kotoba-cpu",
+        .cuda_lib_dir = cuda_lib_dir,
+    };
 
     const options = b.addOptions();
     options.addOption(bool, "test_backend", test_backend);
-    const llama_build = addLlamaBuild(b);
+    const llama_build = addLlamaBuild(b, llama_options);
     const llama_probe = addLlamaApiProbe(b);
 
     const exe = b.addExecutable(.{
@@ -22,7 +32,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
     exe.root_module.linkSystemLibrary("sqlite3", .{});
-    linkLlama(b, exe, target);
+    linkLlama(b, exe, target, llama_options);
     exe.step.dependOn(llama_build);
     exe.step.dependOn(llama_probe);
     b.installArtifact(exe);
@@ -46,22 +56,35 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addOptions("build_options", options);
     tests.root_module.linkSystemLibrary("sqlite3", .{});
-    linkLlama(b, tests, target);
+    linkLlama(b, tests, target, llama_options);
     tests.step.dependOn(llama_build);
     tests.step.dependOn(llama_probe);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const bench_cmd = b.addSystemCommand(&.{ "bash", "test/integration/bench.sh" });
+    const bench_step = b.step("bench", "Run deterministic translation benchmark");
+    bench_step.dependOn(&bench_cmd.step);
 }
 
-fn addLlamaBuild(b: *std.Build) *std.Build.Step {
+const LlamaBuildOptions = struct {
+    cuda: bool,
+    build_dir: []const u8,
+    cuda_lib_dir: ?[]const u8,
+};
+
+fn addLlamaBuild(b: *std.Build, options: LlamaBuildOptions) *std.Build.Step {
+    const cmake_cuda_option = if (options.cuda) "-DGGML_CUDA=ON" else "-DGGML_CUDA=OFF";
     const configure = b.addSystemCommand(&.{
         "cmake",
         "-S",
         "vendor/llama.cpp",
         "-B",
-        "vendor/llama.cpp/build-kotoba",
+        options.build_dir,
         "-DBUILD_SHARED_LIBS=OFF",
+        "-DGGML_STATIC=OFF",
+        cmake_cuda_option,
         "-DLLAMA_BUILD_COMMON=OFF",
         "-DLLAMA_BUILD_TESTS=OFF",
         "-DLLAMA_BUILD_TOOLS=OFF",
@@ -75,9 +98,11 @@ fn addLlamaBuild(b: *std.Build) *std.Build.Step {
     const build_cmd = b.addSystemCommand(&.{
         "cmake",
         "--build",
-        "vendor/llama.cpp/build-kotoba",
+        options.build_dir,
         "--config",
         "Release",
+        "--parallel",
+        "4",
     });
     build_cmd.step.dependOn(&configure.step);
     return &build_cmd.step;
@@ -94,24 +119,58 @@ fn addLlamaApiProbe(b: *std.Build) *std.Build.Step {
     return &probe.step;
 }
 
-fn linkLlama(b: *std.Build, artifact: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+fn linkLlama(b: *std.Build, artifact: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, options: LlamaBuildOptions) void {
     artifact.root_module.addIncludePath(b.path("vendor/llama.cpp/include"));
     artifact.root_module.addIncludePath(b.path("vendor/llama.cpp/ggml/include"));
-    artifact.root_module.addLibraryPath(b.path("vendor/llama.cpp/build-kotoba/src"));
-    artifact.root_module.addLibraryPath(b.path("vendor/llama.cpp/build-kotoba/ggml/src"));
+    artifact.root_module.addLibraryPath(b.path(b.fmt("{s}/src", .{options.build_dir})));
+    artifact.root_module.addLibraryPath(b.path(b.fmt("{s}/ggml/src", .{options.build_dir})));
     artifact.root_module.linkSystemLibrary("llama", .{});
     artifact.root_module.linkSystemLibrary("ggml", .{});
     artifact.root_module.linkSystemLibrary("ggml-base", .{});
     artifact.root_module.linkSystemLibrary("ggml-cpu", .{});
+    if (options.cuda) {
+        artifact.root_module.addLibraryPath(b.path(b.fmt("{s}/ggml/src/ggml-cuda", .{options.build_dir})));
+        artifact.root_module.linkSystemLibrary("ggml-cuda", .{});
+    }
     switch (target.result.os.tag) {
-        .linux => linkLinuxCxxRuntime(b, artifact),
+        .linux => {
+            if (options.cuda) linkLinuxCudaLibraries(b, artifact, options);
+            linkLinuxCxxRuntime(b, artifact, options.build_dir);
+        },
         .macos => artifact.root_module.linkSystemLibrary("c++", .{}),
         else => @panic("embedded llama.cpp build currently supports Linux and macOS native hosts only"),
     }
 }
 
-fn linkLinuxCxxRuntime(b: *std.Build, artifact: *std.Build.Step.Compile) void {
-    const compiler = cxxCompiler(b);
+fn linkLinuxCudaLibraries(b: *std.Build, artifact: *std.Build.Step.Compile, options: LlamaBuildOptions) void {
+    if (options.cuda_lib_dir) |dir| {
+        artifact.root_module.addLibraryPath(.{ .cwd_relative = b.dupe(dir) });
+        addExistingLibraryPath(b, artifact, b.fmt("{s}/stubs", .{dir}));
+    }
+    const default_cuda_lib_dirs = [_][]const u8{
+        "/opt/cuda/targets/x86_64-linux/lib",
+        "/opt/cuda/targets/x86_64-linux/lib/stubs",
+        "/opt/cuda/lib",
+        "/opt/cuda/lib/stubs",
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/lib64/stubs",
+        "/usr/local/cuda/lib",
+        "/usr/local/cuda/lib/stubs",
+    };
+    for (default_cuda_lib_dirs) |dir| addExistingLibraryPath(b, artifact, dir);
+    artifact.root_module.linkSystemLibrary("cuda", .{});
+    artifact.root_module.linkSystemLibrary("cudart", .{});
+    artifact.root_module.linkSystemLibrary("cublas", .{});
+    artifact.root_module.linkSystemLibrary("cublasLt", .{});
+}
+
+fn addExistingLibraryPath(b: *std.Build, artifact: *std.Build.Step.Compile, dir: []const u8) void {
+    std.Io.Dir.cwd().access(b.graph.io, dir, .{}) catch return;
+    artifact.root_module.addLibraryPath(.{ .cwd_relative = b.dupe(dir) });
+}
+
+fn linkLinuxCxxRuntime(b: *std.Build, artifact: *std.Build.Step.Compile, build_dir: []const u8) void {
+    const compiler = cxxCompiler(b, build_dir);
     const result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ compiler, "-###", "-x", "c++", "/dev/null", "-o", "/dev/null" },
         .stdout_limit = .limited(64 * 1024),
@@ -133,10 +192,10 @@ fn linkLinuxCxxRuntime(b: *std.Build, artifact: *std.Build.Step.Compile) void {
     if (!linked) @panic("failed to detect C++ standard library from compiler driver");
 }
 
-fn cxxCompiler(b: *std.Build) []const u8 {
+fn cxxCompiler(b: *std.Build, build_dir: []const u8) []const u8 {
     const cache = std.Io.Dir.cwd().readFileAlloc(
         b.graph.io,
-        "vendor/llama.cpp/build-kotoba/CMakeCache.txt",
+        b.fmt("{s}/CMakeCache.txt", .{build_dir}),
         b.allocator,
         .limited(1024 * 1024),
     ) catch return b.graph.environ_map.get("CXX") orelse "c++";

@@ -20,6 +20,7 @@ pub fn init(allocator: std.mem.Allocator, cfg: config.Config, diagnostics_enable
     return llama.Session.init(allocator, .{
         .model_path = cfg.model_path,
         .model_id = cfg.model_id,
+        .gpu_layers = cfg.gpu_layers,
         .context_length = cfg.context_length,
         .threads = cfg.threads,
         .max_tokens = cfg.max_tokens,
