@@ -264,8 +264,14 @@ test "parse model list" {
 }
 
 test "registry upsert and remove round trip" {
-    const path = "/tmp/kotoba-model-registry-test.toml";
-    sys.deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "registry.toml" });
+    defer std.testing.allocator.free(path);
+    const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy.gguf" });
+    defer std.testing.allocator.free(model_path);
     try save(path, .{ .models = &.{} });
     try upsert(std.heap.page_allocator, path, .{
         .id = "toy",
@@ -273,12 +279,12 @@ test "registry upsert and remove round trip" {
         .profile = "local",
         .languages_en = true,
         .languages_ja = true,
-        .path = "/tmp/toy.gguf",
+        .path = model_path,
         .checksum = "abc",
     });
     const list = try load(std.heap.page_allocator, path);
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("/tmp/toy.gguf", toy.path);
+    try std.testing.expectEqualStrings(model_path, toy.path);
     const removed = try removeById(std.heap.page_allocator, path, "toy");
     try std.testing.expectEqualStrings("toy", removed.id);
     const after = try load(std.heap.page_allocator, path);
@@ -286,29 +292,69 @@ test "registry upsert and remove round trip" {
 }
 
 test "registry upsert replaces existing model fields" {
-    const path = "/tmp/kotoba-model-registry-replace-test.toml";
-    sys.deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "registry.toml" });
+    defer std.testing.allocator.free(path);
+    const first_model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy-v1.gguf" });
+    defer std.testing.allocator.free(first_model_path);
+    const second_model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy-v2.gguf" });
+    defer std.testing.allocator.free(second_model_path);
     try save(path, .{ .models = &.{} });
 
-    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy", .path = "/tmp/toy-v1.gguf" });
-    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy v2", .path = "/tmp/toy-v2.gguf" });
+    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy", .path = first_model_path });
+    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy v2", .path = second_model_path });
 
     const list = try load(std.heap.page_allocator, path);
     try std.testing.expectEqual(@as(usize, 1), list.models.len);
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("Toy v2", toy.name);
-    try std.testing.expectEqualStrings("/tmp/toy-v2.gguf", toy.path);
+    try std.testing.expectEqualStrings(second_model_path, toy.path);
 }
 
 test "registry upsert preserves missing registry errors" {
-    const path = "/tmp/kotoba-model-registry-missing-test.toml";
-    sys.deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing-registry.toml" });
+    defer std.testing.allocator.free(path);
+    const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy.gguf" });
+    defer std.testing.allocator.free(model_path);
     try std.testing.expectError(errors.Error.ModelsInvalid, upsert(std.heap.page_allocator, path, .{
         .id = "toy",
         .name = "Toy",
         .profile = "local",
         .languages_en = true,
         .languages_ja = true,
-        .path = "/tmp/toy.gguf",
+        .path = model_path,
     }));
+}
+
+test "registries with identical model IDs remain independent" {
+    var left_tmp = std.testing.tmpDir(.{});
+    defer left_tmp.cleanup();
+    const left_root = try left_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(left_root);
+    const left_path = try std.fs.path.join(std.testing.allocator, &.{ left_root, "registry.toml" });
+    defer std.testing.allocator.free(left_path);
+
+    var right_tmp = std.testing.tmpDir(.{});
+    defer right_tmp.cleanup();
+    const right_root = try right_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(right_root);
+    const right_path = try std.fs.path.join(std.testing.allocator, &.{ right_root, "registry.toml" });
+    defer std.testing.allocator.free(right_path);
+
+    try save(left_path, .{ .models = &.{} });
+    try save(right_path, .{ .models = &.{} });
+    try upsert(std.heap.page_allocator, left_path, .{ .id = "same", .name = "left" });
+    try upsert(std.heap.page_allocator, right_path, .{ .id = "same", .name = "right" });
+
+    const left = find(try load(std.heap.page_allocator, left_path), "same") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("left", left.name);
+    const right = find(try load(std.heap.page_allocator, right_path), "same") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("right", right.name);
 }

@@ -119,13 +119,17 @@ test "fetchAlloc enforces max bytes without unbounded growth" {
 }
 
 test "downloadToFile streams response body to destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "download.bin" });
+    defer std.testing.allocator.free(dest);
+
     var server = try TestHttpServer.start("download bytes");
     defer server.stop();
     const url = try server.url(std.testing.allocator);
     defer std.testing.allocator.free(url);
-    const dest = "/tmp/kotoba-net-download-to-file-test.bin";
-    sys.deleteFile(dest);
-    defer sys.deleteFile(dest);
 
     try downloadToFile(std.testing.allocator, url, dest);
 
@@ -135,6 +139,13 @@ test "downloadToFile streams response body to destination" {
 }
 
 test "downloadToFile follows redirects" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "redirect.bin" });
+    defer std.testing.allocator.free(dest);
+
     var target = try TestHttpServer.start("redirect target");
     defer target.stop();
     const target_url = try target.url(std.testing.allocator);
@@ -143,9 +154,6 @@ test "downloadToFile follows redirects" {
     defer redirect.stop();
     const redirect_url = try redirect.url(std.testing.allocator);
     defer std.testing.allocator.free(redirect_url);
-    const dest = "/tmp/kotoba-net-download-redirect-test.bin";
-    sys.deleteFile(dest);
-    defer sys.deleteFile(dest);
 
     try downloadToFile(std.testing.allocator, redirect_url, dest);
 
