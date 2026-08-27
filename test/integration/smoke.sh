@@ -411,7 +411,7 @@ json_source_out="$(cat "${TMP}/translate-json-source.out")"
 [[ ! -s "${TMP}/translate-json-source.err" ]]
 
 if command -v script >/dev/null 2>&1 && script --version >/dev/null 2>&1; then
-  script -q -e -c "\"${BIN}\" translate \"Hello\" --to ja --no-memory" "${TMP}/translate-pty.raw" >/dev/null
+  KOTOBA_PTY_BIN="${BIN}" script -q -e -c 'exec "$KOTOBA_PTY_BIN" translate "Hello" --to ja --no-memory' "${TMP}/translate-pty.raw" >/dev/null
   tr -d '\r' <"${TMP}/translate-pty.raw" | sed '/^$/d; /^Script started /d; /^Script done /d' >"${TMP}/translate-pty.out"
   [[ "$(cat "${TMP}/translate-pty.out")" == "JA:Hello" ]]
 fi
