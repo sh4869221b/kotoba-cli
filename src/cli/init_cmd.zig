@@ -42,17 +42,12 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     if (model_path.len == 0 and model_id.len > 0) {
         if (models.find(list, model_id)) |m| {
             selected_registry_model = m;
-            if (m.path.len > 0) {
+            if (m.path.len > 0 and sys.exists(m.path)) {
                 model_path = m.path;
-            } else if (m.download_url.len > 0) {
-                model_path = try models.installedPath(allocator, paths.models_dir, model_id);
-                var pulled = m;
-                pulled.path = model_path;
-                try models.validateGgufPath(model_path);
-                try models.acquire(allocator, pulled, model_path, false);
-                try models.verifyModel(allocator, pulled);
-                try models.upsert(allocator, paths.models_file, pulled);
-            } else return errors.Error.ModelMissing;
+            } else {
+                sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{});
+                return errors.Error.ModelMissing;
+            }
         } else return errors.Error.InvalidArguments;
     }
     if (explicit_model_path) {
@@ -85,7 +80,7 @@ fn printInitChoices(list: models.List) void {
     sys.stdoutPrint("Model choices:\n", .{});
     for (list.models) |m| {
         if (m.recommended and m.download_url.len > 0 and m.checksum.len > 0) {
-            sys.stdoutPrint("- {s}: {s} (downloadable recommended)\n", .{ m.id, m.name });
+            sys.stdoutPrint("- {s}: {s} (requires `models pull` first)\n", .{ m.id, m.name });
         }
     }
     sys.stdoutPrint("- custom: provide --model-path PATH\n", .{});
