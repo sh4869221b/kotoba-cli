@@ -169,6 +169,7 @@ test "restore appends warning when token missing" {
 
     try std.testing.expect(warnings.items.len >= 1);
     try std.testing.expectEqualStrings("protected token missing from translation", warnings.items[0]);
+    try std.testing.expectEqualStrings("translation without protected tokens", restored);
 }
 
 test "protect handles empty input" {
