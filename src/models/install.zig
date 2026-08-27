@@ -4,6 +4,7 @@ const net = @import("../net.zig");
 const sys = @import("../sys.zig");
 const checksum = @import("checksum.zig");
 const types = @import("types.zig");
+const url_policy = @import("../url.zig");
 
 const Downloader = *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!void;
 
@@ -20,13 +21,17 @@ pub fn acquireWithDownloader(
 ) !void {
     if (skip_download or m.download_url.len == 0) return;
     if (dest_path.len == 0) return errors.Error.InvalidArguments;
+    const request = if (url_policy.isRemote(m.download_url)) blk: {
+        const uri = try url_policy.parseRemote(m.download_url);
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
+        break :blk try url_policy.requestUrl(m.download_url);
+    } else null;
     const temp_path = try tempPath(allocator, dest_path);
     defer allocator.free(temp_path);
     errdefer sys.deleteFile(temp_path);
     if (std.fs.path.dirname(temp_path)) |dir| try sys.makePath(dir);
-    if (std.mem.startsWith(u8, m.download_url, "http://")) return errors.Error.InvalidArguments;
-    if (std.mem.startsWith(u8, m.download_url, "https://")) {
-        try downloader(allocator, m.download_url, temp_path);
+    if (request) |remote| {
+        try downloader(allocator, remote, temp_path);
     } else if (std.mem.startsWith(u8, m.download_url, "file://")) {
         try copyFile(m.download_url["file://".len..], temp_path);
     } else {
@@ -108,6 +113,159 @@ fn fakeDownloader(_: std.mem.Allocator, _: []const u8, dest: []const u8) !void {
 
 fn failingDownloader(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
     return errors.Error.ModelRegistryInvalid;
+}
+
+fn forbiddenDownloader(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+    return error.DownloaderInvoked;
+}
+
+test "secret URL acquire rejects userinfo before downloader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "existing.gguf" });
+    defer std.testing.allocator.free(dest);
+    try sys.writeFile(dest, "old model");
+    try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/model.gguf",
+    }, dest, false, forbiddenDownloader));
+    const preserved = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("old model", preserved);
+    try expectNoTempEntries(root);
+}
+
+test "secret URL acquire preserves signed query and excludes fragment" {
+    const Recorder = struct {
+        var calls: usize = 0;
+        fn download(_: std.mem.Allocator, request: []const u8, dest: []const u8) !void {
+            calls += 1;
+            try std.testing.expectEqualStrings("https://models.example.invalid/repo/model%2Bname.gguf?X-Signature=KOTOBA_QUERY_SECRET_36&x=a%2Bb&x=2", request);
+            try sys.writeFile(dest, "remote bytes");
+        }
+    };
+    Recorder.calls = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "signed.gguf" });
+    defer std.testing.allocator.free(dest);
+    const expected_checksum = try sys.hexSha256(std.testing.allocator, "remote bytes");
+    defer std.testing.allocator.free(expected_checksum);
+    try acquireWithDownloader(std.testing.allocator, .{
+        .id = "signed36",
+        .download_url = "https://models.example.invalid/repo/model%2Bname.gguf?X-Signature=KOTOBA_QUERY_SECRET_36&x=a%2Bb&x=2#KOTOBA_FRAGMENT_SECRET_36",
+        .checksum = expected_checksum,
+    }, dest, false, Recorder.download);
+    try std.testing.expectEqual(@as(usize, 1), Recorder.calls);
+    const installed = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
+    defer std.testing.allocator.free(installed);
+    try std.testing.expectEqualStrings("remote bytes", installed);
+    try checksum.verifySha256(std.testing.allocator, dest, expected_checksum);
+    try expectNoTempEntries(root);
+}
+
+test "secret URL invalid acquisition preserves filesystem before downloader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const existing = try std.fs.path.join(std.testing.allocator, &.{ root, "existing.gguf" });
+    defer std.testing.allocator.free(existing);
+    const missing_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "not-created" });
+    defer std.testing.allocator.free(missing_dir);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ missing_dir, "model.gguf" });
+    defer std.testing.allocator.free(missing);
+    try sys.writeFile(existing, "old model");
+    for ([_][]const u8{
+        "https://user@models.example.invalid/a",          "https://@models.example.invalid/a",
+        "https://user:password@models.example.invalid/a", "HTTPS://user@models.example.invalid/a",
+        "hTtP://models.example.invalid/a",                "https:///a",
+        "https:/a",                                       "https//a",
+        "https://host:bad/a",                             "https://host/a%zz",
+        "https://host/a#bad\n",                           "//host/a",
+    }) |value| {
+        for ([_][]const u8{ existing, missing }) |dest| {
+            try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
+                .id = "remote",
+                .download_url = value,
+            }, dest, false, forbiddenDownloader));
+        }
+    }
+    for (0..128) |c| {
+        if (c > 31 and c != 127) continue;
+        var value = "https://models.example.invalid/a#x".*;
+        value[value.len - 1] = @intCast(c);
+        try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
+            .id = "remote",
+            .download_url = &value,
+        }, missing, false, forbiddenDownloader));
+    }
+    var oversize = [_]u8{'a'} ** (url_policy.max_length + 1);
+    const prefix = "https://models.example.invalid/";
+    @memcpy(oversize[0..prefix.len], prefix);
+    try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = &oversize,
+    }, missing, false, forbiddenDownloader));
+    try std.testing.expect(!sys.exists(missing_dir));
+    const preserved = try sys.readFileAlloc(std.testing.allocator, existing, 1024);
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("old model", preserved);
+    try expectNoTempEntries(root);
+
+    try acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "HTTPS://models.example.invalid/a#fragment",
+    }, existing, false, fakeDownloader);
+    try acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = oversize[0..url_policy.max_length],
+    }, existing, false, fakeDownloader);
+    try expectNoTempEntries(root);
+}
+
+test "secret URL local paths preserve question and hash characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source?#.gguf" });
+    defer std.testing.allocator.free(source);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "destination?#.gguf" });
+    defer std.testing.allocator.free(dest);
+    const file_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{source});
+    defer std.testing.allocator.free(file_url);
+    try sys.writeFile(source, "local bytes");
+    const expected_checksum = try sys.hexSha256(std.testing.allocator, "local bytes");
+    defer std.testing.allocator.free(expected_checksum);
+    for ([_][]const u8{ source, file_url }) |value| {
+        try acquireWithDownloader(std.testing.allocator, .{
+            .id = "local",
+            .download_url = value,
+            .checksum = expected_checksum,
+        }, dest, false, forbiddenDownloader);
+        const installed = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
+        defer std.testing.allocator.free(installed);
+        try std.testing.expectEqualStrings("local bytes", installed);
+        try std.testing.expectEqualStrings(value, url_policy.reusableUrl(value));
+        const display = try url_policy.displayUrl(std.testing.allocator, value);
+        defer std.testing.allocator.free(display);
+        try std.testing.expectEqualStrings(value, display);
+        try std.testing.expect(!url_policy.hasUnsafeMetadata(value));
+        const identity = try url_policy.sourceIdentity(std.testing.allocator, value);
+        defer std.testing.allocator.free(identity);
+        try std.testing.expectEqualStrings("", identity);
+        try checksum.verifySha256(std.testing.allocator, dest, expected_checksum);
+        try expectNoTempEntries(root);
+    }
+    try acquireWithDownloader(std.testing.allocator, .{
+        .id = "skip",
+        .download_url = "https://user@invalid/a#bad\n",
+    }, "", true, forbiddenDownloader);
 }
 
 test "acquire https streams through downloader and verifies checksum" {

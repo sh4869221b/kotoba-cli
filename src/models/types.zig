@@ -10,6 +10,7 @@ pub const Model = struct {
     size: []const u8 = "",
     path: []const u8 = "",
     download_url: []const u8 = "",
+    source_url: []const u8 = "",
     checksum: []const u8 = "",
     license: []const u8 = "",
     recommended: bool = false,

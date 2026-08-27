@@ -1,5 +1,6 @@
 const std = @import("std");
 const sys = @import("sys.zig");
+const url_policy = @import("url.zig");
 
 pub fn fetchAlloc(allocator: std.mem.Allocator, url: []const u8, max_bytes: usize) ![]u8 {
     if (max_bytes == std.math.maxInt(usize)) return error.StreamTooLong;
@@ -41,13 +42,15 @@ fn getToWriter(
     url: []const u8,
     response_writer: *std.Io.Writer,
 ) !std.http.Status {
-    var current_url = try allocator.dupe(u8, url);
+    var current_url = try allocator.dupe(u8, try url_policy.requestUrl(url));
     defer allocator.free(current_url);
 
     var redirects_remaining: u8 = 3;
     while (true) {
-        const uri = try std.Uri.parse(current_url);
-        var req = try client.request(.GET, uri, .{
+        const uri = try url_policy.parseRemote(current_url);
+        var request_uri = uri;
+        request_uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else "https";
+        var req = try client.request(.GET, request_uri, .{
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -59,6 +62,7 @@ fn getToWriter(
             redirects_remaining -= 1;
             const location = response.head.location orelse return error.HttpRedirectLocationMissing;
             const next_url = try resolveRedirectUrl(allocator, uri, location);
+            errdefer allocator.free(next_url);
 
             const reader = response.reader(&.{});
             _ = reader.discardRemaining() catch |err| switch (err) {
@@ -93,8 +97,9 @@ fn getToWriter(
 }
 
 fn resolveRedirectUrl(allocator: std.mem.Allocator, base: std.Uri, location: []const u8) ![]u8 {
-    if (location.len > 8 * 1024) return error.HttpRedirectLocationOversize;
-    var redirect_buffer: [16 * 1024]u8 = undefined;
+    try url_policy.validateReference(location);
+    // Resolution needs the reference plus space for the base and merged path.
+    var redirect_buffer: [3 * url_policy.max_length]u8 = undefined;
     @memcpy(redirect_buffer[0..location.len], location);
     var remaining: []u8 = redirect_buffer[0..];
     const resolved = try base.resolveInPlace(location.len, &remaining);
@@ -103,11 +108,13 @@ fn resolveRedirectUrl(allocator: std.mem.Allocator, base: std.Uri, location: []c
     {
         return error.InsecureRedirect;
     }
-    return std.fmt.allocPrint(allocator, "{f}", .{resolved.fmt(.all)});
+    const full_url = try std.fmt.allocPrint(allocator, "{f}", .{resolved.fmt(.all)});
+    defer allocator.free(full_url);
+    return allocator.dupe(u8, try url_policy.requestUrl(full_url));
 }
 
 test "http helpers reject invalid URL syntax" {
-    try std.testing.expectError(error.InvalidFormat, fetchAlloc(std.testing.allocator, "not a url", 1024));
+    try std.testing.expectError(error.InvalidArguments, fetchAlloc(std.testing.allocator, "not a url", 1024));
 }
 
 test "fetchAlloc enforces max bytes without unbounded growth" {
@@ -116,6 +123,43 @@ test "fetchAlloc enforces max bytes without unbounded growth" {
     const url = try server.url(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectError(error.StreamTooLong, fetchAlloc(std.testing.allocator, url, 5));
+}
+
+test "fetchAlloc accepts case-insensitive HTTP schemes at request boundaries" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "HTTP", "hTtP" }) |scheme| {
+        var server = try TestHttpServer.start("scheme-body");
+        defer server.stop();
+        const base_url = try server.url(allocator);
+        defer allocator.free(base_url);
+        const initial_url = try std.fmt.allocPrint(allocator, "{s}{s}?x=a%2Bb&x=2#fragment", .{ scheme, base_url["http".len..] });
+        defer allocator.free(initial_url);
+
+        const body = try fetchAlloc(allocator, initial_url, 64);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings("scheme-body", body);
+        try server.expectStopped(1, 1, 0);
+        try server.expectTarget(0, "/fixture?x=a%2Bb&x=2");
+    }
+
+    var target = try TestHttpServer.start("scheme-body");
+    defer target.stop();
+    const target_url = try target.url(allocator);
+    defer allocator.free(target_url);
+    const location = try std.fmt.allocPrint(allocator, "HtTp{s}?x=a%2Bb&x=2#fragment", .{target_url["http".len..]});
+    defer allocator.free(location);
+    var redirect = try TestHttpServer.startRedirect(location);
+    defer redirect.stop();
+    const redirect_url = try redirect.url(allocator);
+    defer allocator.free(redirect_url);
+
+    const body = try fetchAlloc(allocator, redirect_url, 64);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("scheme-body", body);
+    try redirect.expectStopped(1, 1, 0);
+    try redirect.expectTarget(0, "/fixture");
+    try target.expectStopped(1, 1, 0);
+    try target.expectTarget(0, "/fixture?x=a%2Bb&x=2");
 }
 
 test "downloadToFile streams response body to destination" {
@@ -170,6 +214,153 @@ test "https redirects to http are rejected" {
     );
 }
 
+test "secret URL redirects reject credentials before next request" {
+    const base = try std.Uri.parse("http://127.0.0.1:12345/fixture");
+    const result = resolveRedirectUrl(std.testing.allocator, base, "//user:password@127.0.0.1:12345/model.gguf");
+    defer if (result) |value| std.testing.allocator.free(value) else |_| {};
+    try std.testing.expectError(error.InvalidArguments, result);
+
+    inline for ([_][]const u8{
+        "http://user:password@127.0.0.1:{d}/model.gguf",
+        "//user:password@127.0.0.1:{d}/model.gguf",
+        "//user%40name@127.0.0.1:{d}/model.gguf",
+        "//@127.0.0.1:{d}/model.gguf",
+        "http://127.0.0.1:{d}/model.gguf#x\x01x",
+        "http://127.0.0.1:{d}/model.gguf#x\tx",
+        "http://127.0.0.1:{d}/model.gguf#bad%zz",
+    }) |template| {
+        var target = try TestHttpServer.start("unreachable");
+        defer target.stop();
+        const location = try std.fmt.allocPrint(std.testing.allocator, template, .{target.state.?.server.socket.address.getPort()});
+        defer std.testing.allocator.free(location);
+        var redirect = try TestHttpServer.startRedirect(location);
+        defer redirect.stop();
+        try expectFetchError(&redirect, 100, error.InvalidArguments);
+        try redirect.expectStopped(1, 1, 0);
+        try redirect.expectTarget(0, "/fixture");
+        try target.expectStopped(0, 0, 1);
+    }
+
+    for ([_][]const u8{ "https:///model.gguf", "//user@host/model", "/model#bad%", "/model#bad%zz" }) |location| {
+        try std.testing.expectError(error.InvalidArguments, resolveRedirectUrl(std.testing.allocator, base, location));
+    }
+    for (0..128) |c| {
+        if (c > 31 and c != 127) continue;
+        var location = "/model.gguf#x".*;
+        location[location.len - 1] = @intCast(c);
+        try std.testing.expectError(error.InvalidArguments, resolveRedirectUrl(std.testing.allocator, base, &location));
+    }
+}
+
+test "secret URL redirect bounds apply after resolution" {
+    const allocator = std.testing.allocator;
+    const base_text = "http://127.0.0.1:12345/fixture";
+    const base = try std.Uri.parse(base_text);
+    var location = [_]u8{'a'} ** (url_policy.max_length + 1);
+    const prefix = "http://127.0.0.1:12345/";
+    @memcpy(location[0..prefix.len], prefix);
+    const exact = try resolveRedirectUrl(allocator, base, location[0..url_policy.max_length]);
+    defer allocator.free(exact);
+    try std.testing.expectEqualStrings(location[0..url_policy.max_length], exact);
+    try std.testing.expectError(error.InvalidArguments, resolveRedirectUrl(allocator, base, &location));
+    @memset(&location, 'a');
+    const relative_length = url_policy.max_length - prefix.len;
+    const relative_exact = try resolveRedirectUrl(allocator, base, location[0..relative_length]);
+    defer allocator.free(relative_exact);
+    try std.testing.expectEqual(@as(usize, url_policy.max_length), relative_exact.len);
+    try std.testing.expectError(error.InvalidArguments, resolveRedirectUrl(allocator, base, location[0 .. relative_length + 1]));
+    // The complete resolved fragment counts toward the bound before it is stripped.
+    location[relative_length] = '#';
+    try std.testing.expectError(error.InvalidArguments, resolveRedirectUrl(allocator, base, location[0 .. relative_length + 1]));
+    @memset(&location, 'a');
+
+    for ([_]usize{ url_policy.max_length, url_policy.max_length + 1 }) |length| {
+        const raw = try std.fmt.allocPrint(allocator, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{location[0..length]});
+        defer allocator.free(raw);
+        var redirect = try TestHttpServer.startScript(&.{ raw, http_ok });
+        defer redirect.stop();
+        // The existing HTTP head bound rejects these before URL resolution.
+        try expectFetchError(&redirect, 100, error.HttpHeadersOversize);
+        try redirect.expectStopped(1, 1, 1);
+        try redirect.expectTarget(0, "/fixture");
+    }
+
+    const raw = try std.fmt.allocPrint(allocator, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{location[0..2500]});
+    defer allocator.free(raw);
+    var redirect = try TestHttpServer.startScript(&.{ raw, http_ok });
+    defer redirect.stop();
+    const short_url = try redirect.url(allocator);
+    defer allocator.free(short_url);
+    const long_url = try std.fmt.allocPrint(allocator, "{s}/{s}/base", .{ short_url, location[0..6000] });
+    defer allocator.free(long_url);
+    try std.testing.expectError(error.InvalidArguments, fetchAlloc(allocator, long_url, 100));
+    try redirect.expectStopped(1, 1, 1);
+    const long_uri = try url_policy.parseRemote(long_url);
+    try redirect.expectTarget(0, long_uri.path.percent_encoded);
+}
+
+test "secret URL redirect follow failure frees resolved URL" {
+    var target = try TestHttpServer.start("unreachable");
+    defer target.stop();
+    const location = try target.url(std.testing.allocator);
+    defer std.testing.allocator.free(location);
+    const raw = try std.fmt.allocPrint(std.testing.allocator, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n5\r\nabc", .{location});
+    defer std.testing.allocator.free(raw);
+    var redirect = try TestHttpServer.startScript(&.{raw});
+    defer redirect.stop();
+    try expectFetchError(&redirect, 100, error.HttpChunkTruncated);
+    try redirect.expectStopped(1, 1, 0);
+    try target.expectStopped(0, 0, 1);
+}
+
+test "secret URL redirect request preserves query and drops fragment" {
+    const allocator = std.testing.allocator;
+    const expected_target = "/model.gguf?token=KOTOBA_QUERY_SECRET_36&x=a%2Bb";
+    const locations = [_][]const u8{
+        "model.gguf?token=KOTOBA_QUERY_SECRET_36&x=a%2Bb#KOTOBA_FRAGMENT_SECRET_36",
+        "/model.gguf?token=KOTOBA_QUERY_SECRET_36&x=a%2Bb&x=2#KOTOBA_FRAGMENT_SECRET_36",
+        "/model.gguf?#KOTOBA_FRAGMENT_SECRET_36",
+    };
+    const expected_targets = [_][]const u8{ expected_target, expected_target ++ "&x=2", "/model.gguf?" };
+    for (locations, expected_targets) |location, expected| {
+        const raw = try std.fmt.allocPrint(allocator, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{location});
+        defer allocator.free(raw);
+        var server = try TestHttpServer.startScript(&.{ raw, http_ok });
+        defer server.stop();
+        const base_url = try server.url(allocator);
+        defer allocator.free(base_url);
+        const initial_url = try std.fmt.allocPrint(allocator, "{s}?x=a%2Bb&x=2#KOTOBA_FRAGMENT_SECRET_36", .{base_url});
+        defer allocator.free(initial_url);
+        const bytes = try fetchAlloc(allocator, initial_url, 6);
+        defer allocator.free(bytes);
+        try std.testing.expectEqualStrings("abcdef", bytes);
+        try server.expectStopped(2, 2, 0);
+        try server.expectTarget(0, "/fixture?x=a%2Bb&x=2");
+        try server.expectTarget(1, expected);
+    }
+}
+
+test "secret URL initial requests reject before connection" {
+    const allocator = std.testing.allocator;
+    var server = try TestHttpServer.start("unreachable");
+    defer server.stop();
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+    const userinfo = try std.fmt.allocPrint(allocator, "http://@{s}", .{base_url["http://".len..]});
+    defer allocator.free(userinfo);
+    try std.testing.expectError(error.InvalidArguments, fetchAlloc(allocator, userinfo, 100));
+    for (0..128) |c| {
+        if (c > 31 and c != 127) continue;
+        const controlled = try std.fmt.allocPrint(allocator, "{s}#x{c}", .{ base_url, @as(u8, @intCast(c)) });
+        defer allocator.free(controlled);
+        try std.testing.expectError(error.InvalidArguments, fetchAlloc(allocator, controlled, 100));
+    }
+    var oversized = [_]u8{'a'} ** (url_policy.max_length + 1);
+    @memcpy(oversized[0..base_url.len], base_url);
+    try std.testing.expectError(error.InvalidArguments, fetchAlloc(allocator, &oversized, 100));
+    try server.expectStopped(0, 0, 1);
+}
+
 const TestHttpServer = struct {
     state: ?*State,
     result: Stats = .{},
@@ -185,6 +376,8 @@ const TestHttpServer = struct {
         active: bool = false,
         joined: bool = false,
         failure: ?anyerror = null,
+        targets: [max_responses][max_request_bytes]u8 = undefined,
+        target_lengths: [max_responses]usize = @splat(0),
     };
 
     const State = struct {
@@ -296,7 +489,7 @@ const TestHttpServer = struct {
     }
 
     fn serveScript(state: *State) !void {
-        for (state.responses) |raw| {
+        for (state.responses, 0..) |raw, index| {
             var fds = [_]std.posix.pollfd{
                 .{ .fd = state.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
                 .{ .fd = state.wake_read.handle, .events = std.posix.POLL.IN, .revents = 0 },
@@ -325,8 +518,9 @@ const TestHttpServer = struct {
                 state.mutex.unlock(std.testing.io);
             }
 
-            try readRequestHead(stream);
+            const target_length = try readRequestHead(stream, &state.stats.targets[index]);
             state.mutex.lockUncancelable(std.testing.io);
+            state.stats.target_lengths[index] = target_length;
             state.stats.unused -= 1;
             state.mutex.unlock(std.testing.io);
             var buffer: [1024]u8 = undefined;
@@ -339,7 +533,7 @@ const TestHttpServer = struct {
         }
     }
 
-    fn readRequestHead(stream: std.Io.net.Stream) !void {
+    fn readRequestHead(stream: std.Io.net.Stream, target: []u8) !usize {
         var buffer: [1024]u8 = undefined;
         var reader = stream.reader(std.testing.io, &buffer);
         var head: [max_request_bytes]u8 = undefined;
@@ -348,7 +542,10 @@ const TestHttpServer = struct {
             const bytes = head[0 .. i + 1];
             if (std.mem.endsWith(u8, bytes, "\r\n\r\n")) {
                 if (!std.mem.startsWith(u8, bytes, "GET ")) return error.InvalidRequest;
-                return;
+                const target_end = std.mem.indexOfScalarPos(u8, bytes, 4, ' ') orelse return error.InvalidRequest;
+                const target_length = target_end - 4;
+                @memcpy(target[0..target_length], bytes[4..target_end]);
+                return target_length;
             }
         }
         return error.RequestHeadTooLong;
@@ -363,6 +560,12 @@ const TestHttpServer = struct {
         try std.testing.expectEqual(completed, self.result.completed);
         if (completed > 0) try std.testing.expectEqual(null, self.result.failure);
         try std.testing.expectEqual(unused, self.result.unused);
+    }
+
+    fn expectTarget(self: *TestHttpServer, index: usize, expected: []const u8) !void {
+        try std.testing.expect(self.result.joined);
+        try std.testing.expect(index < self.result.completed);
+        try std.testing.expectEqualStrings(expected, self.result.targets[index][0..self.result.target_lengths[index]]);
     }
 };
 

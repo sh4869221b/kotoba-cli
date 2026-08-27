@@ -20,6 +20,7 @@ const translate = @import("translate.zig");
 const translation_contract = @import("translation_contract.zig");
 const xdg = @import("xdg.zig");
 const sys = @import("sys.zig");
+const url = @import("url.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -58,4 +59,5 @@ test {
     std.testing.refAllDecls(translation_contract);
     std.testing.refAllDecls(xdg);
     std.testing.refAllDecls(sys);
+    std.testing.refAllDecls(url);
 }
