@@ -36,6 +36,52 @@ now exits 1 with an instruction to run `models pull` or provide `--model-path`.
 forms; an HTTPS download completes only when its normal download and checksum
 verification succeed.
 
+### Model URL privacy and migration
+
+Remote model URLs containing userinfo (including an empty userinfo) are rejected.
+For an explicit `--model-url` pull, the complete encoded query is used for that
+request exactly as supplied, while the fragment is removed before acquisition.
+Queries are transient: no remote query, including an empty query, is persisted.
+The fragment is also omitted from saved metadata.
+
+The registry's `source_url` is informational provenance only. It contains the
+remote scheme, authority without userinfo, and encoded path; it is never used as
+a download fallback. A query-free HTTPS URL may remain in `download_url`, but a
+credential-bearing or query-bearing URL cannot be reused from the registry.
+To resupply such a model, enter a fresh URL and checksum explicitly:
+
+```bash
+kotoba models pull --model-url https://download.example.invalid/models/model.gguf \
+  --id MODEL_ID --checksum SHA256
+```
+
+`models pull MODEL_ID` fails before acquisition when no reusable
+`download_url` remains, even if the installed file is present. `models use` and
+`models verify` continue to operate on the installed path.
+
+Reading the registry does not migrate it: `models info`, `models list`, and
+`doctor` leave the file unchanged. The next successful registry write sanitizes
+all retained entries, including unrelated legacy entries. Kotoba does not make
+a secret backup or sidecar, and cannot erase copies already present in external
+backups, shell history, or process inspection. Command-line arguments may be
+visible to shell history or other process observers. Secret-looking URL path
+components are outside automatic detection; do not supply sensitive paths.
+
+For a manual migration, edit the registry while preserving each model's `id`,
+installed `path`, `checksum`, and other descriptive fields. For a URL that
+contains credentials or a query, clear `download_url` and retain only a safe
+identity in `source_url`, for example:
+
+```toml
+download_url = ""
+source_url = "https://download.example.invalid/models/model%2Bname.gguf"
+```
+
+The `source_url` value above is display/provenance metadata, not a fetch URL.
+Run `kotoba doctor` afterward to confirm the registry state, then use a fresh
+`--model-url` with the model ID and checksum when the file must be downloaded
+again. Do not put credentials into a new registry or backup file.
+
 JSON output omits source text unless `--include-source` is specified.
 Translation memory stores source and translated text unless memory is disabled.
 
