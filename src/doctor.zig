@@ -38,9 +38,24 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
         return continueAfterModelCheck(allocator, paths, cfg, &checks, ok, json);
     };
     try checks.append(.{ .name = "models", .status = .ok, .message = "models.toml is readable" });
+    try appendUnsafeRemoteUrlCheck(list, &checks);
     if (!have_config) return print(allocator, checks.items, ok, json);
     try appendModelChecks(allocator, list, cfg, &checks, &ok);
     return continueAfterModelCheck(allocator, paths, cfg, &checks, ok, json);
+}
+
+fn appendUnsafeRemoteUrlCheck(list: models.List, checks: *std.array_list.Managed(Check)) !void {
+    for (list.models) |model| {
+        if (models.url.hasUnsafeMetadata(model.download_url) or models.url.hasUnsafeMetadata(model.source_url)) {
+            try checks.append(.{
+                .name = "model_source_credentials",
+                .status = .warn,
+                .code = "model_source_credentials",
+                .message = "Model registry contains unsafe remote URL metadata. Reads do not change it; the next registry write removes unsafe URL fields. Re-pull with a fresh --model-url when needed.",
+            });
+            return;
+        }
+    }
 }
 
 fn appendModelChecks(allocator: std.mem.Allocator, list_opt: ?models.List, cfg: config.Config, checks: *std.array_list.Managed(Check), ok: *bool) !void {
@@ -113,4 +128,124 @@ fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u
         for (checks) |check| sys.stdoutPrint("{s}: {s}: {s}\n", .{ @tagName(check.status), check.name, check.message });
     }
     return if (ok) 0 else 1;
+}
+
+const TestStdoutCapture = struct {
+    const c = std.c;
+    saved: c_int,
+
+    fn start(file: std.Io.File) !TestStdoutCapture {
+        const saved = c.dup(std.posix.STDOUT_FILENO);
+        if (saved < 0) return error.CaptureFailed;
+        errdefer _ = c.close(saved);
+        if (c.dup2(file.handle, std.posix.STDOUT_FILENO) < 0) return error.CaptureFailed;
+        return .{ .saved = saved };
+    }
+
+    fn restore(self: *TestStdoutCapture) void {
+        if (self.saved < 0) return;
+        if (c.dup2(self.saved, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
+        if (c.close(self.saved) != 0) @panic("stdout capture close failed");
+        self.saved = -1;
+    }
+};
+
+fn testDoctorPaths(allocator: std.mem.Allocator, root: []const u8) !xdg.Paths {
+    return .{
+        .config_dir = root,
+        .data_dir = root,
+        .cache_dir = root,
+        .state_dir = root,
+        .config_file = try std.fs.path.join(allocator, &.{ root, "config.toml" }),
+        .models_file = try std.fs.path.join(allocator, &.{ root, "models.toml" }),
+        .models_dir = root,
+        .glossary_file = try std.fs.path.join(allocator, &.{ root, "glossary.toml" }),
+        .memory_file = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" }),
+    };
+}
+
+fn countText(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |index| {
+        count += 1;
+        rest = rest[index + needle.len ..];
+    }
+    return count;
+}
+
+test "secret URL doctor ignores sanitized source and local metadata" {
+    var checks = std.array_list.Managed(Check).init(std.testing.allocator);
+    defer checks.deinit();
+    var safe_models = [_]models.Model{
+        .{ .id = "sanitized36", .source_url = "https://models.example.invalid/sanitized.gguf" },
+        .{ .id = "local36", .path = "/local/model?#.gguf" },
+    };
+    const list = models.List{ .models = &safe_models };
+    try appendUnsafeRemoteUrlCheck(list, &checks);
+    try std.testing.expectEqual(@as(usize, 0), checks.items.len);
+}
+
+test "secret URL doctor scans all legacy entries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testDoctorPaths(allocator, root);
+    const model_path = try std.fs.path.join(allocator, &.{ root, "safe.gguf" });
+    try sys.writeFile(model_path, "safe model");
+    const config_text = try std.fmt.allocPrint(allocator, "model_id = \"safe36\"\nmodel_path = \"{s}\"\n", .{model_path});
+    defer allocator.free(config_text);
+    try sys.writeFile(paths.config_file, config_text);
+    const registry_text = try std.fmt.allocPrint(allocator, "[[models]]\nid = \"safe36\"\npath = \"{s}\"\nsource_url = \"https://models.example.invalid/safe.gguf\"\n\n" ++
+        "[[models]]\nid = \"signed36\"\ndownload_url = \"https://models.example.invalid/signed.gguf?token=KOTOBA_QUERY_SECRET_36\"\nsource_url = \"https://models.example.invalid/signed.gguf\"\n\n" ++
+        "[[models]]\nid = \"userinfo36\"\ndownload_url = \"https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/userinfo.gguf\"\n\n" ++
+        "[[models]]\nid = \"sanitized36\"\nsource_url = \"https://models.example.invalid/sanitized.gguf\"\n\n" ++
+        "[[models]]\nid = \"local36\"\npath = \"/local/model?#.gguf\"\n", .{model_path});
+    defer allocator.free(registry_text);
+    try sys.writeFile(paths.models_file, registry_text);
+    var db = try memory.open(allocator, paths.memory_file);
+    db.close();
+    try sys.writeFile(paths.glossary_file, glossary.defaultTemplate());
+
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    const exit_code = try run(allocator, paths, false);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqual(@as(usize, 1), countText(rendered, "warn: model_source_credentials: "));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_QUERY_SECRET_36") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_USER_36") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "local36") == null);
+}
+
+test "secret URL doctor warning uses only static text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testDoctorPaths(allocator, root);
+    const registry = "[[models]]\nid = \"legacy36\"\ndownload_url = \"https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/legacy.gguf?token=KOTOBA_QUERY_SECRET_36#KOTOBA_FRAGMENT_SECRET_36\"\n";
+    try sys.writeFile(paths.models_file, registry);
+    const before = try sys.readFileAlloc(allocator, paths.models_file, 8192);
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    const exit_code = try run(allocator, paths, true);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expectEqualStrings(before, try sys.readFileAlloc(allocator, paths.models_file, 8192));
+    try std.testing.expectEqual(@as(usize, 1), countText(rendered, "\"name\":\"model_source_credentials\""));
+    try std.testing.expectEqual(@as(usize, 1), countText(rendered, "\"code\":\"model_source_credentials\""));
+    try std.testing.expectEqual(@as(usize, 1), countText(rendered, "Model registry contains unsafe remote URL metadata. Reads do not change it; the next registry write removes unsafe URL fields. Re-pull with a fresh --model-url when needed."));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_") == null);
 }
