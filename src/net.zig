@@ -48,7 +48,9 @@ fn getToWriter(
     var redirects_remaining: u8 = 3;
     while (true) {
         const uri = try url_policy.parseRemote(current_url);
-        var req = try client.request(.GET, uri, .{
+        var request_uri = uri;
+        request_uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else "https";
+        var req = try client.request(.GET, request_uri, .{
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -121,6 +123,43 @@ test "fetchAlloc enforces max bytes without unbounded growth" {
     const url = try server.url(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectError(error.StreamTooLong, fetchAlloc(std.testing.allocator, url, 5));
+}
+
+test "fetchAlloc accepts case-insensitive HTTP schemes at request boundaries" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "HTTP", "hTtP" }) |scheme| {
+        var server = try TestHttpServer.start("scheme-body");
+        defer server.stop();
+        const base_url = try server.url(allocator);
+        defer allocator.free(base_url);
+        const initial_url = try std.fmt.allocPrint(allocator, "{s}{s}?x=a%2Bb&x=2#fragment", .{ scheme, base_url["http".len..] });
+        defer allocator.free(initial_url);
+
+        const body = try fetchAlloc(allocator, initial_url, 64);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings("scheme-body", body);
+        try server.expectStopped(1, 1, 0);
+        try server.expectTarget(0, "/fixture?x=a%2Bb&x=2");
+    }
+
+    var target = try TestHttpServer.start("scheme-body");
+    defer target.stop();
+    const target_url = try target.url(allocator);
+    defer allocator.free(target_url);
+    const location = try std.fmt.allocPrint(allocator, "HtTp{s}?x=a%2Bb&x=2#fragment", .{target_url["http".len..]});
+    defer allocator.free(location);
+    var redirect = try TestHttpServer.startRedirect(location);
+    defer redirect.stop();
+    const redirect_url = try redirect.url(allocator);
+    defer allocator.free(redirect_url);
+
+    const body = try fetchAlloc(allocator, redirect_url, 64);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("scheme-body", body);
+    try redirect.expectStopped(1, 1, 0);
+    try redirect.expectTarget(0, "/fixture");
+    try target.expectStopped(1, 1, 0);
+    try target.expectTarget(0, "/fixture?x=a%2Bb&x=2");
 }
 
 test "downloadToFile streams response body to destination" {
