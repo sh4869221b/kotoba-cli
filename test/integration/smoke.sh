@@ -215,9 +215,29 @@ checksum = "{SUM}"
     return source, models_file
 
 
+def log_case_start(name, args, observer):
+    print(f"network case {name}: phase=start argv={json.dumps([BIN, *args])} port={observer.port}")
+
+
+def log_case_complete(name, args, observer, process):
+    print(f"network case {name}: phase=complete argv={json.dumps([BIN, *args])} port={observer.port} exit={process.returncode} connections={observer.connections} observer_cleanup=ok")
+
+
+def assert_connection_count(name, args, observer, expected_connections):
+    matches = observer.connections == expected_connections if isinstance(expected_connections, int) else observer.connections >= 1
+    if not matches:
+        print(f"network case {name}: phase=assertions outcome=failed assertion=connections argv={json.dumps([BIN, *args])} port={observer.port} expected={expected_connections} observed={observer.connections}")
+    assert matches, (name, observer.connections)
+
+
+def log_case_pass(name, args, observer):
+    print(f"network case {name}: phase=assertions outcome=passed argv={json.dumps([BIN, *args])} port={observer.port}")
+
+
 def run_case(name, root, args, expected_exit, expected_connections, stdout=None, stderr_parts=(), reset_registry=True):
     observer = Observer()
     process = None
+    log_case_start(name, args, observer)
     try:
         if reset_registry:
             write_registry(root, observer.port)
@@ -226,13 +246,14 @@ def run_case(name, root, args, expected_exit, expected_connections, stdout=None,
         raise AssertionError(f"{name}: subprocess timeout: {error}") from error
     finally:
         observer.close()
-    print(f"network case {name}: exit={process.returncode} connections={observer.connections} observer_cleanup=ok")
-    assert (observer.connections == expected_connections if isinstance(expected_connections, int) else observer.connections >= 1), (name, observer.connections)
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, expected_connections)
     assert process.returncode == expected_exit, (name, process.returncode, process.stderr)
     if stdout is not None:
         assert process.stdout == stdout, (name, process.stdout)
     for part in stderr_parts:
         assert part.encode() in process.stderr, (name, process.stderr)
+    log_case_pass(name, args, observer)
     return process
 
 
@@ -244,6 +265,7 @@ for name, args in (
     ("init-absent-path", ["init", "--model-id", "boundary-absent-path", "--yes"]),
 ):
     observer = Observer()
+    log_case_start(name, args, observer)
     try:
         _, models_file = write_registry(fresh, observer.port)
         config_file = fresh / "config" / "kotoba" / "config.toml"
@@ -251,14 +273,15 @@ for name, args in (
         process = subprocess.run([BIN, *args], env=env_for(fresh), capture_output=True, timeout=10)
     finally:
         observer.close()
-    print(f"network case {name}: exit={process.returncode} connections={observer.connections} observer_cleanup=ok")
-    assert observer.connections == 0, (name, observer.connections)
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, 0)
     assert process.returncode == 1 and process.stdout == b"" and process.stderr == (HINT + MODEL_MISSING).encode()
     assert not config_file.exists()
     assert not (fresh / "data" / "kotoba" / "memory.sqlite3").exists()
     assert models_file.read_bytes() == registry_before
     assert not list((fresh / "data" / "kotoba" / "models").glob("*.gguf"))
     assert not list((fresh / "data" / "kotoba" / "models").glob("*.tmp-*"))
+    log_case_pass(name, args, observer)
 
 run_case("init-yes", fresh, ["init", "--yes"], 0, 0, b"initialized\n")
 run_case("init-installed", fresh, ["init", "--model-id", "boundary-installed", "--yes"], 0, 0, b"initialized\n")
@@ -292,6 +315,7 @@ for name, args in (
     ("existing-absent-path", ["init", "--model-id", "boundary-absent-path", "--yes"]),
 ):
     observer = Observer()
+    log_case_start(name, args, observer)
     try:
         _, models_file = write_registry(existing, observer.port)
         config_file = existing / "config" / "kotoba" / "config.toml"
@@ -302,14 +326,15 @@ for name, args in (
         process = subprocess.run([BIN, *args], env=env_for(existing), capture_output=True, timeout=10)
     finally:
         observer.close()
-    print(f"network case {name}: exit={process.returncode} connections={observer.connections} observer_cleanup=ok")
-    assert observer.connections == 0, (name, observer.connections)
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, 0)
     assert process.returncode == 1 and process.stdout == b"" and process.stderr == (HINT + MODEL_MISSING).encode()
     assert config_file.read_bytes() == config_before
     assert models_file.read_bytes() == registry_before
     assert memory_file.read_bytes() == memory_before
     assert not list((existing / "data" / "kotoba" / "models").glob("*.gguf"))
     assert not list((existing / "data" / "kotoba" / "models").glob("*.tmp-*"))
+    log_case_pass(name, args, observer)
 
 pull_root = TMP / "boundary-pull"
 run_case("explicit-pull-positive-control", pull_root, ["models", "pull", "boundary-pending", "--output", str(pull_root / "pull-probe.gguf")], 1, ">=1", b"", ("model_registry_invalid",))
