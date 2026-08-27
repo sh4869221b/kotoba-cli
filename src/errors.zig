@@ -11,6 +11,7 @@ pub const Code = enum {
     llama_decode_failed,
     model_not_selected,
     model_registry_invalid,
+    model_source_required,
     split_model_unsupported,
     checksum_failed,
     timeout,
@@ -34,6 +35,7 @@ pub const Code = enum {
             .llama_decode_failed => "llama_decode_failed",
             .model_not_selected => "model_not_selected",
             .model_registry_invalid => "model_registry_invalid",
+            .model_source_required => "model_source_required",
             .split_model_unsupported => "split_model_unsupported",
             .checksum_failed => "checksum_failed",
             .timeout => "timeout",
@@ -59,6 +61,7 @@ pub const Error = error{
     LlamaDecodeFailed,
     ModelNotSelected,
     ModelRegistryInvalid,
+    ModelSourceRequired,
     SplitModelUnsupported,
     ChecksumFailed,
     Timeout,
@@ -95,6 +98,7 @@ pub fn fromError(err: anyerror) AppError {
         Error.LlamaDecodeFailed => .{ .code = .llama_decode_failed, .message = "Embedded llama.cpp generation failed." },
         Error.ModelNotSelected => .{ .code = .model_not_selected, .message = "No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`." },
         Error.ModelRegistryInvalid => .{ .code = .model_registry_invalid, .message = "Model registry entry is invalid." },
+        Error.ModelSourceRequired => .{ .code = .model_source_required, .message = "Model has no reusable download URL. Run kotoba models pull --model-url HTTPS_URL --id ID --checksum SHA256 with a fresh URL." },
         Error.SplitModelUnsupported => .{ .code = .split_model_unsupported, .message = "Split GGUF models are not supported by this command yet. Use a single-file GGUF model." },
         Error.ChecksumFailed => .{ .code = .checksum_failed, .message = "Model checksum verification failed." },
         Error.Timeout => .{ .code = .timeout, .message = "The operation timed out." },
@@ -115,4 +119,15 @@ pub fn printHuman(app_err: AppError) void {
 
 pub fn writeJson(app_err: AppError) void {
     sys.stdoutPrint("{{\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}\n", .{ app_err.code.asText(), app_err.message });
+}
+
+test "secret URL missing source and invalid arguments error mapping" {
+    const missing = fromError(Error.ModelSourceRequired);
+    try std.testing.expectEqualStrings("model_source_required", missing.code.asText());
+    try std.testing.expectEqual(@as(u8, 1), missing.exitCode());
+    try std.testing.expectEqualStrings("Model has no reusable download URL. Run kotoba models pull --model-url HTTPS_URL --id ID --checksum SHA256 with a fresh URL.", missing.message);
+    const invalid = fromError(Error.InvalidArguments);
+    try std.testing.expectEqualStrings("invalid_arguments", invalid.code.asText());
+    try std.testing.expectEqual(@as(u8, 2), invalid.exitCode());
+    try std.testing.expectEqualStrings("Invalid arguments.", invalid.message);
 }
