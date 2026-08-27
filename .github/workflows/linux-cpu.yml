@@ -1,0 +1,72 @@
+name: Linux CPU
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-cpu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  format:
+    name: Linux CPU / format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Run format checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-format
+        run: bash test/ci/linux.sh format
+  build:
+    name: Linux CPU / build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Run build checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-build
+        run: bash test/ci/linux.sh build
+  unit:
+    name: Linux CPU / unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Run unit checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-unit
+        run: bash test/ci/linux.sh unit
+  integration:
+    name: Linux CPU / integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - name: Run integration checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-integration
+        run: bash test/ci/linux.sh integration

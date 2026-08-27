@@ -12,7 +12,7 @@ while (($#)); do
     *) invalid ;;
   esac
 done
-case "$CASE" in pin|probe|runner|cache|tools|all) ;; *) invalid ;; esac
+case "$CASE" in pin|probe|runner|cache|tools|stages|all) ;; *) invalid ;; esac
 [[ "$EVIDENCE" == /* ]] || invalid
 mkdir -p "$EVIDENCE"
 EVIDENCE="$(cd "$EVIDENCE" && pwd)"
@@ -302,6 +302,48 @@ case_tools() {
   assert 'probe compiler failure rejected' test "$STATUS" -ne 0
   assert 'probe compiler failure named' grep -q 'cc fixture tool failure' "$TMP/tools-cc.stderr"
   assert 'compiler failure installs no binary' test ! -e "$TMP/cc-failed-prefix/bin/kotoba"
+}
+case_stages() {
+  local stage name diagnostic
+  for stage in format unit build integration; do
+    fixture "stage-$stage"
+    mkdir -p "$FIXTURE/test/ci"
+    cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+    cp "$ROOT/test/integration/build_contract.sh" "$FIXTURE/test/integration/build_contract.sh"
+    cd "$FIXTURE"
+    cp build.zig "$TMP/stage-$stage-build.saved"
+    cp src/main.zig "$TMP/stage-$stage-main.saved"
+    sha256sum build.zig src/main.zig >>"$TMP/hashes.txt"
+    git status --short >"$TMP/stage-$stage-before"
+    name="stage-$stage-baseline"
+    capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh "$stage"
+    assert "$stage real baseline passes" test "$STATUS" -eq 0
+    case "$stage" in
+      format) printf '\nconst ci_format_probe=1;\n' >>build.zig; diagnostic='build.zig' ;;
+      unit) printf '\ntest "ci forced failure" { return error.CiFailure; }\n' >>src/main.zig; diagnostic='ci forced failure' ;;
+      build) printf '\nconst ci_invalid = ;\n' >>src/main.zig; diagnostic="expected expression" ;;
+      integration) diagnostic='benchmark validation failed: direct translated text mismatch' ;;
+    esac
+    name="stage-$stage-mutated"
+    if [[ "$stage" == integration ]]; then
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" KOTOBA_BENCH_EXPECT_MISMATCH=1 bash test/ci/linux.sh "$stage"
+    else
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh "$stage"
+    fi
+    assert "$stage real mutation fails" test "$STATUS" -ne 0
+    assert "$stage intended failure observed" grep -Fq "$diagnostic" "$TMP/$name.stdout" "$TMP/$name.stderr"
+    cp "$TMP/stage-$stage-build.saved" build.zig
+    cp "$TMP/stage-$stage-main.saved" src/main.zig
+    assert "$stage build source restored" cmp -s "$TMP/stage-$stage-build.saved" build.zig
+    assert "$stage main source restored" cmp -s "$TMP/stage-$stage-main.saved" src/main.zig
+    name="stage-$stage-restored"
+    capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh "$stage"
+    assert "$stage real restored passes" test "$STATUS" -eq 0
+    git status --short >"$TMP/stage-$stage-after"
+    assert "$stage fixture source status unchanged" cmp -s "$TMP/stage-$stage-before" "$TMP/stage-$stage-after"
+    printf '%s\tbaseline=0\tmutation=nonzero\trestored=0\tsource_restored=yes\n' "$stage" >>"$TMP/counts.tsv"
+    cd "$ROOT"
+  done
 }
 if [[ "$CASE" == all ]]; then CASES=(pin probe runner cache tools); else CASES=("$CASE"); fi
 for ACTIVE_CASE in "${CASES[@]}"; do
