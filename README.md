@@ -12,6 +12,30 @@ kotoba translate "Hello world" --to ja
 Normal translation performs no network request. Network access is used only
 when you explicitly run `kotoba models pull` for an HTTPS model source.
 
+## Model Setup
+
+`kotoba init` never downloads a model. Initialize with an existing registered
+local model, supply `--model-path`, or import a local GGUF first:
+
+```bash
+kotoba models import --id local-ja --path /path/to/model.gguf --use
+kotoba init --model-id local-ja --yes
+```
+
+For a registered downloadable model, acquire and select it explicitly before
+initialization:
+
+```bash
+kotoba models pull ID --use
+kotoba init --model-id ID --yes
+```
+
+Previously, `init --model-id ID` could acquire a URL-only registry entry. It
+now exits 1 with an instruction to run `models pull` or provide `--model-path`.
+`models pull` keeps its existing HTTPS, direct URL, and Hugging Face command
+forms; an HTTPS download completes only when its normal download and checksum
+verification succeed.
+
 JSON output omits source text unless `--include-source` is specified.
 Translation memory stores source and translated text unless memory is disabled.
 
