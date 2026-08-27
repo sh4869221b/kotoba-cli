@@ -59,6 +59,13 @@ pub fn build(b: *std.Build) void {
     linkLlama(b, tests, target, llama_options);
     tests.step.dependOn(llama_build);
     tests.step.dependOn(llama_probe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    const install_tests = b.addInstallArtifact(tests, .{
+        .dest_sub_path = "kotoba-tests",
+    });
+    const test_artifacts_step = b.step("test-artifacts", "Install kotoba and unit-test artifacts without running tests");
+    test_artifacts_step.dependOn(&install_exe.step);
+    test_artifacts_step.dependOn(&install_tests.step);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

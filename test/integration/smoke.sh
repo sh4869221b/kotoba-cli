@@ -1,66 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TMP="${TMPDIR:-/tmp}/kotoba-smoke-$$"
-BENCH_JSON="/tmp/kotoba-smoke-bench.json"
-
-cleanup() {
-  rm -rf "${TMP}"
-  rm -f "${BENCH_JSON}"
-}
-trap cleanup EXIT
-
-mkdir -p "${TMP}"
-
-export XDG_CONFIG_HOME="${TMP}/config"
-export XDG_DATA_HOME="${TMP}/data"
-export XDG_CACHE_HOME="${TMP}/cache"
-export XDG_STATE_HOME="${TMP}/state"
-
-env ZIG_GLOBAL_CACHE_DIR="${ROOT}/.zig-cache/global" zig build -Dtest-backend=true
-
-BIN="${ROOT}/zig-out/bin/kotoba"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common.sh"
+harness_init smoke
+harness_build_snapshot test
+BENCH_JSON="${TMP}/bench.json"
 
 if rg -n 'curl|findHfFileWithCurl|downloadWithCurl' "${ROOT}/src"; then
   echo "runtime source should not depend on curl" >&2
   exit 1
 fi
-rg -n 'llama_log_set' "${ROOT}/src/llama.zig" >/tmp/kotoba-smoke-llama-log-set.out
-rg -n 'progress_callback' "${ROOT}/src/llama.zig" >/tmp/kotoba-smoke-llama-progress-callback.out
+rg -n 'llama_log_set' "${ROOT}/src/llama.zig" >"${TMP}/llama-log-set.out"
+rg -n 'progress_callback' "${ROOT}/src/llama.zig" >"${TMP}/llama-progress-callback.out"
 
-"${BIN}" config list >/tmp/kotoba-smoke-config-list-preinit.out
-grep -q '^model_id$' /tmp/kotoba-smoke-config-list-preinit.out
+"${BIN}" config list >"${TMP}/config-list-preinit.out"
+grep -q '^model_id$' "${TMP}/config-list-preinit.out"
 
-"${BIN}" init --yes >/tmp/kotoba-smoke-init.out
-"${BIN}" config list >/tmp/kotoba-smoke-config-list.out
-grep -q '^model_id$' /tmp/kotoba-smoke-config-list.out
-grep -q '^gpu_layers$' /tmp/kotoba-smoke-config-list.out
-grep -q '^context_length$' /tmp/kotoba-smoke-config-list.out
-if grep -Eq 'server_url|runtime|server_autostart|llama_server_path|server_startup_timeout_sec' /tmp/kotoba-smoke-config-list.out; then
+"${BIN}" init --yes >"${TMP}/init.out"
+"${BIN}" config list >"${TMP}/config-list.out"
+grep -q '^model_id$' "${TMP}/config-list.out"
+grep -q '^gpu_layers$' "${TMP}/config-list.out"
+grep -q '^context_length$' "${TMP}/config-list.out"
+if grep -Eq 'server_url|runtime|server_autostart|llama_server_path|server_startup_timeout_sec' "${TMP}/config-list.out"; then
   echo "config list exposes removed server keys" >&2
   exit 1
 fi
-"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-default.out
-[[ "$(cat /tmp/kotoba-smoke-gpu-layers-default.out)" == "-1" ]]
+"${BIN}" config get gpu_layers >"${TMP}/gpu-layers-default.out"
+[[ "$(cat "${TMP}/gpu-layers-default.out")" == "-1" ]]
 "${BIN}" config set gpu_layers 0
-"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-zero.out
-[[ "$(cat /tmp/kotoba-smoke-gpu-layers-zero.out)" == "0" ]]
+"${BIN}" config get gpu_layers >"${TMP}/gpu-layers-zero.out"
+[[ "$(cat "${TMP}/gpu-layers-zero.out")" == "0" ]]
 "${BIN}" config set gpu_layers -2
-"${BIN}" config get gpu_layers >/tmp/kotoba-smoke-gpu-layers-negative.out
-[[ "$(cat /tmp/kotoba-smoke-gpu-layers-negative.out)" == "-2" ]]
+"${BIN}" config get gpu_layers >"${TMP}/gpu-layers-negative.out"
+[[ "$(cat "${TMP}/gpu-layers-negative.out")" == "-2" ]]
 
-if "${BIN}" config set server_url http://127.0.0.1:8080 >/tmp/kotoba-smoke-server-url.out 2>/tmp/kotoba-smoke-server-url.err; then
+if "${BIN}" config set server_url http://127.0.0.1:8080 >"${TMP}/server-url.out" 2>"${TMP}/server-url.err"; then
   echo "removed server_url key should be rejected" >&2
   exit 1
 fi
-grep -q 'invalid_arguments' /tmp/kotoba-smoke-server-url.err
+grep -q 'invalid_arguments' "${TMP}/server-url.err"
 
 printf 'toy model bytes' >"${TMP}/toy-source.gguf"
 SUM="$(sha256sum "${TMP}/toy-source.gguf" | awk '{print $1}')"
-"${BIN}" init --model-id init-local --model-path "${TMP}/toy-source.gguf" --yes >/tmp/kotoba-smoke-init-model.out
-"${BIN}" models info init-local >/tmp/kotoba-smoke-init-model-info.out
-grep -q '^path: '"${TMP}"'/toy-source.gguf$' /tmp/kotoba-smoke-init-model-info.out
+"${BIN}" init --model-id init-local --model-path "${TMP}/toy-source.gguf" --yes >"${TMP}/init-model.out"
+"${BIN}" models info init-local >"${TMP}/init-model-info.out"
+grep -q '^path: '"${TMP}"'/toy-source.gguf$' "${TMP}/init-model-info.out"
 
 cat >>"${XDG_CONFIG_HOME}/kotoba/models.toml" <<TOML
 
@@ -81,13 +66,13 @@ recommended = true
 notes = "Metadata should survive init path updates."
 TOML
 
-"${BIN}" init --model-id init-preserve --model-path "${TMP}/toy-source.gguf" --yes >/tmp/kotoba-smoke-init-preserve.out
-"${BIN}" models info init-preserve >/tmp/kotoba-smoke-init-preserve-info.out
-grep -q '^path: '"${TMP}"'/toy-source.gguf$' /tmp/kotoba-smoke-init-preserve-info.out
-grep -q '^download_url: file://'"${TMP}"'/toy-source.gguf$' /tmp/kotoba-smoke-init-preserve-info.out
-grep -q '^checksum: '"${SUM}"'$' /tmp/kotoba-smoke-init-preserve-info.out
-grep -q '^quantization: Q4_K_M$' /tmp/kotoba-smoke-init-preserve-info.out
-grep -q '^recommended: true$' /tmp/kotoba-smoke-init-preserve-info.out
+"${BIN}" init --model-id init-preserve --model-path "${TMP}/toy-source.gguf" --yes >"${TMP}/init-preserve.out"
+"${BIN}" models info init-preserve >"${TMP}/init-preserve-info.out"
+grep -q '^path: '"${TMP}"'/toy-source.gguf$' "${TMP}/init-preserve-info.out"
+grep -q '^download_url: file://'"${TMP}"'/toy-source.gguf$' "${TMP}/init-preserve-info.out"
+grep -q '^checksum: '"${SUM}"'$' "${TMP}/init-preserve-info.out"
+grep -q '^quantization: Q4_K_M$' "${TMP}/init-preserve-info.out"
+grep -q '^recommended: true$' "${TMP}/init-preserve-info.out"
 
 cat >>"${XDG_CONFIG_HOME}/kotoba/models.toml" <<TOML
 
@@ -108,7 +93,7 @@ recommended = true
 notes = "Smoke-test init downloadable source."
 TOML
 
-"${BIN}" init --model-id init-download --yes >/tmp/kotoba-smoke-init-download.out
+"${BIN}" init --model-id init-download --yes >"${TMP}/init-download.out"
 "${BIN}" models verify init-download
 grep -q '^model_id = "init-download"$' "${XDG_CONFIG_HOME}/kotoba/config.toml"
 grep -q '^model_path = "'"${XDG_DATA_HOME}"'/kotoba/models/init-download.gguf"$' "${XDG_CONFIG_HOME}/kotoba/config.toml"
@@ -163,9 +148,9 @@ recommended = false
 notes = "Smoke-test local pull without curl."
 TOML
 
-PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" config list >/tmp/kotoba-smoke-no-curl-config.out
-PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" models pull no-curl-pull --output "${TMP}/no-curl-file-pull.gguf" >/tmp/kotoba-smoke-no-curl-pull.out
-grep -q '^pulled no-curl-pull$' /tmp/kotoba-smoke-no-curl-pull.out
+PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" config list >"${TMP}/no-curl-config.out"
+PATH="${NO_CURL_BIN}:${PATH}" "${BIN}" models pull no-curl-pull --output "${TMP}/no-curl-file-pull.gguf" >"${TMP}/no-curl-pull.out"
+grep -q '^pulled no-curl-pull$' "${TMP}/no-curl-pull.out"
 
 "${BIN}" models remove toy-pull --yes
 if [[ -e "${XDG_DATA_HOME}/kotoba/models/toy-pull.gguf" ]]; then
@@ -192,14 +177,14 @@ recommended = false
 notes = "Smoke-test positional checksum override."
 TOML
 
-if "${BIN}" models pull toy-pull-override --checksum deadbeef >/tmp/kotoba-smoke-pull-bad-checksum.out 2>/tmp/kotoba-smoke-pull-bad-checksum.err; then
+if "${BIN}" models pull toy-pull-override --checksum deadbeef >"${TMP}/pull-bad-checksum.out" 2>"${TMP}/pull-bad-checksum.err"; then
   echo "positional pull should apply explicit checksum" >&2
   exit 1
 fi
-grep -q 'checksum_failed' /tmp/kotoba-smoke-pull-bad-checksum.err
+grep -q 'checksum_failed' "${TMP}/pull-bad-checksum.err"
 "${BIN}" models pull toy-pull-override --checksum "${SUM}"
-"${BIN}" models info toy-pull-override >/tmp/kotoba-smoke-pull-override-info.out
-grep -q '^checksum: '"${SUM}"'$' /tmp/kotoba-smoke-pull-override-info.out
+"${BIN}" models info toy-pull-override >"${TMP}/pull-override-info.out"
+grep -q '^checksum: '"${SUM}"'$' "${TMP}/pull-override-info.out"
 "${BIN}" models remove toy-pull-override --yes
 
 shared_model="${XDG_DATA_HOME}/kotoba/models/shared.gguf"
@@ -305,99 +290,151 @@ if [[ ! -e "${XDG_DATA_HOME}/kotoba/outside.gguf" ]]; then
   exit 1
 fi
 
-if "${BIN}" models pull --model-url https://example.invalid/model.gguf --id unchecked >/tmp/kotoba-smoke-unchecked-url.out 2>/tmp/kotoba-smoke-unchecked-url.err; then
+if "${BIN}" models pull --model-url https://example.invalid/model.gguf --id unchecked >"${TMP}/unchecked-url.out" 2>"${TMP}/unchecked-url.err"; then
   echo "direct HTTPS model-url pull should require checksum" >&2
   exit 1
 fi
-grep -q 'invalid_arguments' /tmp/kotoba-smoke-unchecked-url.err
+grep -q 'invalid_arguments' "${TMP}/unchecked-url.err"
 
 "${BIN}" models import --id toy --path "${TMP}/toy-source.gguf" --name "Toy Local" --checksum "${SUM}" --use
 printf 'bad model bytes' >"${TMP}/bad-source.gguf"
-if "${BIN}" models import --id toy --path "${TMP}/bad-source.gguf" --checksum "${SUM}" >/tmp/kotoba-smoke-bad-import.out 2>/tmp/kotoba-smoke-bad-import.err; then
+if "${BIN}" models import --id toy --path "${TMP}/bad-source.gguf" --checksum "${SUM}" >"${TMP}/bad-import.out" 2>"${TMP}/bad-import.err"; then
   echo "checksum mismatch import should fail" >&2
   exit 1
 fi
-grep -q 'checksum_failed' /tmp/kotoba-smoke-bad-import.err
+grep -q 'checksum_failed' "${TMP}/bad-import.err"
 INSTALLED_SUM="$(sha256sum "${XDG_DATA_HOME}/kotoba/models/toy.gguf" | awk '{print $1}')"
 [[ "${INSTALLED_SUM}" == "${SUM}" ]]
-"${BIN}" models info toy >/tmp/kotoba-smoke-model-info.out
-grep -q '^id: toy$' /tmp/kotoba-smoke-model-info.out
-grep -q '^name: Toy Local$' /tmp/kotoba-smoke-model-info.out
+"${BIN}" models info toy >"${TMP}/model-info.out"
+grep -q '^id: toy$' "${TMP}/model-info.out"
+grep -q '^name: Toy Local$' "${TMP}/model-info.out"
 "${BIN}" models verify toy
 "${BIN}" models verify
 "${BIN}" config set model_path "${TMP}/missing-selected.gguf"
-if "${BIN}" models verify >/tmp/kotoba-smoke-selected-verify.out 2>/tmp/kotoba-smoke-selected-verify.err; then
+if "${BIN}" models verify >"${TMP}/selected-verify.out" 2>"${TMP}/selected-verify.err"; then
   echo "verify without an explicit id should check the selected config path" >&2
   exit 1
 fi
-grep -q 'model_missing' /tmp/kotoba-smoke-selected-verify.err
+grep -q 'model_missing' "${TMP}/selected-verify.err"
 "${BIN}" models use toy
-"${BIN}" doctor >/tmp/kotoba-smoke-doctor.out
-grep -q 'ok: model_registry: selected model is registered' /tmp/kotoba-smoke-doctor.out
-grep -q 'ok: model_checksum: configured model checksum matches registry' /tmp/kotoba-smoke-doctor.out
-"${BIN}" models list >/tmp/kotoba-smoke-model-list.out
-grep -q $'toy\tToy Local\tlocal\tcurrent' /tmp/kotoba-smoke-model-list.out
+"${BIN}" doctor >"${TMP}/doctor.out"
+grep -q 'ok: model_registry: selected model is registered' "${TMP}/doctor.out"
+grep -q 'ok: model_checksum: configured model checksum matches registry' "${TMP}/doctor.out"
+"${BIN}" models list >"${TMP}/model-list.out"
+grep -q $'toy\tToy Local\tlocal\tcurrent' "${TMP}/model-list.out"
 
-"${BIN}" translate "Hello" --to ja --no-memory \
-  >/tmp/kotoba-smoke-translate-direct.out \
-  2>/tmp/kotoba-smoke-translate-direct.err
-[[ "$(cat /tmp/kotoba-smoke-translate-direct.out)" == "JA:Hello" ]]
-[[ ! -s /tmp/kotoba-smoke-translate-direct.err ]]
+"${BIN}" translate "Hello" --from en --to ja --no-memory \
+  >"${TMP}/translate-direct.out" \
+  2>"${TMP}/translate-direct.err"
+[[ "$(cat "${TMP}/translate-direct.out")" == "JA:Hello" ]]
+[[ ! -s "${TMP}/translate-direct.err" ]]
 
 printf 'Hello from stdin' | "${BIN}" translate --to ja --no-memory \
-  >/tmp/kotoba-smoke-translate-stdin.out \
-  2>/tmp/kotoba-smoke-translate-stdin.err
-[[ "$(cat /tmp/kotoba-smoke-translate-stdin.out)" == "JA:Hello from stdin" ]]
-[[ ! -s /tmp/kotoba-smoke-translate-stdin.err ]]
+  >"${TMP}/translate-stdin.out" \
+  2>"${TMP}/translate-stdin.err"
+[[ "$(cat "${TMP}/translate-stdin.out")" == "JA:Hello from stdin" ]]
+[[ ! -s "${TMP}/translate-stdin.err" ]]
+
+printf 'First\nText:\nLast' | "${BIN}" translate --from en --to ja --no-memory \
+  >"${TMP}/translate-literal-marker.out" \
+  2>"${TMP}/translate-literal-marker.err"
+[[ "$(cat "${TMP}/translate-literal-marker.out")" == $'JA:First\nText:\nLast' ]]
+[[ ! -s "${TMP}/translate-literal-marker.err" ]]
+
+"${BIN}" translate "こんにちは" --from ja --to en --no-memory \
+  >"${TMP}/translate-ja-en.out" \
+  2>"${TMP}/translate-ja-en.err"
+[[ "$(cat "${TMP}/translate-ja-en.out")" == "EN:こんにちは" ]]
+[[ ! -s "${TMP}/translate-ja-en.err" ]]
 
 printf '# Hello\n' | "${BIN}" translate --to ja --format markdown --no-memory \
-  >/tmp/kotoba-smoke-translate-markdown.out \
-  2>/tmp/kotoba-smoke-translate-markdown.err
-[[ "$(cat /tmp/kotoba-smoke-translate-markdown.out)" == "JA:# Hello" ]]
-[[ ! -s /tmp/kotoba-smoke-translate-markdown.err ]]
+  >"${TMP}/translate-markdown.out" \
+  2>"${TMP}/translate-markdown.err"
+[[ "$(cat "${TMP}/translate-markdown.out")" == "JA:# Hello" ]]
+[[ ! -s "${TMP}/translate-markdown.err" ]]
 
-"${BIN}" translate "Hello" --to ja --format json --no-memory \
-  >/tmp/kotoba-smoke-translate-json.out \
-  2>/tmp/kotoba-smoke-translate-json.err
-json_out="$(cat /tmp/kotoba-smoke-translate-json.out)"
+"${BIN}" translate "Hello" --from en --to ja --format json --no-memory \
+  >"${TMP}/translate-json.out" \
+  2>"${TMP}/translate-json.err"
+json_out="$(cat "${TMP}/translate-json.out")"
 [[ "${json_out}" == *'"runtime":"embedded"'* ]]
 [[ "${json_out}" == *'"translated_text":"JA:Hello"'* ]]
 [[ "${json_out}" != *'"server_url"'* ]]
 [[ "${json_out}" != *'"source_text"'* ]]
-[[ ! -s /tmp/kotoba-smoke-translate-json.err ]]
+[[ ! -s "${TMP}/translate-json.err" ]]
+
+"${BIN}" translate "こんにちは" --from ja --to en --format json --no-memory \
+  >"${TMP}/translate-ja-en-json.out" \
+  2>"${TMP}/translate-ja-en-json.err"
+python3 - "${TMP}/translate-ja-en-json.out" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["source_lang"] == "ja"
+assert payload["target_lang"] == "en"
+assert payload["translated_text"] == "EN:こんにちは"
+PY
+[[ ! -s "${TMP}/translate-ja-en-json.err" ]]
+
+memory_source="task-6-memory-${RANDOM}-${RANDOM}"
+"${BIN}" translate "${memory_source}" --from en --to ja --format json \
+  >"${TMP}/translate-memory-first.json" \
+  2>"${TMP}/translate-memory-first.err"
+"${BIN}" translate "${memory_source}" --from en --to ja --format json \
+  >"${TMP}/translate-memory-second.json" \
+  2>"${TMP}/translate-memory-second.err"
+python3 - "${memory_source}" "${TMP}/translate-memory-first.json" "${TMP}/translate-memory-second.json" <<'PY'
+import json
+import sys
+
+source, first_path, second_path = sys.argv[1:]
+first = json.load(open(first_path, encoding="utf-8"))
+second = json.load(open(second_path, encoding="utf-8"))
+for payload in (first, second):
+    assert payload["source_lang"] == "en"
+    assert payload["target_lang"] == "ja"
+    assert payload["translated_text"] == f"JA:{source}"
+assert first["cache_status"] == "none"
+assert first["cached"] is False
+assert second["cache_status"] == "full"
+assert second["cached"] is True
+PY
+[[ ! -s "${TMP}/translate-memory-first.err" ]]
+[[ ! -s "${TMP}/translate-memory-second.err" ]]
 
 "${BIN}" translate "Hello" --to ja --format json --include-source --no-memory \
-  >/tmp/kotoba-smoke-translate-json-source.out \
-  2>/tmp/kotoba-smoke-translate-json-source.err
-json_source_out="$(cat /tmp/kotoba-smoke-translate-json-source.out)"
+  >"${TMP}/translate-json-source.out" \
+  2>"${TMP}/translate-json-source.err"
+json_source_out="$(cat "${TMP}/translate-json-source.out")"
 [[ "${json_source_out}" == *'"source_text":"Hello"'* ]]
-[[ ! -s /tmp/kotoba-smoke-translate-json-source.err ]]
+[[ ! -s "${TMP}/translate-json-source.err" ]]
 
 if command -v script >/dev/null 2>&1 && script --version >/dev/null 2>&1; then
-  script -q -e -c "\"${BIN}\" translate \"Hello\" --to ja --no-memory" /tmp/kotoba-smoke-translate-pty.raw >/dev/null
-  tr -d '\r' </tmp/kotoba-smoke-translate-pty.raw | sed '/^$/d; /^Script started /d; /^Script done /d' >/tmp/kotoba-smoke-translate-pty.out
-  [[ "$(cat /tmp/kotoba-smoke-translate-pty.out)" == "JA:Hello" ]]
+  script -q -e -c "\"${BIN}\" translate \"Hello\" --to ja --no-memory" "${TMP}/translate-pty.raw" >/dev/null
+  tr -d '\r' <"${TMP}/translate-pty.raw" | sed '/^$/d; /^Script started /d; /^Script done /d' >"${TMP}/translate-pty.out"
+  [[ "$(cat "${TMP}/translate-pty.out")" == "JA:Hello" ]]
 fi
 
 "${BIN}" translate "Hello" --to ja --debug --no-memory \
-  >/tmp/kotoba-smoke-translate-debug.out \
-  2>/tmp/kotoba-smoke-translate-debug.err
-[[ "$(cat /tmp/kotoba-smoke-translate-debug.out)" == "JA:Hello" ]]
-grep -q 'diagnostics enabled' /tmp/kotoba-smoke-translate-debug.err
+  >"${TMP}/translate-debug.out" \
+  2>"${TMP}/translate-debug.err"
+[[ "$(cat "${TMP}/translate-debug.out")" == "JA:Hello" ]]
+grep -q 'diagnostics enabled' "${TMP}/translate-debug.err"
 
 "${BIN}" config set log_level debug
 "${BIN}" translate "Hello" --to ja --no-memory \
-  >/tmp/kotoba-smoke-translate-config-debug.out \
-  2>/tmp/kotoba-smoke-translate-config-debug.err
-[[ "$(cat /tmp/kotoba-smoke-translate-config-debug.out)" == "JA:Hello" ]]
-grep -q 'diagnostics enabled' /tmp/kotoba-smoke-translate-config-debug.err
+  >"${TMP}/translate-config-debug.out" \
+  2>"${TMP}/translate-config-debug.err"
+[[ "$(cat "${TMP}/translate-config-debug.out")" == "JA:Hello" ]]
+grep -q 'diagnostics enabled' "${TMP}/translate-config-debug.err"
 "${BIN}" config set log_level warn
 
-if "${BIN}" translate "Hello" --to ja --allow-remote-server >/tmp/kotoba-smoke-remote.out 2>/tmp/kotoba-smoke-remote.err; then
+if "${BIN}" translate "Hello" --to ja --allow-remote-server >"${TMP}/remote.out" 2>"${TMP}/remote.err"; then
   echo "removed --allow-remote-server option should be rejected" >&2
   exit 1
 fi
-grep -q 'invalid_arguments' /tmp/kotoba-smoke-remote.err
+grep -q 'invalid_arguments' "${TMP}/remote.err"
 
 bash "${ROOT}/test/integration/bench.sh" >"${BENCH_JSON}"
 grep -q '"benchmark":"translate"' "${BENCH_JSON}"
@@ -408,22 +445,22 @@ echo "benchmark assertions ok"
 
 "${BIN}" models use toy
 "${BIN}" models remove toy --yes
-if "${BIN}" models verify >/tmp/kotoba-smoke-verify-none.out 2>/tmp/kotoba-smoke-verify-none.err; then
+if "${BIN}" models verify >"${TMP}/verify-none.out" 2>"${TMP}/verify-none.err"; then
   echo "verify without selected model should fail after removal" >&2
   exit 1
 fi
-grep -q 'model_not_selected' /tmp/kotoba-smoke-verify-none.err
+grep -q 'model_not_selected' "${TMP}/verify-none.err"
 
-if printf '| a |\n| --- |\n| b |\n' | "${BIN}" translate --to ja --format markdown --no-memory >/tmp/kotoba-smoke-translate-protected-none.out 2>/tmp/kotoba-smoke-translate-protected-none.err; then
+if printf '| a |\n| --- |\n| b |\n' | "${BIN}" translate --to ja --format markdown --no-memory >"${TMP}/translate-protected-none.out" 2>"${TMP}/translate-protected-none.err"; then
   echo "protected-only translate without selected model should fail" >&2
   exit 1
 fi
-grep -q 'model_not_selected' /tmp/kotoba-smoke-translate-protected-none.err
+grep -q 'model_not_selected' "${TMP}/translate-protected-none.err"
 
-if "${BIN}" translate "Hello" --to ja --no-memory >/tmp/kotoba-smoke-translate-none.out 2>/tmp/kotoba-smoke-translate-none.err; then
+if "${BIN}" translate "Hello" --to ja --no-memory >"${TMP}/translate-none.out" 2>"${TMP}/translate-none.err"; then
   echo "translate without selected model should fail" >&2
   exit 1
 fi
-grep -q 'model_not_selected' /tmp/kotoba-smoke-translate-none.err
+grep -q 'model_not_selected' "${TMP}/translate-none.err"
 
 echo "smoke ok"

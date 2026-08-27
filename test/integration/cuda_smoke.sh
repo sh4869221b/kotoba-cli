@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common.sh"
 SKIP_MESSAGE="SKIP cuda qa: missing KOTOBA_CUDA_MODEL or nvidia-smi"
 
 if [[ -z "${KOTOBA_CUDA_MODEL:-}" || ! -f "${KOTOBA_CUDA_MODEL:-}" ]] || ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
@@ -9,21 +10,8 @@ if [[ -z "${KOTOBA_CUDA_MODEL:-}" || ! -f "${KOTOBA_CUDA_MODEL:-}" ]] || ! comma
   exit 0
 fi
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/kotoba-cuda-smoke.XXXXXX")"
-
-cleanup() {
-  rm -rf "${TMP}"
-}
-trap cleanup EXIT
-
-export XDG_CONFIG_HOME="${TMP}/config"
-export XDG_DATA_HOME="${TMP}/data"
-export XDG_CACHE_HOME="${TMP}/cache"
-export XDG_STATE_HOME="${TMP}/state"
-
-env ZIG_GLOBAL_CACHE_DIR="${ROOT}/.zig-cache/global" zig build -Dcuda=true
-
-BIN="${ROOT}/zig-out/bin/kotoba"
+harness_init cuda-smoke
+harness_build_snapshot cuda
 
 INIT_OUT="${TMP}/init.out"
 IMPORT_OUT="${TMP}/import.out"
