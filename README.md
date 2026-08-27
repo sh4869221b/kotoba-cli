@@ -167,6 +167,21 @@ run without a model:
 bash test/integration/common.sh --self-test
 ```
 
+Run the deterministic CLI contract matrix and its concurrent integration check:
+
+```bash
+bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
+bash test/integration/parallel.sh --rounds 2 --evidence-dir "$PWD/.omo/evidence/parallel"
+```
+
+The matrix records actual command streams, status, filesystem and translation
+memory state using private test/CPU snapshots. It supports `--group translate`,
+`commands`, `memory`, or `files`. The parallel driver runs two full matrices per
+round alongside existing smoke, benchmark and unit children. See the
+[coverage and gaps](docs/test-harness.md#cli-contract-matrix) for the separate
+CLI/component evidence and deferred output, mutation and result-validation
+guarantees; these tests do not claim real-model quality or atomic file writes.
+
 Real CUDA QA is guarded so non-CUDA machines can run it safely:
 
 ```bash
