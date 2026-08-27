@@ -146,3 +146,97 @@ test "acquire https failure does not leave final file" {
 test "acquire skip download does not require destination" {
     try acquire(std.testing.allocator, .{ .id = "local", .download_url = "does-not-matter" }, "", true);
 }
+
+fn partialDownloader(_: std.mem.Allocator, _: []const u8, dest: []const u8) !void {
+    try sys.writeFile(dest, "partial");
+    return errors.Error.ModelRegistryInvalid;
+}
+
+fn expectNoTempEntries(path: []const u8) !void {
+    var dir = try sys.cwd().openDir(sys.io(), path, .{ .iterate = true });
+    defer dir.close(sys.io());
+    var iterator = dir.iterate();
+    while (try iterator.next(sys.io())) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+    }
+}
+
+test "fault install happy matching checksum installs exact remote bytes in independent directories" {
+    var first_tmp = std.testing.tmpDir(.{});
+    defer first_tmp.cleanup();
+    var second_tmp = std.testing.tmpDir(.{});
+    defer second_tmp.cleanup();
+    const first_root = try first_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(first_root);
+    const second_root = try second_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(second_root);
+    const first_dest = try std.fs.path.join(std.testing.allocator, &.{ first_root, "first.gguf" });
+    defer std.testing.allocator.free(first_dest);
+    const second_dest = try std.fs.path.join(std.testing.allocator, &.{ second_root, "second.gguf" });
+    defer std.testing.allocator.free(second_dest);
+    const expected_checksum = try sys.hexSha256(std.testing.allocator, "remote bytes");
+    defer std.testing.allocator.free(expected_checksum);
+    const model: types.Model = .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+        .checksum = expected_checksum,
+    };
+
+    try acquireWithDownloader(std.testing.allocator, model, first_dest, false, fakeDownloader);
+    try acquireWithDownloader(std.testing.allocator, model, second_dest, false, fakeDownloader);
+
+    const first_data = try sys.readFileAlloc(std.testing.allocator, first_dest, 1024);
+    defer std.testing.allocator.free(first_data);
+    const second_data = try sys.readFileAlloc(std.testing.allocator, second_dest, 1024);
+    defer std.testing.allocator.free(second_data);
+    try std.testing.expectEqualStrings("remote bytes", first_data);
+    try std.testing.expectEqualStrings("remote bytes", second_data);
+    try expectNoTempEntries(first_root);
+    try expectNoTempEntries(second_root);
+}
+
+test "fault install failure mismatch and partial downloader preserve destinations and clean temporary files" {
+    var mismatch_tmp = std.testing.tmpDir(.{});
+    defer mismatch_tmp.cleanup();
+    var partial_tmp = std.testing.tmpDir(.{});
+    defer partial_tmp.cleanup();
+    const mismatch_root = try mismatch_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(mismatch_root);
+    const partial_root = try partial_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(partial_root);
+    const mismatch_dest = try std.fs.path.join(std.testing.allocator, &.{ mismatch_root, "existing.gguf" });
+    defer std.testing.allocator.free(mismatch_dest);
+    const partial_existing_dest = try std.fs.path.join(std.testing.allocator, &.{ partial_root, "partial-existing.gguf" });
+    defer std.testing.allocator.free(partial_existing_dest);
+    const partial_absent_dest = try std.fs.path.join(std.testing.allocator, &.{ partial_root, "partial-absent.gguf" });
+    defer std.testing.allocator.free(partial_absent_dest);
+    try sys.writeFile(mismatch_dest, "old model");
+    try sys.writeFile(partial_existing_dest, "old model");
+    const wrong_checksum = try sys.hexSha256(std.testing.allocator, "different bytes");
+    defer std.testing.allocator.free(wrong_checksum);
+
+    try std.testing.expectError(errors.Error.ChecksumFailed, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+        .checksum = wrong_checksum,
+    }, mismatch_dest, false, fakeDownloader));
+    const preserved = try sys.readFileAlloc(std.testing.allocator, mismatch_dest, 1024);
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("old model", preserved);
+    try expectNoTempEntries(mismatch_root);
+
+    try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+    }, partial_existing_dest, false, partialDownloader));
+    const partial_preserved = try sys.readFileAlloc(std.testing.allocator, partial_existing_dest, 1024);
+    defer std.testing.allocator.free(partial_preserved);
+    try std.testing.expectEqualStrings("old model", partial_preserved);
+
+    try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
+        .id = "remote",
+        .download_url = "https://example.invalid/model.gguf",
+    }, partial_absent_dest, false, partialDownloader));
+    try std.testing.expect(!sys.exists(partial_absent_dest));
+    try expectNoTempEntries(partial_root);
+}

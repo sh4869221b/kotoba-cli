@@ -59,6 +59,66 @@ unrelated pre-existing file. Unit fixtures that access the filesystem use
 The deterministic backend is a build-time choice. The normal `zig build test`
 and `zig build` paths continue to compile the embedded production branch.
 
+## Fault-boundary fixtures
+
+Fault injection is explicitly supplied by tests through instance-local
+controllers. Default production helpers use no controller and have no runtime
+selector. The entrypoints are `sys.readReaderAlloc`, `sys.writeWriterAll`,
+`sys.ScriptedReader`, and `sys.ScriptedWriter`; `fs.FileSystem` and
+`fs.Faults`; `memory.Faults`, `memory.openWithFaults`, and
+`memory.openReadOnlyWithFaults`; the private test-local
+`net.TestHttpServer.startScript`; and the existing per-call downloader
+argument to `models/install.zig`'s `acquireWithDownloader`.
+
+`ScriptedReader` and `ScriptedWriter` borrow their caller's source, sink,
+buffers, and script storage; take an interface pointer only after the fixture
+has reached its final address, and keep every borrowed value alive through the
+operation. `FileSystem` borrows its `std.Io`, `std.Io.Dir`, and optional
+`Faults`. SQLite `Db` and every prepared `Stmt` retain the caller-owned
+`Faults` pointer, so that controller must outlive both and statements must be
+finalized before closing the handle. The controlled HTTP peer copies its raw
+response scripts into heap-owned test state; stop and join it before releasing
+that state. Filesystem and SQLite tests use `std.testing.tmpDir`, and cleanup
+disarms controllers before closing or removing their private resources.
+
+Each controller counts attempted matching operations before testing a positive,
+one-based target ordinal. `arm` schedules relative to the next matching call
+without resetting lifetime counters. A matching rule records its cause, fires
+once, and disarms itself; explicit `disarm` leaves counters and the last cause
+inspectable. Filesystem injection happens before open/truncate/write, rename,
+or delete, so an injected `AccessDenied` or `NoSpaceLeft` does not claim that
+the native operation ran. SQLite injection likewise occurs before open or step
+and accepts only primary SQLite error codes 1 through 26, never success or
+extended codes. Native writer failures remain the generic `WriteFailed`; a
+fixture-specific cause such as `BrokenPipe` is only inspectable metadata.
+
+These categories have different evidence. The default `sys` wrappers create a
+real `FileSystem` for `sys.io()` and `sys.cwd()` with no controller, so their
+boundary tests exercise actual private files and native write/rename errors.
+SQLite also has separate real private-file lock and corruption tests. HTTP
+tests use a controlled loopback peer with the real client and parser, not an
+injected transport fault or an internet service. A declared `Content-Length`
+that closes early keeps the current observed behavior: the available prefix is
+returned successfully; this is a characterization, not a new rejection
+policy. Prepared `BEGIN`, `COMMIT`, and `ROLLBACK` statements exist only to
+test the SQLite primitive boundary and do not add an application transaction
+API or recovery policy.
+
+Run the focused groups from the repository root:
+
+```bash
+zig test src/sys.zig -lc --test-filter 'fault io happy'
+zig test src/sys.zig -lc --test-filter 'fault io failure'
+zig test src/fs.zig -lc --test-filter 'fault fs happy'
+zig test src/fs.zig -lc --test-filter 'fault fs failure'
+zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite happy'
+zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite failure'
+zig test src/net.zig -lc --test-filter 'fault http happy'
+zig test src/net.zig -lc --test-filter 'fault http failure'
+zig test src/models.zig -lc --test-filter 'fault install'
+zig test src/sys.zig -lc --test-filter 'fault boundary'
+```
+
 ## Build snapshots and coordination
 
 `harness_build_snapshot test|cpu|cuda` runs the non-default

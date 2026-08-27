@@ -20,13 +20,55 @@ pub const Hit = struct {
     translated_text: []const u8,
 };
 
+/// Borrowed by Db and its statements; keep this controller alive until both close.
+/// Faults are injected before the C call, so they do not simulate SQLite side effects.
+pub const Faults = struct {
+    pub const Operation = enum { open, step };
+    const Rule = struct { target: usize, code: c_int };
+
+    calls: [2]usize = .{ 0, 0 },
+    rules: [2]?Rule = .{ null, null },
+    last_code: ?c_int = null,
+
+    pub fn count(self: *const Faults, operation: Operation) usize {
+        return self.calls[@intFromEnum(operation)];
+    }
+
+    /// Schedule a one-shot error relative to the next matching operation.
+    pub fn arm(self: *Faults, operation: Operation, ordinal: usize, code: c_int) !void {
+        if (ordinal == 0) return error.InvalidFaultOrdinal;
+        // Primary error codes only: exclude OK, ROW, DONE, NOTICE and WARNING.
+        if (code < c.SQLITE_ERROR or code > c.SQLITE_NOTADB) return error.InvalidFaultCode;
+        const index = @intFromEnum(operation);
+        self.rules[index] = .{ .target = try std.math.add(usize, self.calls[index], ordinal), .code = code };
+    }
+
+    pub fn disarm(self: *Faults) void {
+        self.rules = .{ null, null };
+    }
+
+    fn check(self: *Faults, operation: Operation) ?c_int {
+        const index = @intFromEnum(operation);
+        self.calls[index] += 1;
+        if (self.rules[index]) |rule| {
+            if (self.calls[index] == rule.target) {
+                self.rules[index] = null;
+                self.last_code = rule.code;
+                return rule.code;
+            }
+        }
+        return null;
+    }
+};
+
 pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
     allocator: std.mem.Allocator,
+    faults: ?*Faults = null,
     pub fn prepare(db: *Db, sql: []const u8) !Stmt {
         var handle: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &handle, null) != c.SQLITE_OK) return errors.Error.SqliteFailed;
-        return .{ .handle = handle orelse return errors.Error.SqliteFailed, .allocator = db.allocator };
+        return .{ .handle = handle orelse return errors.Error.SqliteFailed, .allocator = db.allocator, .faults = db.faults };
     }
 
     pub fn deinit(self: *Stmt) void {
@@ -38,7 +80,8 @@ pub const Stmt = struct {
     }
 
     pub fn step(self: *Stmt) !c_int {
-        const rc = c.sqlite3_step(self.handle);
+        const injected = if (self.faults) |faults| faults.check(.step) else null;
+        const rc = injected orelse c.sqlite3_step(self.handle);
         return switch (rc) {
             c.SQLITE_ROW, c.SQLITE_DONE => rc,
             else => errors.Error.SqliteFailed,
@@ -55,6 +98,7 @@ pub const Stmt = struct {
 pub const Db = struct {
     handle: *c.sqlite3,
     allocator: std.mem.Allocator,
+    faults: ?*Faults = null,
 
     pub fn close(self: *Db) void {
         _ = c.sqlite3_close(self.handle);
@@ -167,22 +211,31 @@ fn bindKey(stmt: *Stmt, key: Key, hash_text: []const u8, glossary_hash_text: []c
 }
 
 pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
+    return openWithFaults(allocator, path, null);
+}
+
+pub fn openWithFaults(allocator: std.mem.Allocator, path: []const u8, faults: ?*Faults) !Db {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    var db = Db{ .handle = try openHandle(path_z, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE), .allocator = allocator };
+    var db = Db{ .handle = try openHandle(path_z, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, faults), .allocator = allocator, .faults = faults };
     errdefer db.close();
     try db.initSchema();
     return db;
 }
 
 pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) !Db {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    return .{ .handle = try openHandle(path_z, c.SQLITE_OPEN_READONLY), .allocator = allocator };
+    return openReadOnlyWithFaults(allocator, path, null);
 }
 
-fn openHandle(path: [:0]const u8, flags: c_int) !*c.sqlite3 {
+pub fn openReadOnlyWithFaults(allocator: std.mem.Allocator, path: []const u8, faults: ?*Faults) !Db {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    return .{ .handle = try openHandle(path_z, c.SQLITE_OPEN_READONLY, faults), .allocator = allocator, .faults = faults };
+}
+
+fn openHandle(path: [:0]const u8, flags: c_int, faults: ?*Faults) !*c.sqlite3 {
+    if (faults) |controller| if (controller.check(.open) != null) return errors.Error.SqliteFailed;
     var handle: ?*c.sqlite3 = null;
     const rc = c.sqlite3_open_v2(path.ptr, &handle, flags, null);
     if (rc != c.SQLITE_OK) {
@@ -335,4 +388,269 @@ test "sqlite lookup bumps hit_count" {
     const second = (try db.lookup(key)).?;
     defer std.testing.allocator.free(second.translated_text);
     try std.testing.expectEqual(@as(usize, 2), try hitCount(&db, key));
+}
+
+test "fault sqlite failure injected open has no file side effect" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "absent.sqlite3" });
+    defer std.testing.allocator.free(path);
+    var faults = Faults{};
+    defer faults.disarm();
+    try faults.arm(.open, 1, c.SQLITE_CANTOPEN);
+    const result = openWithFaults(std.testing.allocator, path, &faults);
+    if (result) |value| {
+        var unexpected = value;
+        unexpected.close();
+    } else |_| {}
+    try std.testing.expectError(errors.Error.SqliteFailed, result);
+    try std.testing.expectEqual(c.SQLITE_CANTOPEN, faults.last_code.?);
+    try std.testing.expectEqual(@as(usize, 1), faults.count(.open));
+    try std.testing.expectEqual(@as(usize, 0), faults.count(.step));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "absent.sqlite3", .{}));
+}
+
+const TestDatabaseFile = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init() !TestDatabaseFile {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        return .{ .tmp = tmp, .path = try std.fs.path.join(std.testing.allocator, &.{ root, "memory.sqlite3" }) };
+    }
+
+    fn deinit(self: *TestDatabaseFile) void {
+        self.tmp.cleanup();
+        std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, std.fs.path.dirname(self.path).?, .{})) catch @panic("temporary database directory leaked");
+        std.testing.allocator.free(self.path);
+    }
+};
+
+const test_key = Key{ .source_text = "fixture", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "fixture", .glossary_hash = 0 };
+
+fn testStatement(db: *Db, sql: []const u8) !void {
+    var stmt = try Stmt.prepare(db, sql);
+    defer stmt.deinit();
+    try std.testing.expectEqual(c.SQLITE_DONE, try stmt.step());
+}
+
+fn testClose(db: *Db) void {
+    if (db.faults) |faults| faults.disarm();
+    std.testing.expect(c.sqlite3_next_stmt(db.handle, null) == null) catch @panic("statement leaked");
+    std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(db.handle)) catch @panic("database did not close");
+}
+
+test "fault sqlite happy real local commit persists and rollback discards" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    {
+        var db = try open(std.testing.allocator, file.path);
+        defer testClose(&db);
+        var observer = try openReadOnly(std.testing.allocator, file.path);
+        defer testClose(&observer);
+        try std.testing.expect(db.faults == null);
+        try std.testing.expect(observer.faults == null);
+
+        try testStatement(&db, "BEGIN");
+        try db.upsert(test_key, "committed");
+        try std.testing.expectEqual(@as(usize, 1), try db.count());
+        try std.testing.expectEqual(@as(usize, 0), try observer.count());
+        try testStatement(&db, "COMMIT");
+        try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+        try std.testing.expectEqual(@as(usize, 1), try observer.count());
+
+        try testStatement(&db, "BEGIN");
+        var rolled_back_key = test_key;
+        rolled_back_key.source_text = "discarded";
+        try db.upsert(rolled_back_key, "rolled back");
+        try std.testing.expectEqual(@as(usize, 2), try db.count());
+        try std.testing.expectEqual(@as(usize, 1), try observer.count());
+        try testStatement(&db, "ROLLBACK");
+        try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+        try std.testing.expectEqual(@as(usize, 1), try db.count());
+    }
+    var reopened = try openReadOnly(std.testing.allocator, file.path);
+    defer testClose(&reopened);
+    try std.testing.expectEqual(@as(usize, 1), try reopened.count());
+    var persisted = try Stmt.prepare(&reopened, "SELECT translated_text FROM translations");
+    defer persisted.deinit();
+    try std.testing.expectEqual(c.SQLITE_ROW, try persisted.step());
+    const text = try persisted.columnTextDup(0);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("committed", text);
+}
+
+test "fault sqlite happy independent schedules counters and disarm" {
+    var left_file = try TestDatabaseFile.init();
+    defer left_file.deinit();
+    var right_file = try TestDatabaseFile.init();
+    defer right_file.deinit();
+    var left_faults = Faults{};
+    var right_faults = Faults{};
+    var left = try openWithFaults(std.testing.allocator, left_file.path, &left_faults);
+    defer testClose(&left);
+    var right = try openWithFaults(std.testing.allocator, right_file.path, &right_faults);
+    defer testClose(&right);
+    try std.testing.expectEqual(@as(usize, 1), left_faults.count(.open));
+    try std.testing.expectEqual(@as(usize, 1), left_faults.count(.step));
+    try std.testing.expect(left.faults == &left_faults);
+    var stmt = try Stmt.prepare(&left, "SELECT 1");
+    defer stmt.deinit();
+    try std.testing.expect(stmt.faults == &left_faults);
+
+    try left_faults.arm(.step, 2, c.SQLITE_BUSY);
+    try left_faults.arm(.open, 2, c.SQLITE_CANTOPEN);
+    try std.testing.expectEqual(@as(usize, 0), try left.count());
+    try right.upsert(test_key, "right");
+    try std.testing.expectEqual(@as(usize, 1), try right.count());
+    try std.testing.expectEqual(@as(usize, 2), left_faults.count(.step));
+    try std.testing.expectError(errors.Error.SqliteFailed, left.count());
+    try std.testing.expectEqual(c.SQLITE_BUSY, left_faults.last_code.?);
+    try std.testing.expectEqual(@as(usize, 0), try left.count());
+    try std.testing.expectEqual(@as(usize, 4), left_faults.count(.step));
+    try std.testing.expectEqual(@as(usize, 3), right_faults.count(.step));
+    try std.testing.expect(right_faults.last_code == null);
+
+    var reader = try openReadOnlyWithFaults(std.testing.allocator, left_file.path, &left_faults);
+    defer testClose(&reader);
+    try std.testing.expectEqual(@as(usize, 2), left_faults.count(.open));
+    try std.testing.expectEqual(@as(usize, 4), left_faults.count(.step));
+    try std.testing.expectError(errors.Error.SqliteFailed, openReadOnlyWithFaults(std.testing.allocator, left_file.path, &left_faults));
+    try std.testing.expectEqual(c.SQLITE_CANTOPEN, left_faults.last_code.?);
+    try std.testing.expectEqual(@as(usize, 3), left_faults.count(.open));
+    try left_faults.arm(.step, 1, c.SQLITE_IOERR);
+    left_faults.disarm();
+    try std.testing.expectEqual(@as(usize, 0), try reader.count());
+    try std.testing.expectEqual(@as(usize, 5), left_faults.count(.step));
+    try std.testing.expectEqual(c.SQLITE_CANTOPEN, left_faults.last_code.?);
+    const fresh = Faults{};
+    try std.testing.expectEqual(@as(usize, 0), fresh.count(.open));
+    try std.testing.expectEqual(@as(usize, 0), fresh.count(.step));
+    try std.testing.expect(fresh.last_code == null);
+}
+
+test "fault sqlite failure rejects successful codes and invalid ordinals" {
+    var faults = Faults{};
+    for ([_]c_int{ c.SQLITE_OK, c.SQLITE_ROW, c.SQLITE_DONE, c.SQLITE_NOTICE, c.SQLITE_WARNING, -1, 9999 }) |code| {
+        try std.testing.expectError(error.InvalidFaultCode, faults.arm(.step, 1, code));
+    }
+    try std.testing.expectError(error.InvalidFaultOrdinal, faults.arm(.step, 0, c.SQLITE_IOERR));
+    try std.testing.expectEqual(@as(usize, 0), faults.count(.step));
+    try std.testing.expect(faults.rules[@intFromEnum(Faults.Operation.step)] == null);
+}
+
+test "fault sqlite failure injected schema closes handle and leaves schema absent" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    var faults = Faults{};
+    defer faults.disarm();
+    // Warm SQLite's process-level initialization before comparing C allocations.
+    var warm = try open(std.testing.allocator, ":memory:");
+    testClose(&warm);
+    const before = c.sqlite3_memory_used();
+    try faults.arm(.step, 1, c.SQLITE_IOERR);
+    try std.testing.expectError(errors.Error.SqliteFailed, openWithFaults(std.testing.allocator, file.path, &faults));
+    try std.testing.expectEqual(c.SQLITE_IOERR, faults.last_code.?);
+    try std.testing.expectEqual(@as(usize, 1), faults.count(.open));
+    try std.testing.expectEqual(@as(usize, 1), faults.count(.step));
+    try std.testing.expectEqual(before, c.sqlite3_memory_used());
+    {
+        var readonly = try openReadOnly(std.testing.allocator, file.path);
+        defer testClose(&readonly);
+        try std.testing.expectError(errors.Error.SqliteFailed, Stmt.prepare(&readonly, "SELECT * FROM translations"));
+    }
+    faults.disarm();
+    var retry = try openWithFaults(std.testing.allocator, file.path, &faults);
+    defer testClose(&retry);
+    try std.testing.expectEqual(@as(usize, 0), try retry.count());
+}
+
+test "fault sqlite failure injected step preserves rows and is one shot" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    var faults = Faults{};
+    var db = try openWithFaults(std.testing.allocator, file.path, &faults);
+    defer testClose(&db);
+    for ([_]c_int{ c.SQLITE_BUSY, c.SQLITE_IOERR }) |code| {
+        try faults.arm(.step, 1, code);
+        try std.testing.expectError(errors.Error.SqliteFailed, db.upsert(test_key, "unwritten"));
+        try std.testing.expectEqual(code, faults.last_code.?);
+        try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+        try std.testing.expectEqual(@as(usize, 0), try db.count());
+    }
+    try db.upsert(test_key, "written");
+    try std.testing.expectEqual(@as(usize, 1), try db.count());
+    try std.testing.expectEqual(@as(usize, 7), faults.count(.step));
+}
+
+test "fault sqlite failure injected commit and rollback preserve pending transaction" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    var faults = Faults{};
+    var db = try openWithFaults(std.testing.allocator, file.path, &faults);
+    defer testClose(&db);
+    var observer = try openReadOnly(std.testing.allocator, file.path);
+    defer testClose(&observer);
+    for ([_][]const u8{ "COMMIT", "ROLLBACK" }) |sql| {
+        try testStatement(&db, "BEGIN");
+        try db.upsert(test_key, "pending");
+        try std.testing.expectEqual(@as(usize, 1), try db.count());
+        try std.testing.expectEqual(@as(usize, 0), try observer.count());
+        {
+            var target = try Stmt.prepare(&db, sql);
+            defer target.deinit();
+            try faults.arm(.step, 1, c.SQLITE_IOERR);
+            try std.testing.expectError(errors.Error.SqliteFailed, target.step());
+            try std.testing.expectEqual(c.SQLITE_IOERR, faults.last_code.?);
+            try std.testing.expectEqual(@as(c_int, 0), c.sqlite3_get_autocommit(db.handle));
+            try std.testing.expectEqual(@as(usize, 1), try db.count());
+            try std.testing.expectEqual(@as(usize, 0), try observer.count());
+            faults.disarm();
+        }
+        try testStatement(&db, "ROLLBACK");
+        try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+        try std.testing.expectEqual(@as(usize, 0), try db.count());
+        try std.testing.expectEqual(@as(usize, 0), try observer.count());
+    }
+}
+
+test "fault sqlite failure real local busy lock clears after rollback" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    var left = try open(std.testing.allocator, file.path);
+    defer testClose(&left);
+    var right = try open(std.testing.allocator, file.path);
+    defer testClose(&right);
+    try std.testing.expect(left.faults == null and right.faults == null);
+    try testStatement(&left, "BEGIN IMMEDIATE");
+    var insert = try Stmt.prepare(&right, "INSERT INTO translations VALUES ('hash', 'source', 'target', 'en', 'ja', 'default', 'm', '0', 0, 0, 0)");
+    defer insert.deinit();
+    try std.testing.expectError(errors.Error.SqliteFailed, insert.step());
+    try std.testing.expectEqual(c.SQLITE_BUSY, c.sqlite3_errcode(right.handle));
+    try std.testing.expectEqual(@as(usize, 0), try left.count());
+    try testStatement(&left, "ROLLBACK");
+    try std.testing.expectEqual(c.SQLITE_DONE, try insert.step());
+    try std.testing.expectEqual(@as(usize, 1), try left.count());
+}
+
+test "fault sqlite failure real local corrupt readonly prepare rejects unchanged bytes" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    const corrupt = "not a SQLite database\n" ** 16;
+    try file.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "memory.sqlite3", .data = corrupt });
+    {
+        var db = try openReadOnly(std.testing.allocator, file.path);
+        defer testClose(&db);
+        try std.testing.expect(db.faults == null);
+        try std.testing.expectError(errors.Error.SqliteFailed, Stmt.prepare(&db, "SELECT name FROM sqlite_master"));
+        try std.testing.expectEqual(c.SQLITE_NOTADB, c.sqlite3_errcode(db.handle));
+    }
+    const bytes = try file.tmp.dir.readFileAlloc(std.testing.io, "memory.sqlite3", std.testing.allocator, .limited(corrupt.len + 1));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(corrupt, bytes);
 }
