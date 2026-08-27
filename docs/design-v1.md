@@ -86,6 +86,37 @@ when available, and `models remove ID --yes` deletes the managed model file
 only when no other registry entry references the same file, then clears the
 selection if it was active.
 
+Remote model URLs are bounded to 8192 bytes and must be valid HTTPS URLs without
+userinfo (including empty userinfo) or raw ASCII control characters. Validation
+covers the complete input, including any fragment. An explicit signed URL is
+used only for that request: its encoded query bytes are preserved exactly, and
+its fragment is removed before acquisition. All query parameters, including an
+empty query, are treated as transient; no credential-key allowlist is used.
+
+The optional registry field `source_url` records only remote scheme, authority
+without userinfo, and encoded path. It is display/provenance information, never
+a download fallback. `download_url` retains only reusable query-free HTTPS URLs
+(without fragments) or existing local/file sources. Local filenames containing
+`?` or `#` are preserved. A fragment alone does not prevent HTTPS URL reuse.
+Invalid remote metadata is displayed as `[redacted]` and saved as empty URL
+fields; otherwise valid legacy userinfo/query URLs can retain a safe identity
+but cannot become reusable URLs.
+
+Registry reads, including `models info` and `doctor`, do not rewrite files.
+Every successful registry write sanitizes all retained entries, including
+unrelated legacy entries, without changing installed paths, IDs, or checksums
+and without creating secret backups or sidecars. Doctor warns about unsafe
+remote metadata across the whole registry, even without a usable config.
+Earlier external backups and history are not erased by this migration.
+
+`models pull ID` requires a reusable source before acquisition or verification,
+even if an installed file exists. Query-bearing legacy sources and models with
+only `source_url` require a fresh explicit `--model-url`, ID, and checksum;
+invalid/userinfo remote sources are rejected. `models use` and `models verify`
+continue to use installed paths. URL-path secrets cannot be recognized
+automatically; do not supply them. CLI arguments may also appear in shell
+history or process inspection.
+
 ## Markdown Limitations
 
 Kotoba protects code fences, inline code, URLs, frontmatter, HTML-like tags, and
