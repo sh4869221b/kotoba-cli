@@ -117,6 +117,12 @@ continue to use installed paths. URL-path secrets cannot be recognized
 automatically; do not supply them. CLI arguments may also appear in shell
 history or process inspection.
 
+`kotoba init` only selects an existing local registry path or records an
+explicit `--model-path`; it never acquires a model. A URL-only or missing-path
+registry entry makes `init --model-id ID` exit 1 with instructions to run
+`kotoba models pull ID --use` first or provide `--model-path PATH`. This
+replaces the earlier implicit acquisition of URL-only registry entries.
+
 ## Markdown Limitations
 
 Kotoba protects code fences, inline code, URLs, frontmatter, HTML-like tags, and

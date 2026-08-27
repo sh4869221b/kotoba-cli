@@ -93,10 +93,272 @@ recommended = true
 notes = "Smoke-test init downloadable source."
 TOML
 
-"${BIN}" init --model-id init-download --yes >"${TMP}/init-download.out"
-"${BIN}" models verify init-download
-grep -q '^model_id = "init-download"$' "${XDG_CONFIG_HOME}/kotoba/config.toml"
-grep -q '^model_path = "'"${XDG_DATA_HOME}"'/kotoba/models/init-download.gguf"$' "${XDG_CONFIG_HOME}/kotoba/config.toml"
+BIN="${BIN}" TMP="${TMP}" SUM="${SUM}" python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import socket
+import subprocess
+import threading
+
+
+BIN = os.environ["BIN"]
+TMP = Path(os.environ["TMP"])
+SUM = os.environ["SUM"]
+HINT = "kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n"
+MODEL_MISSING = "kotoba: model_missing: Configured model file does not exist.\n"
+
+
+class Observer:
+    def __init__(self):
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.listener.setblocking(False)
+        self.port = self.listener.getsockname()[1]
+        self.control_read, self.control_write = socket.socketpair()
+        self.connections = 0
+        self.failure = None
+        self.thread = threading.Thread(target=self._run, name="issue9-observer")
+        self.thread.start()
+
+    def _drain(self):
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except BlockingIOError:
+                return
+            connection.close()
+            self.connections += 1
+
+    def _run(self):
+        try:
+            while True:
+                ready, _, _ = select.select([self.listener, self.control_read], [], [])
+                if self.listener in ready:
+                    self._drain()
+                if self.control_read in ready:
+                    self.control_read.recv(1)
+                    self._drain()
+                    return
+        except BaseException as error:
+            self.failure = error
+        finally:
+            self.listener.close()
+            self.control_read.close()
+
+    def close(self):
+        self.control_write.sendall(b"x")
+        self.thread.join(5)
+        self.control_write.close()
+        assert not self.thread.is_alive(), "observer cleanup timed out"
+        assert self.failure is None, self.failure
+
+
+def env_for(root):
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(root / "home"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_STATE_HOME": str(root / "state"),
+    })
+    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def write_registry(root, port):
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "toy-source.gguf"
+    source.write_bytes(b"toy model bytes")
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == SUM
+    models_file = root / "config" / "kotoba" / "models.toml"
+    models_file.parent.mkdir(parents=True, exist_ok=True)
+    (root / "data" / "kotoba" / "models").mkdir(parents=True, exist_ok=True)
+    missing = root / "missing.gguf"
+    remote = f"https://127.0.0.1:{port}/model.gguf"
+    models_file.write_text(f'''[[models]]
+id = "boundary-pending"
+name = "Boundary pending"
+profile = "test"
+languages = ["en", "ja"]
+format = "gguf"
+path = ""
+download_url = "{remote}"
+checksum = "{SUM}"
+recommended = true
+
+[[models]]
+id = "boundary-absent-path"
+name = "Boundary absent"
+profile = "test"
+languages = ["en", "ja"]
+format = "gguf"
+path = "{missing}"
+download_url = "{remote}"
+checksum = "{SUM}"
+
+[[models]]
+id = "boundary-installed"
+name = "Boundary installed"
+profile = "test"
+languages = ["en", "ja"]
+format = "gguf"
+path = "{source}"
+download_url = "{remote}"
+checksum = "{SUM}"
+''')
+    return source, models_file
+
+
+def log_case_start(name, args, observer):
+    print(f"network case {name}: phase=start argv={json.dumps([BIN, *args])} port={observer.port}")
+
+
+def log_case_complete(name, args, observer, process):
+    print(f"network case {name}: phase=complete argv={json.dumps([BIN, *args])} port={observer.port} exit={process.returncode} connections={observer.connections} observer_cleanup=ok")
+
+
+def assert_connection_count(name, args, observer, expected_connections):
+    matches = observer.connections == expected_connections if isinstance(expected_connections, int) else observer.connections >= 1
+    if not matches:
+        print(f"network case {name}: phase=assertions outcome=failed assertion=connections argv={json.dumps([BIN, *args])} port={observer.port} expected={expected_connections} observed={observer.connections}")
+    assert matches, (name, observer.connections)
+
+
+def log_case_pass(name, args, observer):
+    print(f"network case {name}: phase=assertions outcome=passed argv={json.dumps([BIN, *args])} port={observer.port}")
+
+
+def run_case(name, root, args, expected_exit, expected_connections, stdout=None, stderr_parts=(), reset_registry=True):
+    observer = Observer()
+    process = None
+    log_case_start(name, args, observer)
+    try:
+        if reset_registry:
+            write_registry(root, observer.port)
+        process = subprocess.run([BIN, *args], env=env_for(root), capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(f"{name}: subprocess timeout: {error}") from error
+    finally:
+        observer.close()
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, expected_connections)
+    assert process.returncode == expected_exit, (name, process.returncode, process.stderr)
+    if stdout is not None:
+        assert process.stdout == stdout, (name, process.stdout)
+    for part in stderr_parts:
+        assert part.encode() in process.stderr, (name, process.stderr)
+    log_case_pass(name, args, observer)
+    return process
+
+
+fresh = TMP / "boundary-fresh"
+env_for(fresh)
+for name, args in (
+    ("init-pending-yes", ["init", "--model-id", "boundary-pending", "--yes"]),
+    ("init-pending", ["init", "--model-id", "boundary-pending"]),
+    ("init-absent-path", ["init", "--model-id", "boundary-absent-path", "--yes"]),
+):
+    observer = Observer()
+    log_case_start(name, args, observer)
+    try:
+        _, models_file = write_registry(fresh, observer.port)
+        config_file = fresh / "config" / "kotoba" / "config.toml"
+        registry_before = models_file.read_bytes()
+        process = subprocess.run([BIN, *args], env=env_for(fresh), capture_output=True, timeout=10)
+    finally:
+        observer.close()
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, 0)
+    assert process.returncode == 1 and process.stdout == b"" and process.stderr == (HINT + MODEL_MISSING).encode()
+    assert not config_file.exists()
+    assert not (fresh / "data" / "kotoba" / "memory.sqlite3").exists()
+    assert models_file.read_bytes() == registry_before
+    assert not list((fresh / "data" / "kotoba" / "models").glob("*.gguf"))
+    assert not list((fresh / "data" / "kotoba" / "models").glob("*.tmp-*"))
+    log_case_pass(name, args, observer)
+
+run_case("init-yes", fresh, ["init", "--yes"], 0, 0, b"initialized\n")
+run_case("init-installed", fresh, ["init", "--model-id", "boundary-installed", "--yes"], 0, 0, b"initialized\n")
+for name, args, output in (
+    ("translate", ["translate", "Hello", "--from", "en", "--to", "ja", "--no-memory"], b"JA:Hello\n"),
+    ("doctor", ["doctor", "--format", "json"], None),
+    ("config", ["config", "get", "model_id"], b"boundary-installed\n"),
+    ("glossary", ["glossary", "validate"], None),
+    ("memory", ["memory", "status"], None),
+):
+    process = run_case(name, fresh, args, 0, 0, output)
+    if name == "doctor":
+        assert json.loads(process.stdout)["ok"] is True
+    if name == "glossary":
+        assert b"terms: 0\n" in process.stdout and b"hash: " in process.stdout
+    if name == "memory":
+        assert b"rows: 0\n" in process.stdout
+
+source = fresh / "toy-source.gguf"
+run_case("init-explicit-path", fresh, ["init", "--model-id", "boundary-pending", "--model-path", str(source), "--yes"], 0, 0, b"initialized\n")
+info = run_case("explicit-metadata", fresh, ["models", "info", "boundary-pending"], 0, 0, reset_registry=False)
+assert f"checksum: {SUM}\n".encode() in info.stdout and b"download_url: https://127.0.0.1:" in info.stdout
+config_before = (fresh / "config" / "kotoba" / "config.toml").read_bytes()
+run_case("init-unknown", fresh, ["init", "--model-id", "no-such-boundary-model", "--yes"], 2, 0, b"", ("invalid_arguments",))
+assert (fresh / "config" / "kotoba" / "config.toml").read_bytes() == config_before
+
+existing = TMP / "boundary-existing"
+run_case("existing-setup", existing, ["init", "--model-id", "boundary-installed", "--yes"], 0, 0, b"initialized\n")
+for name, args in (
+    ("existing-pending", ["init", "--model-id", "boundary-pending", "--yes"]),
+    ("existing-absent-path", ["init", "--model-id", "boundary-absent-path", "--yes"]),
+):
+    observer = Observer()
+    log_case_start(name, args, observer)
+    try:
+        _, models_file = write_registry(existing, observer.port)
+        config_file = existing / "config" / "kotoba" / "config.toml"
+        memory_file = existing / "data" / "kotoba" / "memory.sqlite3"
+        config_before = config_file.read_bytes()
+        registry_before = models_file.read_bytes()
+        memory_before = memory_file.read_bytes()
+        process = subprocess.run([BIN, *args], env=env_for(existing), capture_output=True, timeout=10)
+    finally:
+        observer.close()
+    log_case_complete(name, args, observer, process)
+    assert_connection_count(name, args, observer, 0)
+    assert process.returncode == 1 and process.stdout == b"" and process.stderr == (HINT + MODEL_MISSING).encode()
+    assert config_file.read_bytes() == config_before
+    assert models_file.read_bytes() == registry_before
+    assert memory_file.read_bytes() == memory_before
+    assert not list((existing / "data" / "kotoba" / "models").glob("*.gguf"))
+    assert not list((existing / "data" / "kotoba" / "models").glob("*.tmp-*"))
+    log_case_pass(name, args, observer)
+
+pull_root = TMP / "boundary-pull"
+run_case("explicit-pull-positive-control", pull_root, ["models", "pull", "boundary-pending", "--output", str(pull_root / "pull-probe.gguf")], 1, ">=1", b"", ("model_registry_invalid",))
+assert not (pull_root / "pull-probe.gguf").exists()
+assert not list(pull_root.glob("pull-probe.gguf.tmp-*"))
+print("network matrix assertions ok")
+PY
+
+cp "${XDG_CONFIG_HOME}/kotoba/config.toml" "${TMP}/init-download-config.before"
+cp "${XDG_CONFIG_HOME}/kotoba/models.toml" "${TMP}/init-download-registry.before"
+if "${BIN}" init --model-id init-download --yes >"${TMP}/init-download.out" 2>"${TMP}/init-download.err"; then
+  echo "init must not acquire a file-source registry model" >&2
+  exit 1
+fi
+test ! -s "${TMP}/init-download.out"
+grep -Fx 'kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.' "${TMP}/init-download.err"
+grep -Fx 'kotoba: model_missing: Configured model file does not exist.' "${TMP}/init-download.err"
+cmp "${TMP}/init-download-config.before" "${XDG_CONFIG_HOME}/kotoba/config.toml"
+cmp "${TMP}/init-download-registry.before" "${XDG_CONFIG_HOME}/kotoba/models.toml"
+test ! -e "${XDG_DATA_HOME}/kotoba/models/init-download.gguf"
+if compgen -G "${XDG_DATA_HOME}/kotoba/models/init-download.gguf.tmp-*" >/dev/null; then
+  echo "init left a partial init-download model" >&2
+  exit 1
+fi
 
 cat >>"${XDG_CONFIG_HOME}/kotoba/models.toml" <<TOML
 

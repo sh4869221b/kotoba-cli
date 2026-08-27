@@ -59,6 +59,18 @@ unrelated pre-existing file. Unit fixtures that access the filesystem use
 The deterministic backend is a build-time choice. The normal `zig build test`
 and `zig build` paths continue to compile the embedded production branch.
 
+## Local-first CLI network regression
+
+`bash test/integration/smoke.sh` runs the real copied CLI against a dynamic
+loopback TCP observer. Each command receives a private fixture and records its
+final connection count after the observer drains, stops, and joins. Local-only
+`init`, `translate`, `doctor`, `config`, `glossary`, and `memory` cases must
+have zero connections. An explicit HTTPS `models pull` is the positive control:
+the observer must see a TCP connection, while the intentionally certificate-less
+peer makes that fixture fail rather than claiming a completed HTTPS download.
+This checks the CLI boundary with the deterministic backend; it does not claim
+an operating-system-wide network sandbox or real-model inference coverage.
+
 ## Fault-boundary fixtures
 
 Fault injection is explicitly supplied by tests through instance-local
