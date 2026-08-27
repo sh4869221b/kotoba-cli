@@ -9,6 +9,12 @@ Kotoba CLI is designed for local-first translation.
 - Normal translation performs no network request.
 - Network access can occur only when the user explicitly runs
   `kotoba models pull` for an HTTPS model source.
+- `kotoba init` never downloads a model. It selects an existing local registry
+  path or accepts an explicit `--model-path`; use `kotoba models pull ID --use`
+  before initializing a registered downloadable model.
+- A URL-only registry entry now makes `init --model-id ID` exit 1 with an
+  explicit-pull/local-path instruction. This is a setup boundary, not an
+  operating-system-wide network sandbox.
 - `kotoba translate` suppresses diagnostics by default; interactive terminal
   use still prints only translated text for plain and Markdown output.
 - Debug output is opt-in and is written to stderr. It must not include source or
