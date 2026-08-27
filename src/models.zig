@@ -10,6 +10,7 @@ const validation = @import("models/validation.zig");
 pub const Model = types.Model;
 pub const List = types.List;
 pub const HfSpec = huggingface.HfSpec;
+pub const url = @import("url.zig");
 
 pub const defaultTemplate = registry.defaultTemplate;
 pub const ensure = registry.ensure;

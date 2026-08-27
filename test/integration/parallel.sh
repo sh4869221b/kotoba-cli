@@ -16,6 +16,7 @@ PIDS=()
 LABELS=()
 ROUND_LABELS=()
 UNIT_ROOTS=()
+CHILD_PIDS=()
 
 invalid_arguments() {
   echo "parallel harness: invalid arguments" >&2
@@ -104,11 +105,32 @@ cleanup_owned_child_tmpdir() {
 }
 
 parallel_cleanup() {
-  local status=$?
+  local status=$? original_tmp="${TMP}" child_pids="${CHILD_PIDS[*]}"
   trap - EXIT INT TERM
   terminate_and_reap_children
   cleanup_owned_child_tmpdir
-  harness_cleanup || true
+  harness_cleanup || status=1
+  if [[ -d "${EVIDENCE_RUN}" ]]; then
+    python3 - "${EVIDENCE_RUN}/cleanup.json" "${original_tmp}" "${HARNESS_LOCK_OWNED}" "${status}" "${child_pids}" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+path, temporary, lock_owned, status, pids = sys.argv[1:]
+remaining = []
+for pid in map(int, pids.split()):
+    try:
+        os.kill(pid, 0)
+        remaining.append(pid)
+    except ProcessLookupError:
+        pass
+receipt = {"temporary_root": temporary, "temporary_removed": not Path(temporary).exists(),
+           "lock_released": lock_owned == "0", "remaining_children": remaining, "exit_status": int(status)}
+Path(path).write_text(json.dumps(receipt) + "\n")
+assert receipt["temporary_removed"] and receipt["lock_released"] and not remaining
+PY
+  fi
   exit "${status}"
 }
 
@@ -131,8 +153,15 @@ start_child() {
       restore_job_control=1
       ;;
   esac
-  "$@" >"${prefix}.out" 2>"${prefix}.err" &
+  (
+    date +%s%N >"${prefix}.started"
+    status=0
+    "$@" || status=$?
+    date +%s%N >"${prefix}.finished"
+    exit "${status}"
+  ) >"${prefix}.out" 2>"${prefix}.err" &
   PIDS+=("$!")
+  CHILD_PIDS+=("$!")
   if [[ "${restore_job_control}" == "1" ]]; then
     set +m
   fi
@@ -170,12 +199,14 @@ start_script_child() {
   local round="$1"
   local label="$2"
   local script_name="$3"
+  shift 3
   start_child "${round}" "${label}" bash -c '
     set -euo pipefail
     root="$1"
     parent_state="$2"
     child_tmpdir="$3"
     script_name="$4"
+    shift 4
     cd "${root}"
     exec env \
       HOME="${parent_state}/home" \
@@ -184,8 +215,69 @@ start_script_child() {
       XDG_CACHE_HOME="${parent_state}/cache" \
       XDG_STATE_HOME="${parent_state}/state" \
       TMPDIR="${child_tmpdir}" \
-      bash "${root}/test/integration/${script_name}"
-  ' bash "${ROOT}" "${PARENT_STATE_ROOT}" "${CHILD_TMPDIR}" "${script_name}"
+      bash "${root}/test/integration/${script_name}" "$@"
+  ' bash "${ROOT}" "${PARENT_STATE_ROOT}" "${CHILD_TMPDIR}" "${script_name}" "$@"
+}
+
+verify_matrix_evidence() {
+  python3 - "${EVIDENCE_RUN}" "${ROUNDS}" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+root, rounds = Path(sys.argv[1]), int(sys.argv[2])
+temporary_roots, executables, children = set(), set(), []
+for round_number in range(1, rounds + 1):
+    intervals = []
+    for number in (1, 2):
+        prefix = root / f"round-{round_number}-matrix-{number}"
+        runs = list(prefix.glob("cli-matrix.*"))
+        assert len(runs) == 1, f"missing or ambiguous matrix run: {prefix}"
+        run = runs[0]
+        summary = json.loads((run / "summary.json").read_text())
+        assert set(summary["groups"]) == {"translate", "commands", "memory", "files"}
+        assert all(type(count) is int and count > 0 for count in summary["groups"].values())
+        receipts = [json.loads(path.read_text()) for path in sorted((run / "cases").glob("*/receipt.json"))]
+        assert len(receipts) == summary["passed"] == sum(summary["groups"].values())
+        assert sorted(summary["cases"]) == sorted(r["case_id"] for r in receipts)
+        assert len(set(summary["cases"])) == len(receipts)
+        cleanup = json.loads((run / "cleanup.json").read_text())
+        temporary = cleanup["temporary_root"]
+        assert cleanup["temporary_removed"] and cleanup["lock_released"] and cleanup["exit_status"] == 0
+        assert not Path(temporary).exists() and temporary not in temporary_roots
+        temporary_roots.add(temporary)
+        profiles = {}
+        for receipt in receipts:
+            assert receipt["level"] == "cli" and receipt["verdict"] == "pass"
+            assert not receipt["harness_timeout"] and receipt["signal"] == 0
+            assert receipt["assertions"] and all(item["passed"] for item in receipt["assertions"])
+            profile = receipt["profile"]
+            assert profile in {"test", "cpu"}
+            executable = receipt["executable"]
+            assert executable == f"{temporary}/profiles/{profile}/kotoba"
+            assert re.fullmatch(r"[0-9a-f]{64}", receipt["executable_sha256"])
+            identity = (executable, receipt["executable_sha256"])
+            assert profiles.setdefault(profile, identity) == identity
+            case = run / "cases" / receipt["case_id"]
+            assert int((case / "status").read_text()) == receipt["status"]
+            for key in ("stdout", "stderr", "fs_before", "fs_after", "db_before", "db_after"):
+                assert (case / receipt[key]).is_file(), f"missing {key}: {case}"
+        assert set(profiles) == {"test", "cpu"}
+        assert profiles["test"][1] != profiles["cpu"][1]
+        for executable, _ in profiles.values():
+            assert executable not in executables
+            executables.add(executable)
+        interval = [int(Path(str(prefix) + suffix).read_text()) for suffix in (".started", ".finished")]
+        assert interval[0] < interval[1]
+        intervals.append(interval)
+        children.append({"round": round_number, "child": number, "evidence": str(run),
+                         "groups": summary["groups"], "profiles": profiles, "temporary_root": temporary,
+                         "started_ns": interval[0], "finished_ns": interval[1]})
+    assert max(item[0] for item in intervals) < min(item[1] for item in intervals), "matrix children did not overlap"
+(root / "matrix-verification.json").write_text(json.dumps({"children": children, "concurrent_rounds": rounds,
+                                                          "unique_roots": len(temporary_roots)}, indent=2) + "\n")
+PY
 }
 
 verify_benchmark_json() {
@@ -239,20 +331,23 @@ run_self_test() {
   EVIDENCE_RUN="${scratch}/evidence"
   mkdir -p "${EVIDENCE_RUN}"
 
-  start_child self early bash -c 'exit 7'
+  start_child self matrix-early bash -c 'exit 7'
   early_pid="${PIDS[0]}"
-  start_child self later bash -c 'exit 0'
+  start_child self matrix-later bash -c 'exit 0'
   later_pid="${PIDS[1]}"
   if record_child_statuses; then
     self_test_fail "early status 7 was hidden by a later successful child"
   fi
-  grep -qx "round=self child=early pid=${early_pid} status=7" "${EVIDENCE_RUN}/round-self-early.status" \
+  grep -qx "round=self child=matrix-early pid=${early_pid} status=7" "${EVIDENCE_RUN}/round-self-matrix-early.status" \
     || self_test_fail "early child status was not recorded"
-  grep -qx "round=self child=later pid=${later_pid} status=0" "${EVIDENCE_RUN}/round-self-later.status" \
+  grep -qx "round=self child=matrix-later pid=${later_pid} status=0" "${EVIDENCE_RUN}/round-self-matrix-later.status" \
     || self_test_fail "later child status was not recorded"
   ! kill -0 "${early_pid}" 2>/dev/null || self_test_fail "early child was not reaped"
   ! kill -0 "${later_pid}" 2>/dev/null || self_test_fail "later child was not reaped"
-  echo "parallel harness self-test: status aggregation and reaping ok"
+  start_child restored matrix-early bash -c 'exit 0'
+  start_child restored matrix-later bash -c 'exit 0'
+  record_child_statuses || self_test_fail "restored matrix children did not pass"
+  echo "parallel harness self-test: matrix failure aggregation, restored success and reaping ok (lifecycle only)"
 
   TMP="${scratch}"
   CHILD_TMPDIR="${scratch}/child-tmp"
@@ -290,7 +385,7 @@ run_self_test() {
     CHILD_TMPDIR="$TMP/child-tmp"
     mkdir -p "$EVIDENCE_RUN" "$CHILD_TMPDIR"
     install_parallel_cleanup_traps
-    start_child self interrupt bash -c '\''sleep 30 & child=$!; printf "%s\\n" "$child" >"$1"; wait "$child"'\'' bash "$INTERRUPT_PID_FILE"
+    start_child self matrix-interrupt bash -c '\''sleep 30 & child=$!; printf "%s\\n" "$child" >"$1"; wait "$child"'\'' bash "$INTERRUPT_PID_FILE"
     for _ in {1..50}; do
       [[ -s "$INTERRUPT_PID_FILE" ]] && break
       sleep 0.1
@@ -352,6 +447,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     start_script_child "${round}" smoke-1 smoke.sh
     start_script_child "${round}" smoke-2 smoke.sh
     start_script_child "${round}" bench bench.sh
+    for matrix_number in 1 2; do
+      start_script_child "${round}" "matrix-${matrix_number}" cli_matrix.sh \
+        --evidence-dir "${EVIDENCE_RUN}/round-${round}-matrix-${matrix_number}"
+    done
 
     if ! record_child_statuses; then
       overall=1
@@ -367,6 +466,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       overall=1
     fi
   done
+  if ! verify_matrix_evidence; then
+    echo "parallel harness: matrix evidence failed validation" >&2
+    overall=1
+  fi
   if ! verify_parent_state; then
     echo "parallel harness: parent sentinel state changed" >&2
     overall=1

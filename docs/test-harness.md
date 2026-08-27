@@ -33,7 +33,7 @@ explicit fixture copies arbitrary bytes exactly, including empty, whitespace,
 invalid UTF-8, and truncated bytes. Without a fixture it returns
 `JA:<source_text>` or `EN:<source_text>` according to `target_lang`. It uses
 the structured source and target fields and never parses prompt markers.
-Malformed bytes are payloads, not a new validation feature; #31 validation is
+Malformed bytes are payloads, not a new validation feature; #37 validation is
 outside this harness.
 
 ## Private state and cleanup
@@ -58,6 +58,18 @@ unrelated pre-existing file. Unit fixtures that access the filesystem use
 
 The deterministic backend is a build-time choice. The normal `zig build test`
 and `zig build` paths continue to compile the embedded production branch.
+
+## Local-first CLI network regression
+
+`bash test/integration/smoke.sh` runs the real copied CLI against a dynamic
+loopback TCP observer. Each command receives a private fixture and records its
+final connection count after the observer drains, stops, and joins. Local-only
+`init`, `translate`, `doctor`, `config`, `glossary`, and `memory` cases must
+have zero connections. An explicit HTTPS `models pull` is the positive control:
+the observer must see a TCP connection, while the intentionally certificate-less
+peer makes that fixture fail rather than claiming a completed HTTPS download.
+This checks the CLI boundary with the deterministic backend; it does not claim
+an operating-system-wide network sandbox or real-model inference coverage.
 
 ## Fault-boundary fixtures
 
@@ -152,8 +164,10 @@ zig build test
 zig build test -Dtest-backend=true
 zig build
 bash test/integration/common.sh --self-test
+bash test/integration/parallel.sh --self-test
 bash test/integration/smoke.sh
 bash test/integration/bench.sh
+bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
 ```
 
 To inspect the installed artifacts without running the build's shared
@@ -175,8 +189,9 @@ env -u KOTOBA_CUDA_MODEL bash test/integration/cuda_smoke.sh
 # SKIP cuda qa: missing KOTOBA_CUDA_MODEL or nvidia-smi
 ```
 
-The repeated/concurrent check uses independent unit-test, smoke, and
-benchmark processes. It runs 3 rounds by default; `--rounds` accepts an
+The repeated/concurrent check uses four unit-test, two smoke, one benchmark,
+and two complete CLI matrix processes per round (nine children). It runs 3
+rounds by default; `--rounds` accepts an
 integer from 1 through 1000. `--evidence-dir` must be an absolute path, and
 invalid or out-of-range arguments exit with status 2 and
 `parallel harness: invalid arguments`.
@@ -184,14 +199,142 @@ invalid or out-of-range arguments exit with status 2 and
 Run it with an absolute evidence directory:
 
 ```bash
-E="$PWD/.omo/evidence/issue-47"
-mkdir -p "$E/task-6-children"
-bash test/integration/parallel.sh --rounds 3 --evidence-dir "$E/task-6-children" \
-  >"$E/task-6-parallel.log" 2>&1
+E="$PWD/.omo/evidence/parallel"
+mkdir -p "$E"
+bash test/integration/parallel.sh --rounds 2 --evidence-dir "$E"
 ```
 
-The driver records every child status, preserves parent sentinels, parses each
-benchmark JSON with Python's standard library, and cleans only owned roots.
+The driver records every child status and start/finish timestamps, preserves
+parent sentinels, parses each benchmark JSON, and cleans only owned roots.
+Each `parallel.*/round-N-matrix-M/cli-matrix.*` subtree retains the full matrix
+receipts. `matrix-verification.json` records distinct temporary roots and
+profile executables, nonempty groups, and overlapping matrix child lifetimes
+in each round. Builds still serialize through the shared lock; this is process
+concurrency, not simultaneous raw Zig builds. `cleanup.json` records the removed
+parent root, released lock ownership and reaped child PIDs. An explicit external
+evidence directory retains these artifacts after cleanup.
+
+`parallel.sh --self-test` uses fake children only for lifecycle verification:
+an early matrix child exits 7 followed by a successful child, the aggregate
+must fail, restored children must pass, and a signal must remove the owned
+root and reap descendants. These are helper checks, not product CLI coverage.
+
+## CLI contract matrix
+
+The stable entrypoint for automation (including the follow-up #15) is:
+
+```bash
+bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
+# Optional focused selection; default is all four groups.
+bash test/integration/cli_matrix.sh --group translate --evidence-dir "$PWD/.omo/evidence/translate"
+bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/commands"
+bash test/integration/cli_matrix.sh --group memory --evidence-dir "$PWD/.omo/evidence/memory"
+bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evidence/files"
+bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
+```
+
+The matrix currently has 155 measured CLI cases: translate 39, commands 65,
+memory 17, files 34. Setup calls are captured separately, not counted as cases.
+Every selected group must run at least one case; missing files, duplicate IDs,
+unfinished cases, failed assertions and harness timeouts fail the suite.
+The per-command limit is 120 seconds and the suite limit is 20 minutes. A
+harness timeout is not evidence of Kotoba's application `timeout` error.
+The runner builds separate private `test` and `cpu` snapshots. Only
+`commands-translate-cpu-model-missing` uses CPU; a deterministic session does
+not check whether its configured model file exists.
+
+Each `cli-matrix.*/cases/ID/receipt.json` identifies `level=cli`, group, actual
+argv array, executable profile and SHA-256, stdin SHA-256, process status,
+raw stdout/stderr, before/after FS and TM snapshots, and assertion verdicts.
+Captured paths are relative to the case evidence directory; executable and
+fixture paths describe the original, subsequently removed temporary tree.
+FS entries are sorted relative paths with type, mode, symlink target or content
+hash, including SQLite/journal entries. Access times are excluded. TM is
+observed through a separate SQLite URI `mode=ro` connection: absent and
+unreadable are explicit states, never silently treated as zero rows. Readable
+state includes column names, ordered row values and hit counts. The observer
+does not initialize or repair a database. `summary.json` lists every case and
+group count; `cleanup.json` records removed TMP and released lock ownership.
+Evidence contains synthetic source/translation fixtures; no user state is read.
+
+JSON assertions parse the real stdout. Success has exactly `source_lang`,
+`target_lang`, `mode`, `model_id`, `runtime`, `cached`, `cache_status`,
+`cached_segments`, `total_segments`, `translated_text`, `warnings`, `elapsed_ms`;
+`source_text` is added only with `--include-source`. Strings remain strings,
+`cached` is boolean, warnings are a string array, and counts/time must be
+nonnegative integers (booleans rejected). Only elapsed time's type/range is
+normalized, not translated bytes or counters. Error JSON is exactly
+`{"error":{"code":string,"message":string}}`; doctor is exactly `ok:boolean`
+and `checks:[{name,status,code,message:string}]`. If file routing wins over
+`--format json`, stdout is empty and the file contains translated bytes, so no
+JSON response is claimed. The helper self-test's synthetic zero-segment Result
+is not the real nonempty all-protected CLI case.
+
+### Measured CLI rows (`level=cli`)
+
+Braced alternatives below expand to exact case IDs; full IDs are in each
+summary. All rows assert real status, both streams, and FS/TM state.
+
+| Axis and case IDs | Status and streams | FS / TM observations |
+| --- | --- | --- |
+| `translate-{en-ja,ja-en}-{direct,stdin,txt,md}-{plain,markdown,json}` (24) | 0; exact text or parsed JSON, empty stderr; file routing has empty stdout | Input unchanged; only designated sibling created; no TM changes |
+| `translate-{multiline-plain,multiline-json,include-source-json,technical-json}` | 0; quotes, backslash, tab, newline and UTF-8 preserved; include-source and technical fields checked | FS/TM unchanged |
+| `translate-debug-{flag,config,json}` | 0; exact debug diagnostic on stderr, no source/translated bodies there | FS/TM unchanged |
+| `translate-markdown-{fenced,inline,table,link-url,all-protected}` | 0; protected bytes preserved; tables untranslated; no quality claim | FS/TM unchanged |
+| `translate-empty-{direct,stdin,file}` | 2; empty stdout, exact human `invalid_arguments` | FS/TM unchanged |
+| `commands-{version,init-yes,config-list-ready,config-get-default,config-set,models-list,models-info,models-import,models-pull,models-use,models-verify-explicit,models-remove,glossary-ready,memory-status,memory-clear}` | 0; exact command-specific streams; local `file://` pull | Exact creation/update/removal sets; clear removes seed row; status preserves it |
+| `commands-{top-missing,top-invalid,init-invalid,config-invalid,config-get-arity,models-info-arity,glossary-arity,doctor-arity,memory-clear-arity-absent-db}` and other family arity cases | 2; exact `invalid_arguments`; JSON variants `commands-{invalid-json,doctor-invalid-json}` have parsed error stdout and empty stderr | Initialized failures unchanged; absent-state mutations characterized separately |
+| `commands-doctor-{ready,absent,missing-db}-{human,json}` | 0 ready / 1 absent or missing DB; exact human or typed JSON, empty stderr | Does not create missing state |
+| `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
+| `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity 2; unknown token succeeds as `JA:--bogus` | Model commands eagerly create registry/directories; memory commands create DB when parent exists; #32 characterization |
+| `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
+| `tm-disabled-{flag,config}`; `tm-{directory-open-failure,corrupt-open-failure,statement-failure}` | Disabled/open failure 0 uncached, empty warnings; incompatible table 1 with parsed `sqlite_failed`; empty stderr | Disabled sentinel unchanged; invalid DB/directory unchanged, no replacement or new translation |
+| `glossary-{prefer,protect,hash-change,disabled-flag,disabled-config,empty-key-reuse,empty-key-reuse-config}` | 0; parsed JSON; no deterministic glossary substitution claim | Hash change/disable uses distinct key; disabled empty-glossary key reuse hits |
+| `glossary-invalid-before-tm{,-absent}` | 1; parsed `glossary_invalid`, empty stderr | Existing sentinel or absent DB stays unchanged |
+| `files-explicit-{direct,stdin,txt,md}-{plain,json}`, `files-default-sibling-{md,markdown}` | 0; empty stdout/stderr; exact translated destination bytes | Only destination created; no TM changes |
+| `files-{overwrite,alias-overwrite}-{enabled,disabled}` | 0; empty streams | Destination replaced, including source alias; TM +1 enabled / unchanged disabled |
+| `files-{output-exists,alias-exists,directory-exists,missing-parent,directory-open}-{enabled,disabled}` | 1; empty stdout, exact `output_exists` or Linux `io_error` (`FileNotFound` / `IsDir`) | Destination bytes/entries and siblings preserved, but fresh source already cached (+1 row) when enabled; no-memory unchanged |
+| `files-{empty-direct,empty-stdin,empty-file,conflicting-input,missing-input}-{enabled,disabled}` | 2 `invalid_arguments` or 1 `io_error: FileNotFound`; empty stdout | Fail before translation; destination and TM unchanged |
+
+Finalized initialization regression #9 remains in `smoke.sh` and
+`commands-init-remote-rejected`: URL-only init exits 1 with pull/model-path
+guidance and `model_missing`, without downloading. The original smoke network
+observer still checks zero local-command connections and the explicit pull
+positive control. The separate `bash test/integration/secret_urls.sh` retains
+#36's real CLI rejection, redaction and migration coverage; its signed-download
+success proof is explicitly an injected-downloader component test, not real
+HTTPS success. Neither regression is replaced by a matrix helper.
+
+### Component rows and remaining gaps
+
+These named inline tests run via `zig build test -Dtest-backend=true`.
+Their returned errors and state are `level=component`: CLI argv, streams and
+exit status are **N/A**. The CPU unit profile skips only the test requiring
+`translateSegments`' deterministic backend; the deterministic profile executes it.
+
+| Exact test name (module) | Component observable / limitation |
+| --- | --- |
+| `result consumer frees failed partial payloads without appending or caching them` (`translate`) | Timeout maps to `Timeout` / `timeout`; context/decode to `LlamaDecodeFailed` / `llama_decode_failed`; failed payload not appended/cached, previous row retained, allocator cleanup checked |
+| `translateSegments sqlite lookup and upsert failures retain prior rows and fresh fixtures recover` (`translate`) | Borrowed faults at relative step 3/4 return `SqliteFailed`; exact counters and independent read-only observer prove first row retained, second absent; fresh fixtures recover |
+| `result consumer accepts completed and token-limited bytes verbatim` (`translate`) | `eog` and `max_tokens` append/cache partial, invalid UTF-8, empty and whitespace bytes verbatim (8 rows); #31/#37 characterization |
+| `restore appends warning when token missing` (`markdown`) | Warning-only success; returned text stays `translation without protected tokens`; #37 |
+| `writeOutput rejects existing destination without overwrite` (`translate`) | `OutputExists`, existing `old` bytes unchanged |
+| `fault fs failure injected write preserves data and entry set`; `fault fs failure rename preserves existing and absent destinations` (`fs`) | Pre-operation injected failure preserves bytes/entries; not mid-write atomicity |
+| `fault io failure prefix and broken pipe cause`; `fault io failure deferred flush independent counters disarm and rearm`; `fault io failure full caller owned sink is bounded` (`sys`) | `WriteFailed`, partial/pending bytes and recorded `BrokenPipe`/`NoSpaceLeft` causes; not real CLI stdout failure |
+| `fault io failure read limit prefix independent instances and rearm` (`sys`) | Reader failure/limit, consumed prefix, independent counters and recovery |
+
+| Level | Unproven or deferred guarantee | Owning follow-up |
+| --- | --- | --- |
+| gap | Broken stdout and control-byte serializer paths are not fully CLI covered; ordinary valid JSON is not proof for these paths | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
+| gap | Mid-write regular-file atomicity/rollback; pre-open failures and injected pre-call preservation cannot establish it | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
+| gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
+| gap | Validation before mutation and truly read-only commands; unknown option as initial text is currently accepted | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
+| gap | Invalid/empty result validation and missing protected-token rejection; bytes are accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
+
+Characterizations record today's behavior, not endorsements or permanent
+guarantees. Component failures do not invent corresponding CLI streams/status.
+No matrix case claims real-model quality, GPU execution or real generation
+timeout/decode faults, and no default test needs internet, a model or curl.
 
 ## Concurrency and coverage boundary
 

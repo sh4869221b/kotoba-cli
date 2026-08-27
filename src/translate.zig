@@ -350,6 +350,9 @@ test "writeOutput rejects existing destination without overwrite" {
         .translated_text = "new",
         .elapsed_ms = 1,
     }, .markdown, null, out_path, false));
+    const preserved = try sys.readFileAlloc(std.testing.allocator, out_path, 1024);
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("old", preserved);
 }
 
 test "result consumer frees failed partial payloads without appending or caching them" {
@@ -380,13 +383,101 @@ test "result consumer frees failed partial payloads without appending or caching
             .timeout_sec = 1,
         });
         const expected_error = if (reason == .timeout) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
-        try std.testing.expectError(expected_error, consumeResult(allocator, result, &translated, &db, failed_key));
+        const consumed = consumeResult(allocator, result, &translated, &db, failed_key);
+        try std.testing.expectError(expected_error, consumed);
+        if (consumed) |_| unreachable else |err| {
+            const mapped = errors.fromError(err);
+            try std.testing.expectEqual(if (reason == .timeout) errors.Code.timeout else errors.Code.llama_decode_failed, mapped.code);
+            try std.testing.expectEqualStrings(if (reason == .timeout) "The operation timed out." else "Embedded llama.cpp generation failed.", mapped.message);
+        }
         try std.testing.expectEqualStrings("saved", translated.items);
         try std.testing.expect(try db.lookup(failed_key) == null);
         try std.testing.expectEqual(@as(usize, 1), try db.count());
         const hit = (try db.lookup(previous)).?;
         defer allocator.free(hit.translated_text);
         try std.testing.expectEqualStrings("saved", hit.translated_text);
+    }
+}
+
+test "translateSegments sqlite lookup and upsert failures retain prior rows and fresh fixtures recover" {
+    if (!@import("build_options").test_backend) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("sqlite3.h");
+    });
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 3, 4 }) |ordinal| {
+        for ([_]bool{ true, false }) |inject| {
+            var tmp = std.testing.tmpDir(.{});
+            const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+            defer allocator.free(root);
+            defer {
+                tmp.cleanup();
+                std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, root, .{})) catch @panic("translation fixture leaked");
+            }
+            const path = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" });
+            defer allocator.free(path);
+            var faults = memory.Faults{};
+            defer faults.disarm();
+            var db = try memory.openWithFaults(allocator, path, &faults);
+            defer {
+                std.testing.expect(c.sqlite3_next_stmt(@ptrCast(db.handle), null) == null) catch @panic("translation statement leaked");
+                std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(@ptrCast(db.handle))) catch @panic("translation database did not close");
+            }
+            try std.testing.expectEqual(@as(usize, 1), faults.count(.open));
+            try std.testing.expectEqual(@as(usize, 1), faults.count(.step));
+            if (inject) try faults.arm(.step, ordinal, c.SQLITE_IOERR);
+            var segments = [_]segment.Segment{ .{ .text = "first" }, .{ .text = "\n\n", .translatable = false }, .{ .text = "second" } };
+            var cfg = config.default();
+            cfg.model_id = "test";
+            cfg.model_path = "unused-by-test-backend.gguf";
+            const result = translateSegments(allocator, &segments, .{
+                .source_lang = .en,
+                .target_lang = .ja,
+                .mode = .default,
+                .model_id = cfg.model_id,
+                .glossary_hash = 0,
+                .glossary = .{ .terms = &.{} },
+                .db_opt = &db,
+                .cfg = cfg,
+                .diagnostics_enabled = false,
+            });
+            if (result) |translated| {
+                defer allocator.free(translated.translated_text);
+                try std.testing.expect(!inject);
+                try std.testing.expectEqualStrings("JA:first\n\nJA:second", translated.translated_text);
+                try std.testing.expectEqual(@as(usize, 0), translated.cached_segments);
+            } else |err| {
+                try std.testing.expect(inject);
+                try std.testing.expectEqual(errors.Error.SqliteFailed, err);
+                const mapped = errors.fromError(err);
+                try std.testing.expectEqual(errors.Code.sqlite_failed, mapped.code);
+                try std.testing.expectEqualStrings("SQLite translation memory operation failed.", mapped.message);
+            }
+            try std.testing.expectEqual(@as(usize, 1) + if (inject) ordinal else @as(usize, 4), faults.count(.step));
+            try std.testing.expectEqual(if (inject) @as(?c_int, c.SQLITE_IOERR) else null, faults.last_code);
+            faults.disarm();
+
+            var observer = try memory.openReadOnly(allocator, path);
+            defer observer.close();
+            try std.testing.expect(observer.faults == null);
+            try std.testing.expectEqual(if (inject) @as(usize, 1) else @as(usize, 2), try observer.count());
+            var rows = try memory.Stmt.prepare(&observer, "SELECT source_text, translated_text, hit_count FROM translations ORDER BY source_text");
+            defer rows.deinit();
+            const expected_rows: usize = if (inject) 1 else 2;
+            for (0..expected_rows) |index| {
+                try std.testing.expectEqual(c.SQLITE_ROW, try rows.step());
+                const source = try rows.columnTextDup(0);
+                defer allocator.free(source);
+                const translated = try rows.columnTextDup(1);
+                defer allocator.free(translated);
+                try std.testing.expectEqualStrings(if (index == 0) "first" else "second", source);
+                try std.testing.expectEqualStrings(if (index == 0) "JA:first" else "JA:second", translated);
+                try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(@ptrCast(rows.handle), 2));
+            }
+            try std.testing.expectEqual(c.SQLITE_DONE, try rows.step());
+            try std.testing.expectEqual(@as(usize, 1), faults.count(.open));
+            try std.testing.expectEqual(@as(usize, 1) + if (inject) ordinal else @as(usize, 4), faults.count(.step));
+        }
     }
 }
 

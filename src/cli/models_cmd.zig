@@ -33,12 +33,17 @@ fn runInfo(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     if (cmd_args.len != 1) return errors.Error.InvalidArguments;
     const list = try models.load(allocator, paths.models_file);
     const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
-    printModelInfo(m);
+    try printModelInfo(allocator, m);
     return 0;
 }
 
-fn printModelInfo(m: models.Model) void {
-    sys.stdoutPrint("id: {s}\nname: {s}\nprofile: {s}\nformat: {s}\nquantization: {s}\ncontext_length: {d}\npath: {s}\ndownload_url: {s}\nchecksum: {s}\nlicense: {s}\nrecommended: {}\nnotes: {s}\n", .{
+fn printModelInfo(allocator: std.mem.Allocator, m: models.Model) !void {
+    const download_url = try models.url.displayUrl(allocator, m.download_url);
+    defer allocator.free(download_url);
+    const source = if (m.source_url.len > 0) m.source_url else m.download_url;
+    const source_url = try models.url.displayUrl(allocator, if (models.url.isRemote(source)) source else "");
+    defer allocator.free(source_url);
+    sys.stdoutPrint("id: {s}\nname: {s}\nprofile: {s}\nformat: {s}\nquantization: {s}\ncontext_length: {d}\npath: {s}\ndownload_url: {s}\nsource_url: {s}\nchecksum: {s}\nlicense: {s}\nrecommended: {}\nnotes: {s}\n", .{
         m.id,
         m.name,
         m.profile,
@@ -46,7 +51,8 @@ fn printModelInfo(m: models.Model) void {
         m.quantization,
         m.context_length,
         m.path,
-        m.download_url,
+        download_url,
+        source_url,
         m.checksum,
         m.license,
         m.recommended,
@@ -106,6 +112,15 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
 }
 
 fn runPull(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    return runPullWithAcquirer(allocator, paths, cmd_args, models.acquire);
+}
+
+fn runPullWithAcquirer(
+    allocator: std.mem.Allocator,
+    paths: xdg.Paths,
+    cmd_args: []const []const u8,
+    acquirer: *const fn (std.mem.Allocator, models.Model, []const u8, bool) anyerror!void,
+) !u8 {
     var cursor = args.ArgCursor.init(cmd_args);
     var id: []const u8 = "";
     var output_path: []const u8 = "";
@@ -154,7 +169,8 @@ fn runPull(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         m = .{ .id = id, .name = id, .profile = "huggingface", .languages_en = true, .languages_ja = true, .format = "gguf", .quantization = hf.quant, .path = output_path, .download_url = url, .checksum = checksum, .notes = "Downloaded from Hugging Face." };
     } else if (model_url.len > 0) {
         if (positional_id.len > 0 or id.len == 0) return errors.Error.InvalidArguments;
-        if (!std.mem.startsWith(u8, model_url, "https://")) return errors.Error.InvalidArguments;
+        const uri = try models.url.parseRemote(model_url);
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
         if (checksum.len == 0) return errors.Error.InvalidArguments;
         try models.validateId(id);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
@@ -163,13 +179,24 @@ fn runPull(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
         const list = try models.load(allocator, paths.models_file);
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
+        if (models.url.isRemote(m.download_url)) {
+            const uri = try models.url.parseRemote(m.download_url);
+            if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
+        }
+        if (models.url.reusableUrl(m.download_url).len == 0) return errors.Error.ModelSourceRequired;
         id = m.id;
         if (output_path.len == 0) output_path = if (m.path.len > 0) m.path else try models.installedPath(allocator, paths.models_dir, id);
         m.path = output_path;
         if (checksum.len > 0) m.checksum = checksum;
     }
     try models.validateGgufPath(output_path);
-    try models.acquire(allocator, m, output_path, false);
+    var request_model = m;
+    if (models.url.isRemote(m.download_url)) {
+        request_model.download_url = try models.url.requestUrl(m.download_url);
+        m.source_url = try models.url.sourceIdentity(allocator, m.download_url);
+    }
+    m.download_url = models.url.reusableUrl(m.download_url);
+    try acquirer(allocator, request_model, output_path, false);
     m.path = output_path;
     try models.verifyModel(allocator, m);
     try models.upsert(allocator, paths.models_file, m);
@@ -243,4 +270,217 @@ pub fn selectModel(allocator: std.mem.Allocator, paths: xdg.Paths, id: []const u
     cfg.model_id = try allocator.dupe(u8, id);
     cfg.model_path = try allocator.dupe(u8, model_path);
     try config.save(paths.config_file, cfg);
+}
+
+// Keep command output out of the Zig test runner's stdout protocol.
+const TestStdoutCapture = struct {
+    const c = std.c;
+    saved: c_int,
+
+    fn start(file: std.Io.File) !TestStdoutCapture {
+        const saved = c.dup(std.posix.STDOUT_FILENO);
+        if (saved < 0) return error.CaptureFailed;
+        errdefer _ = c.close(saved);
+        if (c.dup2(file.handle, std.posix.STDOUT_FILENO) < 0) return error.CaptureFailed;
+        return .{ .saved = saved };
+    }
+
+    fn restore(self: *TestStdoutCapture) void {
+        if (self.saved < 0) return;
+        if (c.dup2(self.saved, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
+        if (c.close(self.saved) != 0) @panic("stdout capture close failed");
+        self.saved = -1;
+    }
+};
+
+fn testPullPaths(allocator: std.mem.Allocator, root: []const u8) !xdg.Paths {
+    return .{
+        .config_dir = root,
+        .data_dir = root,
+        .cache_dir = root,
+        .state_dir = root,
+        .models_dir = root,
+        .config_file = try std.fs.path.join(allocator, &.{ root, "config.toml" }),
+        .models_file = try std.fs.path.join(allocator, &.{ root, "models.toml" }),
+        .glossary_file = try std.fs.path.join(allocator, &.{ root, "glossary.toml" }),
+        .memory_file = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" }),
+    };
+}
+
+test "secret URL pull pipeline keeps request transient" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    try sys.writeFile(paths.models_file, "");
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    const Fixture = struct {
+        const signed = "https://models.example.invalid/repo/model%2Bname.gguf?X-Signature=KOTOBA_QUERY_SECRET_36&x=a%2Bb&x=2#KOTOBA_FRAGMENT_SECRET_36";
+        const identity = "https://models.example.invalid/repo/model%2Bname.gguf";
+        const bytes = "remote model bytes";
+        var expected: []const u8 = undefined;
+        var calls: usize = 0;
+        fn download(_: std.mem.Allocator, value: []const u8, dest: []const u8) !void {
+            calls += 1;
+            try std.testing.expectEqualStrings(expected, value);
+            try sys.writeFile(dest, bytes);
+        }
+        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, skip: bool) !void {
+            try std.testing.expectEqualStrings(expected, m.download_url);
+            try std.testing.expect(!skip);
+            try @import("../models/install.zig").acquireWithDownloader(a, m, dest, skip, download);
+        }
+    };
+    Fixture.calls = 0;
+    const checksum = try sys.hexSha256(allocator, Fixture.bytes);
+    const dest = try models.installedPath(allocator, root, "signed36");
+    for ([_][]const u8{ Fixture.signed, Fixture.identity, Fixture.signed }) |source| {
+        Fixture.expected = source[0 .. std.mem.indexOfScalar(u8, source, '#') orelse source.len];
+        const before_calls = Fixture.calls;
+        try std.testing.expectEqual(@as(u8, 0), try runPullWithAcquirer(allocator, paths, &.{ "--model-url", source, "--id", "signed36", "--checksum", checksum }, Fixture.acquire));
+        try std.testing.expectEqual(before_calls + 1, Fixture.calls);
+        const saved = models.find(try models.load(allocator, paths.models_file), "signed36").?;
+        try std.testing.expectEqualStrings(Fixture.identity, saved.source_url);
+        try std.testing.expectEqualStrings(if (std.mem.indexOfScalar(u8, source, '?') == null) Fixture.identity else "", saved.download_url);
+        try std.testing.expectEqualStrings(checksum, saved.checksum);
+        try std.testing.expectEqualStrings(dest, saved.path);
+        try std.testing.expectEqualStrings(Fixture.bytes, try sys.readFileAlloc(allocator, dest, 1024));
+        try models.verifySha256(allocator, dest, checksum);
+        const registry = try sys.readFileAlloc(allocator, paths.models_file, 8192);
+        try std.testing.expect(std.mem.indexOf(u8, registry, "KOTOBA_") == null);
+    }
+    const saved_before_failure = try sys.readFileAlloc(allocator, paths.models_file, 8192);
+    const wrong_checksum = try sys.hexSha256(allocator, "different bytes");
+    Fixture.expected = try models.url.requestUrl(Fixture.signed);
+    try std.testing.expectError(error.ChecksumFailed, runPullWithAcquirer(allocator, paths, &.{ "--model-url", Fixture.signed, "--id", "signed36", "--checksum", wrong_checksum }, Fixture.acquire));
+    try std.testing.expectEqual(@as(usize, 4), Fixture.calls);
+    try std.testing.expectEqualStrings(saved_before_failure, try sys.readFileAlloc(allocator, paths.models_file, 8192));
+    try std.testing.expectEqualStrings(Fixture.bytes, try sys.readFileAlloc(allocator, dest, 1024));
+    try models.verifySha256(allocator, dest, checksum);
+    Fixture.expected = "https://huggingface.co/example/repo/resolve/main/model.gguf";
+    try std.testing.expectEqual(@as(u8, 0), try runPullWithAcquirer(allocator, paths, &.{ "--hf-repo", "example/repo", "--hf-file", "model.gguf", "--id", "hf36", "--checksum", checksum }, Fixture.acquire));
+    try std.testing.expectEqual(@as(usize, 5), Fixture.calls);
+    const hf_saved = models.find(try models.load(allocator, paths.models_file), "hf36").?;
+    try std.testing.expectEqualStrings(Fixture.expected, hf_saved.download_url);
+    try std.testing.expectEqualStrings(Fixture.expected, hf_saved.source_url);
+    try models.verifySha256(allocator, hf_saved.path, checksum);
+    capture.restore();
+    try std.testing.expectEqualStrings("pulled signed36\npulled signed36\npulled signed36\npulled hf36\n", try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 1024));
+    var iterator = tmp.dir.iterate();
+    while (try iterator.next(sys.io())) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+}
+
+test "secret URL pull without reusable source fails before acquirer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    const dest = try models.installedPath(allocator, root, "signed36");
+    try sys.writeFile(dest, "installed model bytes");
+    const checksum = try sys.hexSha256(allocator, "installed model bytes");
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    const Fixture = struct {
+        var calls: usize = 0;
+        fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: bool) !void {
+            calls += 1;
+            return error.UnexpectedAcquirerCall;
+        }
+    };
+    Fixture.calls = 0;
+    for ([_]struct { source: []const u8, expected: anyerror }{
+        .{ .source = "", .expected = error.ModelSourceRequired },
+        .{ .source = "https://models.example.invalid/a?token=KOTOBA_QUERY_SECRET_36", .expected = error.ModelSourceRequired },
+        .{ .source = "https://models.example.invalid/a?", .expected = error.ModelSourceRequired },
+        .{ .source = "https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/a", .expected = error.InvalidArguments },
+        .{ .source = "https://@models.example.invalid/a", .expected = error.InvalidArguments },
+        .{ .source = "https:///a", .expected = error.InvalidArguments },
+        .{ .source = "https://models.example.invalid/a#\t", .expected = error.InvalidArguments },
+        .{ .source = "http://models.example.invalid/a", .expected = error.InvalidArguments },
+    }) |case| {
+        const registry = try std.fmt.allocPrint(allocator, "[[models]]\nid = \"signed36\"\npath = \"{s}\"\nchecksum = \"{s}\"\ndownload_url = \"{s}\"\nsource_url = \"https://models.example.invalid/never-fetch.gguf\"\n", .{ dest, checksum, case.source });
+        try sys.writeFile(paths.models_file, registry);
+        try std.testing.expectError(case.expected, runPullWithAcquirer(allocator, paths, &.{"signed36"}, Fixture.acquire));
+        try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
+        try std.testing.expectEqualStrings(registry, try sys.readFileAlloc(allocator, paths.models_file, 8192));
+        try std.testing.expectEqualStrings("installed model bytes", try sys.readFileAlloc(allocator, dest, 1024));
+        try models.verifySha256(allocator, dest, checksum);
+    }
+    const oversize = try allocator.alloc(u8, models.url.max_length + 1);
+    @memset(oversize, 'a');
+    @memcpy(oversize[0.."https://models.example.invalid/".len], "https://models.example.invalid/");
+    for ([_][]const u8{ "https://@models.example.invalid/a", "https:///a", "https://models.example.invalid/a#\t", oversize }) |source| {
+        try std.testing.expectError(error.InvalidArguments, runPullWithAcquirer(allocator, paths, &.{ "--model-url", source, "--id", "signed36", "--checksum", checksum }, Fixture.acquire));
+        try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
+        try models.verifySha256(allocator, dest, checksum);
+    }
+    capture.restore();
+    try std.testing.expectEqualStrings("", try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 1024));
+    var iterator = tmp.dir.iterate();
+    while (try iterator.next(sys.io())) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+}
+
+test "secret URL pull stdout capture restores on error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const outer = try tmp.dir.createFile(sys.io(), "outer", .{ .read = true });
+    defer outer.close(sys.io());
+    const inner = try tmp.dir.createFile(sys.io(), "inner", .{ .read = true });
+    defer inner.close(sys.io());
+    var capture = try TestStdoutCapture.start(outer);
+    defer capture.restore();
+    const Fixture = struct {
+        fn fail(file: std.Io.File) !void {
+            var nested = try TestStdoutCapture.start(file);
+            defer nested.restore();
+            sys.stdoutWrite("before error\n");
+            return error.ExpectedFailure;
+        }
+    };
+    try std.testing.expectError(error.ExpectedFailure, Fixture.fail(inner));
+    sys.stdoutWrite("restored\n");
+    capture.restore();
+    const outer_bytes = try tmp.dir.readFileAlloc(sys.io(), "outer", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(outer_bytes);
+    const inner_bytes = try tmp.dir.readFileAlloc(sys.io(), "inner", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(inner_bytes);
+    try std.testing.expectEqualStrings("restored\n", outer_bytes);
+    try std.testing.expectEqualStrings("before error\n", inner_bytes);
+}
+
+test "secret URL model info renders remote identities only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]struct { download: []const u8, source: []const u8, expected: []const u8 }{
+        .{ .download = "/local/model?#.gguf", .source = "", .expected = "" },
+        .{ .download = "file:///local/model?#.gguf", .source = "", .expected = "" },
+        .{ .download = "/local/model.gguf", .source = "file:///local/model.gguf", .expected = "" },
+        .{ .download = "https://KOTOBA_USER_36@models.example.invalid/a?KOTOBA_QUERY_SECRET_36", .source = "", .expected = "https://models.example.invalid/a" },
+        .{ .download = "", .source = "https://models.example.invalid/b#KOTOBA_FRAGMENT_SECRET_36", .expected = "https://models.example.invalid/b" },
+        .{ .download = "https:///a", .source = "https:///b", .expected = "[redacted]" },
+    }) |case| {
+        const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+        defer output.close(sys.io());
+        var capture = try TestStdoutCapture.start(output);
+        defer capture.restore();
+        try printModelInfo(allocator, .{ .download_url = case.download, .source_url = case.source });
+        capture.restore();
+        const bytes = try tmp.dir.readFileAlloc(sys.io(), "stdout", allocator, .limited(8192));
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "KOTOBA_") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, try std.fmt.allocPrint(allocator, "\nsource_url: {s}\n", .{case.expected})) != null);
+    }
 }
