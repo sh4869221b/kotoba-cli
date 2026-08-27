@@ -42,8 +42,24 @@ pub fn errorPrefersJson(args_slice: []const []const u8) bool {
 }
 
 test "version command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const captured = try tmp.dir.createFile(std.testing.io, "stdout", .{});
+    defer captured.close(std.testing.io);
+    const saved_stdout = std.c.dup(std.posix.STDOUT_FILENO);
+    if (saved_stdout < 0) return error.StdoutDuplicateFailed;
+    defer _ = std.c.close(saved_stdout);
     const test_args = [_][]const u8{ "kotoba", "version" };
-    _ = try run(std.testing.allocator, &test_args);
+    const status = result: {
+        if (std.c.dup2(captured.handle, std.posix.STDOUT_FILENO) < 0) return error.StdoutCaptureFailed;
+        // The standard test runner reserves stdout for its control protocol.
+        defer if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
+        break :result try run(std.testing.allocator, &test_args);
+    };
+    try std.testing.expectEqual(@as(u8, 0), status);
+    const output = try tmp.dir.readFileAlloc(std.testing.io, "stdout", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("kotoba " ++ version ++ "\n", output);
 }
 
 test "json error preference" {

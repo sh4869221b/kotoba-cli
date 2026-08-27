@@ -1,0 +1,38 @@
+name: Set up Linux CPU toolchain
+description: Install Ubuntu packages and checksum-verified official Zig 0.16.0
+runs:
+  using: composite
+  steps:
+    - name: Install distribution build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        packages=(build-essential clang cmake pkg-config libsqlite3-dev git ripgrep python3 xz-utils ca-certificates curl)
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends "${packages[@]}"
+        # Ubuntu maintains these packages; record the actual resolution on every run.
+        dpkg-query -W -f='${Package}\t${Version}\n' "${packages[@]}"
+    - name: Verify and install official Zig
+      shell: bash
+      run: |
+        set -euo pipefail
+        tool_dir="$(mktemp -d "${RUNNER_TEMP}/kotoba-zig.XXXXXX")"
+        archive=zig-x86_64-linux-0.16.0.tar.xz
+        curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+          "https://ziglang.org/download/0.16.0/${archive}" --output "${tool_dir}/${archive}"
+        (
+          cd "${tool_dir}"
+          printf '%s  %s\n' '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00' "${archive}" \
+            | sha256sum --check --strict
+          tar -xJf "${archive}"
+        )
+        zig_bin="${tool_dir}/zig-x86_64-linux-0.16.0"
+        actual_version="$("${zig_bin}/zig" version)"
+        test "${actual_version}" = 0.16.0
+        python3 - "${actual_version}" <<'PY'
+        import pathlib, re, sys
+        versions = re.findall(r'\.minimum_zig_version\s*=\s*"([^"]+)"', pathlib.Path('build.zig.zon').read_text())
+        assert versions == [sys.argv[1]], (versions, sys.argv[1])
+        print(f'Zig {sys.argv[1]} matches build.zig.zon')
+        PY
+        printf '%s\n' "${zig_bin}" >>"${GITHUB_PATH}"

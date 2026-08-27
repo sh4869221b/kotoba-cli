@@ -19,7 +19,7 @@ kotoba-cli/
 `-- vendor/llama.cpp/      # pinned upstream submodule, own AGENTS.md applies
 ```
 
-Generated or runtime state: `.zig-cache/`, `zig-out/`, `.omo/`, `.codex/`, `.agents/`, and `vendor/llama.cpp/build-kotoba*`.
+Generated or runtime state: `.zig-cache/` (including `llama.cpp/cpu` and `llama.cpp/cuda`, or the same paths under `--cache-dir`), `zig-out/`, `.omo/`, `.codex/`, and `.agents/`. Old `vendor/llama.cpp/build-kotoba*` caches are unused and not automatically removed.
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
