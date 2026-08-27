@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs = @import("fs.zig");
 const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("time.h");
@@ -17,9 +18,8 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, limit: usiz
 }
 
 pub fn writeFile(path: []const u8, data: []const u8) !void {
-    var file = try cwd().createFile(io(), path, .{ .truncate = true });
-    defer file.close(io());
-    try file.writeStreamingAll(io(), data);
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    try filesystem.writeFile(path, data);
 }
 
 pub fn copyFile(src: []const u8, dest: []const u8) !void {
@@ -27,7 +27,8 @@ pub fn copyFile(src: []const u8, dest: []const u8) !void {
 }
 
 pub fn renameFile(src: []const u8, dest: []const u8) !void {
-    try cwd().rename(src, cwd(), dest, io());
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    try filesystem.renameFile(src, dest);
 }
 
 pub fn realPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
@@ -44,7 +45,8 @@ pub fn makePath(path: []const u8) !void {
 }
 
 pub fn deleteFile(path: []const u8) void {
-    cwd().deleteFile(io(), path) catch {};
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    filesystem.deleteFile(path) catch {};
 }
 
 pub fn stdoutWrite(bytes: []const u8) void {
@@ -442,6 +444,48 @@ test "fault io failure full caller owned sink is bounded" {
     try std.testing.expectEqualStrings("ab", &sink);
     try std.testing.expectEqual(@as(usize, 2), writer.bytes_written);
     try std.testing.expectEqual(error.NoSpaceLeft, writer.last_cause.?);
+}
+
+test "fault boundary happy default file system writes renames and deletes real files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "destination" });
+    defer std.testing.allocator.free(destination);
+
+    try writeFile(source, "old");
+    try writeFile(source, "new");
+    try renameFile(source, destination);
+    const bytes = try readFileAlloc(std.testing.allocator, destination, 64);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("new", bytes);
+    deleteFile(destination);
+    try std.testing.expect(!exists(destination));
+}
+
+test "fault boundary failure default errors propagate while missing delete is swallowed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ root, "missing" });
+    defer std.testing.allocator.free(missing);
+    const missing_parent_destination = try std.fs.path.join(std.testing.allocator, &.{ root, "missing-parent", "destination" });
+    defer std.testing.allocator.free(missing_parent_destination);
+
+    try std.testing.expectError(error.IsDir, writeFile(root, "cannot write a directory"));
+    try writeFile(source, "source bytes");
+    try std.testing.expectError(error.FileNotFound, renameFile(source, missing_parent_destination));
+    const bytes = try readFileAlloc(std.testing.allocator, source, 64);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("source bytes", bytes);
+    deleteFile(missing);
+    try std.testing.expect(!exists(missing));
 }
 
 pub fn getenvOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
