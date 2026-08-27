@@ -10,6 +10,7 @@ const memory = @import("memory.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
 const segment = @import("segment.zig");
+const contract = @import("translation_contract.zig");
 const sys = @import("sys.zig");
 const xdg = @import("xdg.zig");
 
@@ -137,6 +138,7 @@ pub fn translateSegments(
     ctx: TranslationContext,
 ) !TranslationResult {
     var translated = std.array_list.Managed(u8).init(allocator);
+    errdefer translated.deinit();
     var cached_segments: usize = 0;
     var session: ?backend.Session = null;
     defer if (session) |*s| s.deinit();
@@ -167,18 +169,30 @@ pub fn translateSegments(
         if (session == null) session = try backend.init(allocator, ctx.cfg, ctx.diagnostics_enabled);
         const out = try session.?.translate(allocator, .{
             .model_id = ctx.model_id,
+            .source_text = seg.text,
+            .source_lang = ctx.source_lang,
+            .target_lang = ctx.target_lang,
             .prompt = built_prompt,
             .timeout_sec = ctx.cfg.timeout_sec,
         });
-        defer allocator.free(out);
-        if (ctx.db_opt) |db| try db.upsert(key, out);
-        try translated.appendSlice(out);
+        try consumeResult(allocator, out, &translated, ctx.db_opt, key);
     }
 
     return .{
         .translated_text = try translated.toOwnedSlice(),
         .cached_segments = cached_segments,
     };
+}
+
+fn consumeResult(allocator: std.mem.Allocator, result: contract.Result, translated: *std.array_list.Managed(u8), db_opt: ?*memory.Db, key: memory.Key) !void {
+    defer result.deinit(allocator);
+    switch (result.finish_reason) {
+        .eog, .max_tokens => {},
+        .context, .decode => return errors.Error.LlamaDecodeFailed,
+        .timeout => return errors.Error.Timeout,
+    }
+    if (db_opt) |db| try db.upsert(key, result.text);
+    try translated.appendSlice(result.text);
 }
 
 pub fn readKindForOptions(format: ?config.OutputFormat, file_path: ?[]const u8) input.Kind {
@@ -286,10 +300,14 @@ test "writeOutput returns false when no output target applies" {
 }
 
 test "writeOutput writes markdown default output path" {
-    const src_path = "/tmp/kotoba-translate-write-default.md";
-    const out_path = "/tmp/kotoba-translate-write-default.ja.md";
-    sys.deleteFile(src_path);
-    sys.deleteFile(out_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const src_path = try std.fs.path.join(std.testing.allocator, &.{ root, "source.md" });
+    defer std.testing.allocator.free(src_path);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ root, "source.ja.md" });
+    defer std.testing.allocator.free(out_path);
     try sys.writeFile(src_path, "# source\n");
     const computed = try input.defaultMarkdownOutput(std.testing.allocator, src_path, "ja");
     defer std.testing.allocator.free(computed);
@@ -313,8 +331,12 @@ test "writeOutput writes markdown default output path" {
 }
 
 test "writeOutput rejects existing destination without overwrite" {
-    const out_path = "/tmp/kotoba-translate-write-exists.md";
-    sys.deleteFile(out_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const out_path = try std.fs.path.join(std.testing.allocator, &.{ root, "exists.md" });
+    defer std.testing.allocator.free(out_path);
     try sys.writeFile(out_path, "old");
 
     try std.testing.expectError(errors.Error.OutputExists, writeOutput(std.testing.allocator, .{
@@ -327,5 +349,73 @@ test "writeOutput rejects existing destination without overwrite" {
         .total_segments = 1,
         .translated_text = "new",
         .elapsed_ms = 1,
-    }, .markdown, "/tmp/ignored.md", out_path, false));
+    }, .markdown, null, out_path, false));
+}
+
+test "result consumer frees failed partial payloads without appending or caching them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" });
+    defer allocator.free(path);
+    var db = try memory.open(allocator, path);
+    defer db.close();
+    var translated = std.array_list.Managed(u8).init(allocator);
+    defer translated.deinit();
+    const previous = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+    try consumeResult(allocator, .{ .text = try allocator.dupe(u8, "saved"), .finish_reason = .eog }, &translated, &db, previous);
+
+    for ([_]contract.FinishReason{ .context, .timeout, .decode }) |reason| {
+        var session = backend.TestSession{ .model_id = "test", .fixture = .{ .text = "partial", .finish_reason = reason } };
+        var failed_key = previous;
+        failed_key.source_text = @tagName(reason);
+        const result = try session.translate(allocator, .{
+            .model_id = "test",
+            .source_text = failed_key.source_text,
+            .source_lang = .en,
+            .target_lang = .ja,
+            .prompt = "ignored",
+            .timeout_sec = 1,
+        });
+        const expected_error = if (reason == .timeout) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
+        try std.testing.expectError(expected_error, consumeResult(allocator, result, &translated, &db, failed_key));
+        try std.testing.expectEqualStrings("saved", translated.items);
+        try std.testing.expect(try db.lookup(failed_key) == null);
+        try std.testing.expectEqual(@as(usize, 1), try db.count());
+        const hit = (try db.lookup(previous)).?;
+        defer allocator.free(hit.translated_text);
+        try std.testing.expectEqualStrings("saved", hit.translated_text);
+    }
+}
+
+test "result consumer accepts completed and token-limited bytes verbatim" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" });
+    defer allocator.free(path);
+    var db = try memory.open(allocator, path);
+    defer db.close();
+    var translated = std.array_list.Managed(u8).init(allocator);
+    defer translated.deinit();
+    for ([_]contract.FinishReason{ .eog, .max_tokens }) |reason| {
+        for ([_][]const u8{ "partial", "\xff", "", " \n\t" }, 0..) |bytes, index| {
+            const source = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ @tagName(reason), index });
+            defer allocator.free(source);
+            const key = memory.Key{ .source_text = source, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+            var session = backend.TestSession{ .model_id = "test", .fixture = .{ .text = bytes, .finish_reason = reason } };
+            const result = try session.translate(allocator, .{ .model_id = "test", .source_text = source, .source_lang = .en, .target_lang = .ja, .prompt = "ignored", .timeout_sec = 1 });
+            translated.clearRetainingCapacity();
+            try consumeResult(allocator, result, &translated, &db, key);
+            try std.testing.expectEqualSlices(u8, bytes, translated.items);
+            const hit = (try db.lookup(key)).?;
+            defer allocator.free(hit.translated_text);
+            try std.testing.expectEqualSlices(u8, bytes, hit.translated_text);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), try db.count());
 }

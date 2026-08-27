@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend = @import("backend.zig");
+const contract = @import("translation_contract.zig");
 const errors = @import("errors.zig");
 const sys = @import("sys.zig");
 
@@ -220,49 +220,70 @@ pub const Session = struct {
         self.diag_guard.deinit();
     }
 
-    pub fn translate(self: *Session, allocator: std.mem.Allocator, req: backend.Request) ![]const u8 {
+    pub fn translate(self: *Session, allocator: std.mem.Allocator, req: contract.Request) !contract.Result {
         self.abort_guard.state.setTimeout(if (req.timeout_sec > 0) req.timeout_sec else self.opts.timeout_sec);
         defer self.abort_guard.state.clear();
         self.ctx.clearMemory();
         self.sampler.reset();
 
-        const prompt_tokens = try tokenize(allocator, self.vocab, req.prompt);
-        defer allocator.free(prompt_tokens);
-        if (prompt_tokens.len == 0 or prompt_tokens.len >= self.opts.context_length) return errors.Error.LlamaDecodeFailed;
-
-        try self.decodeTokens(prompt_tokens);
-
         var out = std.array_list.Managed(u8).init(allocator);
         errdefer out.deinit();
+        const prompt_tokens = tokenize(allocator, self.vocab, req.prompt) catch |err| switch (err) {
+            errors.Error.LlamaDecodeFailed => return .{ .text = try out.toOwnedSlice(), .finish_reason = if (self.abort_guard.state.timedOut()) .timeout else .decode },
+            else => return err,
+        };
+        defer allocator.free(prompt_tokens);
+        if (prompt_tokens.len == 0) return .{ .text = try out.toOwnedSlice(), .finish_reason = .decode };
+        if (prompt_tokens.len >= self.opts.context_length) return .{ .text = try out.toOwnedSlice(), .finish_reason = .context };
+
+        if (self.decodeTokens(prompt_tokens)) |reason| return .{ .text = try out.toOwnedSlice(), .finish_reason = reason };
+
+        var finish_reason: contract.FinishReason = .max_tokens;
         var generated: u32 = 0;
         while (generated < self.opts.max_tokens) : (generated += 1) {
-            if (self.abort_guard.state.timedOut()) return errors.Error.Timeout;
+            if (self.abort_guard.state.timedOut()) {
+                finish_reason = .timeout;
+                break;
+            }
             const token = self.sampler.sample(self.ctx.ptr, -1);
-            if (c.llama_vocab_is_eog(self.vocab, token)) break;
+            if (c.llama_vocab_is_eog(self.vocab, token)) {
+                finish_reason = .eog;
+                break;
+            }
             self.sampler.accept(token);
-            try appendTokenPiece(allocator, &out, self.vocab, token);
+            appendTokenPiece(allocator, &out, self.vocab, token) catch |err| switch (err) {
+                errors.Error.LlamaDecodeFailed => return .{ .text = try out.toOwnedSlice(), .finish_reason = if (self.abort_guard.state.timedOut()) .timeout else .decode },
+                else => return err,
+            };
 
             var next_tokens = [_]c.llama_token{token};
-            try self.decodeTokens(&next_tokens);
+            if (self.decodeTokens(&next_tokens)) |reason| {
+                finish_reason = reason;
+                break;
+            }
         }
-        return out.toOwnedSlice();
+        return .{ .text = try out.toOwnedSlice(), .finish_reason = finish_reason };
     }
 
-    fn decodeTokens(self: *Session, tokens: []c.llama_token) errors.Error!void {
+    fn decodeTokens(self: *Session, tokens: []c.llama_token) ?contract.FinishReason {
         var start: usize = 0;
         const limit = batchTokenLimit(self.opts.context_length);
         while (start < tokens.len) {
             const end = @min(start + limit, tokens.len);
             const batch = c.llama_batch_get_one(tokens[start..end].ptr, @intCast(end - start));
-            if (c.llama_decode(self.ctx.ptr, batch) != 0) return self.decodeError();
+            const status = c.llama_decode(self.ctx.ptr, batch);
+            if (decodeFinishReason(status, self.abort_guard.state.timedOut())) |reason| return reason;
             start = end;
         }
-    }
-
-    fn decodeError(self: *Session) errors.Error {
-        return if (self.abort_guard.state.timedOut()) errors.Error.Timeout else errors.Error.LlamaDecodeFailed;
+        return null;
     }
 };
+
+fn decodeFinishReason(status: i32, timed_out: bool) ?contract.FinishReason {
+    if (status == 0) return null;
+    if (timed_out) return .timeout;
+    return if (status == 1) .context else .decode;
+}
 
 pub fn validateOptions(opts: Options) !void {
     if (opts.context_length == 0) return errors.Error.InvalidArguments;
@@ -364,8 +385,14 @@ fn appendTokenPiece(allocator: std.mem.Allocator, out: *std.array_list.Managed(u
 }
 
 test "embedded session rejects missing model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing.gguf" });
+    defer std.testing.allocator.free(model_path);
     try std.testing.expectError(errors.Error.ModelMissing, Session.init(std.testing.allocator, .{
-        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_path = model_path,
         .model_id = "missing",
         .gpu_layers = -1,
         .context_length = 4096,
@@ -379,7 +406,7 @@ test "embedded session rejects missing model" {
 
 test "embedded session validates context length and threads" {
     var opts = Options{
-        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_path = "not-accessed.gguf",
         .model_id = "missing",
         .gpu_layers = -1,
         .context_length = 0,
@@ -399,7 +426,7 @@ test "embedded session validates context length and threads" {
 
 test "embedded session validates generation limits" {
     var opts = Options{
-        .model_path = "/tmp/kotoba-missing-model.gguf",
+        .model_path = "not-accessed.gguf",
         .model_id = "missing",
         .gpu_layers = -1,
         .context_length = 4096,
@@ -417,7 +444,7 @@ test "embedded session validates generation limits" {
 test "model params preserve signed gpu layer offload values" {
     for ([_]i32{ -2, -1, 0, 1 }) |layers| {
         const opts = Options{
-            .model_path = "/tmp/kotoba-missing-model.gguf",
+            .model_path = "not-accessed.gguf",
             .model_id = "missing",
             .gpu_layers = layers,
             .context_length = 4096,
@@ -432,6 +459,7 @@ test "model params preserve signed gpu layer offload values" {
     }
 }
 
+// llama/log global-state tests run serially within each process; see docs/test-harness.md.
 test "diagnostics callbacks can be toggled without model load" {
     const quiet = DiagnosticsGuard.init(false);
     quiet.deinit();
@@ -444,4 +472,16 @@ test "FFI resources expose guard wrappers" {
     try std.testing.expect(@hasDecl(@This(), "ContextGuard"));
     try std.testing.expect(@hasDecl(@This(), "SamplerGuard"));
     try std.testing.expect(@hasDecl(@This(), "DiagnosticsGuard"));
+}
+
+test "decode status classification preserves timeout precedence" {
+    try std.testing.expectEqual(@as(?contract.FinishReason, null), decodeFinishReason(0, false));
+    try std.testing.expectEqual(@as(?contract.FinishReason, null), decodeFinishReason(0, true));
+    try std.testing.expectEqual(contract.FinishReason.context, decodeFinishReason(1, false).?);
+    for ([_]i32{ 2, -1, -2 }) |status| {
+        try std.testing.expectEqual(contract.FinishReason.decode, decodeFinishReason(status, false).?);
+    }
+    for ([_]i32{ 1, 2, -1, -2 }) |status| {
+        try std.testing.expectEqual(contract.FinishReason.timeout, decodeFinishReason(status, true).?);
+    }
 }
