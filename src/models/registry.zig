@@ -3,6 +3,7 @@ const errors = @import("../errors.zig");
 const sys = @import("../sys.zig");
 const toml = @import("../toml.zig");
 const types = @import("types.zig");
+const url = @import("../url.zig");
 const validation = @import("validation.zig");
 
 pub const Model = types.Model;
@@ -82,6 +83,11 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !List {
         if (current == null) continue;
         var m = current.?;
         const val = toml.unquote(p.value);
+        if (std.mem.eql(u8, p.key, "source_url")) {
+            try replaceString(allocator, &m.source_url, val);
+            current = m;
+            continue;
+        }
         if (std.mem.eql(u8, p.key, "id")) try replaceString(allocator, &m.id, val) else if (std.mem.eql(u8, p.key, "name")) try replaceString(allocator, &m.name, val) else if (std.mem.eql(u8, p.key, "profile")) try replaceString(allocator, &m.profile, val) else if (std.mem.eql(u8, p.key, "languages")) {
             m.languages_en = toml.stringArrayContains(p.value, "en");
             m.languages_ja = toml.stringArrayContains(p.value, "ja");
@@ -171,6 +177,7 @@ fn parsedModelDefaults(allocator: std.mem.Allocator) !Model {
     model.size = try allocator.dupe(u8, "");
     model.path = try allocator.dupe(u8, "");
     model.download_url = try allocator.dupe(u8, "");
+    model.source_url = try allocator.dupe(u8, "");
     model.checksum = try allocator.dupe(u8, "");
     model.license = try allocator.dupe(u8, "");
     model.notes = try allocator.dupe(u8, "");
@@ -196,6 +203,7 @@ fn freeParsedModel(allocator: std.mem.Allocator, m: Model) void {
     freeOwnedString(allocator, m.size);
     freeOwnedString(allocator, m.path);
     freeOwnedString(allocator, m.download_url);
+    freeOwnedString(allocator, m.source_url);
     freeOwnedString(allocator, m.checksum);
     freeOwnedString(allocator, m.license);
     freeOwnedString(allocator, m.notes);
@@ -209,6 +217,10 @@ fn freeOwnedString(allocator: std.mem.Allocator, value: []const u8) void {
 }
 
 fn appendModel(out: *std.array_list.Managed(u8), m: Model) !void {
+    const existing_source = try url.sourceIdentity(out.allocator, m.source_url);
+    defer out.allocator.free(existing_source);
+    const source = if (existing_source.len > 0) existing_source else try url.sourceIdentity(out.allocator, m.download_url);
+    defer if (existing_source.len == 0) out.allocator.free(source);
     try out.appendSlice("[[models]]\n");
     try appendStringField(out, "id", m.id);
     try appendStringField(out, "name", m.name);
@@ -223,7 +235,8 @@ fn appendModel(out: *std.array_list.Managed(u8), m: Model) !void {
     try appendFmt(out, "context_length = {d}\n", .{m.context_length});
     try appendStringField(out, "size", m.size);
     try appendStringField(out, "path", m.path);
-    try appendStringField(out, "download_url", m.download_url);
+    try appendStringField(out, "download_url", url.reusableUrl(m.download_url));
+    try appendStringField(out, "source_url", source);
     try appendStringField(out, "checksum", m.checksum);
     try appendStringField(out, "license", m.license);
     try appendFmt(out, "recommended = {}\n", .{m.recommended});
@@ -280,8 +293,12 @@ test "registry upsert and remove round trip" {
         .languages_en = true,
         .languages_ja = true,
         .path = model_path,
+        .download_url = "https://models.example.invalid/toy.gguf?token=KOTOBA_QUERY_SECRET_36",
         .checksum = "abc",
     });
+    const saved = try sys.readFileAlloc(std.testing.allocator, path, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "KOTOBA_QUERY_SECRET_36") == null);
     const list = try load(std.heap.page_allocator, path);
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(model_path, toy.path);
@@ -357,4 +374,183 @@ test "registries with identical model IDs remain independent" {
     try std.testing.expectEqualStrings("left", left.name);
     const right = find(try load(std.heap.page_allocator, right_path), "same") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("right", right.name);
+}
+
+const legacy_url_fixture =
+    \\[[models]]
+    \\id = "legacy"
+    \\name = "Legacy model"
+    \\profile = "technical"
+    \\languages = ["en", "ja"]
+    \\format = "gguf"
+    \\quantization = "Q4_K_M"
+    \\context_length = 4096
+    \\size = "small"
+    \\path = "/installed/model?#.gguf"
+    \\download_url = "https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/model%2Bname.gguf?token=KOTOBA_QUERY_SECRET_36#KOTOBA_FRAGMENT_SECRET_36"
+    \\checksum = "abc123"
+    \\license = "MIT"
+    \\recommended = true
+    \\notes = "Retain descriptive metadata."
+    \\[[models]]
+    \\id = "other"
+    \\[[models]]
+    \\id = "invalid"
+    \\download_url = "https:///missing-host?KOTOBA_QUERY_SECRET_36"
+    \\source_url = "https://bad host/KOTOBA_PASSWORD_36"
+    \\[[models]]
+    \\id = "signed"
+    \\download_url = "https://models.example.invalid/signed.gguf?token=KOTOBA_QUERY_SECRET_36"
+    \\source_url = "https://KOTOBA_USER_36@origin.example.invalid/source%2Bname.gguf?KOTOBA_QUERY_SECRET_36#KOTOBA_FRAGMENT_SECRET_36"
+    \\[[models]]
+    \\id = "fragment"
+    \\download_url = "HTTPS://models.example.invalid/model.gguf#KOTOBA_FRAGMENT_SECRET_36"
+    \\[[models]]
+    \\id = "empty-query"
+    \\download_url = "https://models.example.invalid/model.gguf?"
+    \\[[models]]
+    \\id = "http"
+    \\download_url = "http://models.example.invalid/model.gguf"
+;
+
+test "secret URL registry writes sanitize all entries" {
+    for (0..3) |operation| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        const path = try std.fs.path.join(allocator, &.{ root, "registry.toml" });
+        var fixture = std.array_list.Managed(u8).init(allocator);
+        try fixture.appendSlice(legacy_url_fixture ++ "\n[[models]]\nid = \"oversized\"\n");
+        var oversized = [_]u8{'a'} ** (url.max_length + 1);
+        @memcpy(oversized[0..8], "https://");
+        try appendStringField(&fixture, "download_url", &oversized);
+        try appendStringField(&fixture, "source_url", &oversized);
+        try sys.writeFile(path, fixture.items);
+        const before = try load(allocator, path);
+        switch (operation) {
+            0 => try save(path, before),
+            1 => try upsert(allocator, path, .{ .id = "new", .name = "Unrelated import" }),
+            2 => _ = try removeById(allocator, path, "other"),
+            else => unreachable,
+        }
+        const saved = try sys.readFileAlloc(allocator, path, 2 * 1024 * 1024);
+        try std.testing.expect(std.mem.indexOf(u8, saved, "KOTOBA_") == null);
+        const after = try parse(allocator, saved);
+        const original = find(before, "legacy").?;
+        const migrated = find(after, "legacy").?;
+        try std.testing.expectEqualStrings("", migrated.download_url);
+        try std.testing.expectEqualStrings("https://models.example.invalid/model%2Bname.gguf", migrated.source_url);
+        inline for (std.meta.fields(Model)) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "source_url") and !std.mem.eql(u8, field.name, "download_url")) {
+                try std.testing.expectEqualDeep(@field(original, field.name), @field(migrated, field.name));
+            }
+        }
+        try std.testing.expect(std.mem.indexOf(u8, original.download_url, "KOTOBA_QUERY_SECRET_36") != null);
+        try std.testing.expectEqualStrings("", original.source_url);
+        try std.testing.expectEqualStrings("", find(after, "invalid").?.download_url);
+        try std.testing.expectEqualStrings("", find(after, "invalid").?.source_url);
+        try std.testing.expectEqualStrings("", find(after, "oversized").?.download_url);
+        try std.testing.expectEqualStrings("", find(after, "oversized").?.source_url);
+        try std.testing.expectEqualStrings("", find(after, "signed").?.download_url);
+        try std.testing.expectEqualStrings("https://origin.example.invalid/source%2Bname.gguf", find(after, "signed").?.source_url);
+        try std.testing.expectEqualStrings("HTTPS://models.example.invalid/model.gguf", find(after, "fragment").?.download_url);
+        try std.testing.expectEqualStrings("", find(after, "empty-query").?.download_url);
+        try std.testing.expectEqualStrings("", find(after, "http").?.download_url);
+        try std.testing.expectEqualStrings("http://models.example.invalid/model.gguf", find(after, "http").?.source_url);
+        var entries = tmp.dir.iterate();
+        try std.testing.expectEqualStrings("registry.toml", (try entries.next(std.testing.io)).?.name);
+        try std.testing.expect(try entries.next(std.testing.io) == null);
+    }
+}
+
+test "secret URL registry read is nonmutating" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "registry.toml" });
+    defer allocator.free(path);
+    try sys.writeFile(path, legacy_url_fixture);
+    const list = try load(allocator, path);
+    defer allocator.free(list.models);
+    defer freeParsedModels(allocator, list.models);
+    try std.testing.expect(std.mem.indexOf(u8, find(list, "legacy").?.download_url, "KOTOBA_PASSWORD_36") != null);
+    try std.testing.expect(std.mem.indexOf(u8, find(list, "signed").?.source_url, "KOTOBA_USER_36") != null);
+    const after = try sys.readFileAlloc(allocator, path, 2 * 1024 * 1024);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(legacy_url_fixture, after);
+    var before_hash: [32]u8 = undefined;
+    var after_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(legacy_url_fixture, &before_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(after, &after_hash, .{});
+    try std.testing.expectEqualSlices(u8, &before_hash, &after_hash);
+    var entries = tmp.dir.iterate();
+    _ = try entries.next(std.testing.io);
+    try std.testing.expect(try entries.next(std.testing.io) == null);
+}
+
+test "secret URL source identity is never reusable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var oversized = [_]u8{'a'} ** (url.max_length + 1);
+    @memcpy(oversized[0..8], "https://");
+    const cases = [_]struct { model: Model, expected_source: []const u8 }{
+        .{ .model = .{ .source_url = "https://models.example.invalid/source.gguf" }, .expected_source = "https://models.example.invalid/source.gguf" },
+        .{ .model = .{ .source_url = "https://KOTOBA_USER_36@models.example.invalid/model?KOTOBA_QUERY_SECRET_36#KOTOBA_FRAGMENT_SECRET_36" }, .expected_source = "https://models.example.invalid/model" },
+        .{ .model = .{ .source_url = "https:///invalid", .download_url = "https://models.example.invalid/fallback?KOTOBA_QUERY_SECRET_36" }, .expected_source = "https://models.example.invalid/fallback" },
+        .{ .model = .{ .source_url = "https:///invalid" }, .expected_source = "" },
+        .{ .model = .{ .source_url = &oversized, .download_url = &oversized }, .expected_source = "" },
+        .{ .model = .{ .source_url = "https://models.example.invalid/a\x7f", .download_url = "https://models.example.invalid/a\x01" }, .expected_source = "" },
+    };
+    for (cases) |case| {
+        var out = std.array_list.Managed(u8).init(allocator);
+        try appendModel(&out, case.model);
+        const model = (try parse(allocator, out.items)).models[0];
+        try std.testing.expectEqualStrings(case.expected_source, model.source_url);
+        try std.testing.expectEqualStrings("", model.download_url);
+        var second = std.array_list.Managed(u8).init(allocator);
+        try appendModel(&second, model);
+        try std.testing.expectEqualStrings(out.items, second.items);
+    }
+}
+
+test "secret URL registry preserves local metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_][]const u8{ "/local/model?#.gguf", "file:///local/model?#.gguf", "https://models.example.invalid/model%2Bname.gguf" }) |download| {
+        for ([_][]const u8{ "", "https://origin.example.invalid/original.gguf" }) |source| {
+            var out = std.array_list.Managed(u8).init(allocator);
+            const original: Model = .{ .id = "local", .path = "/installed/model?#.gguf", .download_url = download, .source_url = source, .checksum = "abc123" };
+            try appendModel(&out, original);
+            const model = (try parse(allocator, out.items)).models[0];
+            try std.testing.expectEqualStrings(download, model.download_url);
+            try std.testing.expectEqualStrings(if (source.len > 0) source else if (url.isRemote(download)) download else "", model.source_url);
+            try std.testing.expectEqualStrings(original.id, model.id);
+            try std.testing.expectEqualStrings(original.path, model.path);
+            try std.testing.expectEqualStrings(original.checksum, model.checksum);
+        }
+    }
+}
+
+fn checkSourceOwnership(allocator: std.mem.Allocator) !void {
+    const data = try allocator.dupe(u8, legacy_url_fixture ++ "\nsource_url = \"https://origin.example.invalid/replaced\"\nsource_url = \"https://origin.example.invalid/final\"\n");
+    const list = parse(allocator, data) catch |err| {
+        allocator.free(data);
+        return err;
+    };
+    allocator.free(data);
+    defer allocator.free(list.models);
+    defer freeParsedModels(allocator, list.models);
+    try std.testing.expectEqualStrings("https://origin.example.invalid/final", find(list, "http").?.source_url);
+    try std.testing.expectEqualStrings("", find(list, "legacy").?.source_url);
+}
+
+test "secret URL registry source strings own allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSourceOwnership, .{});
 }
