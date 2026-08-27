@@ -66,6 +66,12 @@ Kotoba follows XDG directories:
 
 ## Translation Flow
 
+This section describes the **current v1 implementation flow**, not the target
+architecture or commit protocol for the roadmap work. For future architecture,
+hard dependencies, validation ordering, Translation Memory commit semantics, and
+file/MOD publication ordering, Roadmap #46 and the referenced implementation
+Issues are authoritative when they differ from this current-state description.
+
 1. Read config and verify that a model is selected.
 2. Read direct text, stdin, or file input.
 3. Protect Markdown elements when translating Markdown.
@@ -75,6 +81,13 @@ Kotoba follows XDG directories:
 7. Generate uncached translated segments in-process.
 8. Restore protected Markdown tokens.
 9. Save cacheable results and write plain, Markdown, or JSON output.
+
+The roadmap target for file/MOD output is intentionally stricter: generated
+candidates must pass finish/detokenization/text/structure/content validation,
+accepted TM rows are staged in memory, the staged artifact receives final
+validation, accepted rows are committed in a short SQLite write transaction,
+and only then is the artifact atomically published. Do not infer the target
+commit protocol from the simplified current flow above.
 
 ## Model Management
 
