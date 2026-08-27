@@ -66,10 +66,14 @@ fn downloadHttps(allocator: std.mem.Allocator, url: []const u8, dest: []const u8
 }
 
 test "acquire local file verifies checksum" {
-    const src = "/tmp/kotoba-model-acquire-src.gguf";
-    const dest = "/tmp/kotoba-model-acquire-dest.gguf";
-    sys.deleteFile(src);
-    sys.deleteFile(dest);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const src = try std.fs.path.join(std.testing.allocator, &.{ root, "source.gguf" });
+    defer std.testing.allocator.free(src);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "destination.gguf" });
+    defer std.testing.allocator.free(dest);
     try sys.writeFile(src, "model bytes");
     const data = try sys.readFileAlloc(std.testing.allocator, src, 1024);
     defer std.testing.allocator.free(data);
@@ -84,10 +88,14 @@ test "acquire local file verifies checksum" {
 }
 
 test "acquire local file rejects checksum mismatch" {
-    const src = "/tmp/kotoba-model-acquire-bad-src.gguf";
-    const dest = "/tmp/kotoba-model-acquire-bad-dest.gguf";
-    sys.deleteFile(src);
-    sys.deleteFile(dest);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const src = try std.fs.path.join(std.testing.allocator, &.{ root, "bad-source.gguf" });
+    defer std.testing.allocator.free(src);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "bad-destination.gguf" });
+    defer std.testing.allocator.free(dest);
     try sys.writeFile(src, "model bytes");
     const download_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{src});
     defer std.testing.allocator.free(download_url);
@@ -103,8 +111,12 @@ fn failingDownloader(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
 }
 
 test "acquire https streams through downloader and verifies checksum" {
-    const dest = "/tmp/kotoba-model-acquire-https-dest.gguf";
-    sys.deleteFile(dest);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "https-destination.gguf" });
+    defer std.testing.allocator.free(dest);
     const expected_checksum = try sys.hexSha256(std.testing.allocator, "remote bytes");
     defer std.testing.allocator.free(expected_checksum);
     try acquireWithDownloader(std.testing.allocator, .{
@@ -118,8 +130,12 @@ test "acquire https streams through downloader and verifies checksum" {
 }
 
 test "acquire https failure does not leave final file" {
-    const dest = "/tmp/kotoba-model-acquire-https-fail.gguf";
-    sys.deleteFile(dest);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ root, "https-failure.gguf" });
+    defer std.testing.allocator.free(dest);
     try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
@@ -128,5 +144,5 @@ test "acquire https failure does not leave final file" {
 }
 
 test "acquire skip download does not require destination" {
-    try acquire(std.testing.allocator, .{ .id = "local", .download_url = "/tmp/does-not-matter" }, "", true);
+    try acquire(std.testing.allocator, .{ .id = "local", .download_url = "does-not-matter" }, "", true);
 }

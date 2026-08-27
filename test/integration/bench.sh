@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TMP="${TMPDIR:-/tmp}/kotoba-bench-$$"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common.sh"
 ITERATIONS=5
 WARMUP_ITERATIONS=1
-
-cleanup() {
-  rm -rf "${TMP}"
-}
-trap cleanup EXIT
 
 fail() {
   echo "benchmark validation failed: $*" >&2
@@ -71,16 +66,8 @@ validate_output() {
   [[ "${actual}" == "${expected}" ]] || fail "${name} translated text mismatch"
 }
 
-mkdir -p "${TMP}"
-
-export XDG_CONFIG_HOME="${TMP}/config"
-export XDG_DATA_HOME="${TMP}/data"
-export XDG_CACHE_HOME="${TMP}/cache"
-export XDG_STATE_HOME="${TMP}/state"
-
-env ZIG_GLOBAL_CACHE_DIR="${ROOT}/.zig-cache/global" zig build -Dtest-backend=true >/dev/null
-
-BIN="${ROOT}/zig-out/bin/kotoba"
+harness_init bench
+harness_build_snapshot test
 markdown_file="${TMP}/input.md"
 markdown_output_file="${TMP}/input.ja.md"
 printf '# Hello\n\nThis is a short markdown paragraph.' >"${markdown_file}"

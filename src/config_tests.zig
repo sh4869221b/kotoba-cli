@@ -2,7 +2,6 @@ const std = @import("std");
 const config = @import("config.zig");
 const errors = @import("errors.zig");
 const lang = @import("lang.zig");
-const sys = @import("sys.zig");
 
 test "config round trip parse" {
     const cfg = try config.parse(std.heap.page_allocator,
@@ -58,9 +57,13 @@ test "config parses saves gets sets and lists signed gpu layers" {
     try std.testing.expectEqualStrings("0", got);
     try config.setValue(std.testing.allocator, &cfg, "gpu_layers", "-2");
     try std.testing.expectEqual(@as(i32, -2), cfg.gpu_layers);
-    const path = "/tmp/kotoba-config-gpu-layers-test.toml";
-    sys.deleteFile(path);
-    defer sys.deleteFile(path);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "config.toml" });
+    defer std.testing.allocator.free(path);
     try config.save(path, cfg);
     const loaded = try config.load(std.heap.page_allocator, path);
     try std.testing.expectEqual(@as(i32, -2), loaded.gpu_layers);

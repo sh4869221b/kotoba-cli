@@ -44,8 +44,15 @@ test "verifyModel requires existing path" {
         .id = "missing",
         .path = "",
     }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing-model.gguf" });
+    defer std.testing.allocator.free(missing_path);
     try std.testing.expectError(errors.Error.ModelMissing, verifyModel(std.testing.allocator, .{
         .id = "missing",
-        .path = "/tmp/kotoba-missing-model-file.gguf",
+        .path = missing_path,
     }));
 }

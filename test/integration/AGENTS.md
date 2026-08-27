@@ -14,8 +14,15 @@
 - Scripts use `set -euo pipefail` and temp XDG dirs; do not touch the developer's real config.
 - Build with `env ZIG_GLOBAL_CACHE_DIR="${ROOT}/.zig-cache/global"` to keep Zig cache predictable.
 - Use the deterministic test backend for normal smoke/bench checks.
-- Assert stdout/stderr contracts with files under `/tmp` or script temp dirs.
+- Source `common.sh` and call `harness_init <suite>` for every integration run.
+- Keep stdout, stderr, PTY, benchmark JSON, model fixtures, and other captures
+  under that run's private `TMP`; never use a fixed shared `/tmp` path or
+  remove a path the current run did not create.
+- Use `harness_build_snapshot` so build coordination covers artifact creation
+  and copying, then releases before binary execution or nested benchmarks.
 - CUDA checks must be optional and skip successfully on non-CUDA machines.
+- Global llama/log state tests remain serial within a unit-test process;
+  separate harness processes are the supported concurrency boundary.
 
 ## ANTI-PATTERNS
 - Do not require real network, real GGUF models, CUDA hardware, or an installed `curl` for default integration checks.

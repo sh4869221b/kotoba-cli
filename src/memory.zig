@@ -197,8 +197,12 @@ pub fn sourceHash(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 test "sqlite memory stores hit" {
-    const path = "/tmp/kotoba-memory-test.sqlite3";
-    @import("sys.zig").deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "memory.sqlite3" });
+    defer std.testing.allocator.free(path);
     var db = try open(std.testing.allocator, path);
     defer db.close();
     const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 0 };
@@ -209,9 +213,48 @@ test "sqlite memory stores hit" {
     try std.testing.expectEqualStrings("こんにちは", hit.translated_text);
 }
 
+test "sqlite stores with identical keys remain independent" {
+    var left_tmp = std.testing.tmpDir(.{});
+    defer left_tmp.cleanup();
+    const left_root = try left_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(left_root);
+    const left_path = try std.fs.path.join(std.testing.allocator, &.{ left_root, "memory.sqlite3" });
+    defer std.testing.allocator.free(left_path);
+
+    var right_tmp = std.testing.tmpDir(.{});
+    defer right_tmp.cleanup();
+    const right_root = try right_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(right_root);
+    const right_path = try std.fs.path.join(std.testing.allocator, &.{ right_root, "memory.sqlite3" });
+    defer std.testing.allocator.free(right_path);
+
+    var left_db = try open(std.testing.allocator, left_path);
+    defer left_db.close();
+    var right_db = try open(std.testing.allocator, right_path);
+    defer right_db.close();
+
+    const key = Key{ .source_text = "same key", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 7 };
+    try std.testing.expect(try left_db.lookup(key) == null);
+    try std.testing.expect(try right_db.lookup(key) == null);
+    try left_db.upsert(key, "left value");
+    try std.testing.expect(try right_db.lookup(key) == null);
+    try right_db.upsert(key, "right value");
+
+    const left_hit = (try left_db.lookup(key)).?;
+    defer std.testing.allocator.free(left_hit.translated_text);
+    try std.testing.expectEqualStrings("left value", left_hit.translated_text);
+    const right_hit = (try right_db.lookup(key)).?;
+    defer std.testing.allocator.free(right_hit.translated_text);
+    try std.testing.expectEqualStrings("right value", right_hit.translated_text);
+}
+
 test "sqlite statement wrapper binds and duplicates text" {
-    const path = "/tmp/kotoba-memory-stmt-test.sqlite3";
-    @import("sys.zig").deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "memory.sqlite3" });
+    defer std.testing.allocator.free(path);
     var db = try open(std.testing.allocator, path);
     defer db.close();
 
@@ -252,8 +295,12 @@ fn hitCount(db: *Db, key: Key) !usize {
 }
 
 test "sqlite upsert updates existing translation without duplicating rows" {
-    const path = "/tmp/kotoba-memory-upsert-test.sqlite3";
-    @import("sys.zig").deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "memory.sqlite3" });
+    defer std.testing.allocator.free(path);
     var db = try open(std.testing.allocator, path);
     defer db.close();
 
@@ -268,8 +315,12 @@ test "sqlite upsert updates existing translation without duplicating rows" {
 }
 
 test "sqlite lookup bumps hit_count" {
-    const path = "/tmp/kotoba-memory-bump-test.sqlite3";
-    @import("sys.zig").deleteFile(path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "memory.sqlite3" });
+    defer std.testing.allocator.free(path);
     var db = try open(std.testing.allocator, path);
     defer db.close();
 

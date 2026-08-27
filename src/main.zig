@@ -16,6 +16,7 @@ const net = @import("net.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
 const translate = @import("translate.zig");
+const translation_contract = @import("translation_contract.zig");
 const xdg = @import("xdg.zig");
 const sys = @import("sys.zig");
 
@@ -52,6 +53,7 @@ test {
     std.testing.refAllDecls(output);
     std.testing.refAllDecls(prompt);
     std.testing.refAllDecls(translate);
+    std.testing.refAllDecls(translation_contract);
     std.testing.refAllDecls(xdg);
     std.testing.refAllDecls(sys);
 }
