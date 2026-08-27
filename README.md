@@ -87,6 +87,16 @@ zig build bench
 bash test/integration/bench.sh
 ```
 
+The integration harness gives each run private HOME, XDG directories, model
+fixtures, output captures, and a temporary build prefix. Its build snapshot
+and deterministic backend contracts are documented in
+[docs/test-harness.md](docs/test-harness.md). The harness self-check can be
+run without a model:
+
+```bash
+bash test/integration/common.sh --self-test
+```
+
 Real CUDA QA is guarded so non-CUDA machines can run it safely:
 
 ```bash
