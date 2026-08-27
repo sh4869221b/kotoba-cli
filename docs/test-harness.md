@@ -2,7 +2,8 @@
 
 This guide describes the isolated, deterministic checks for Kotoba CLI and
 their supported boundaries. It does not add a CLI option, a runtime fake-mode
-switch, a CI requirement, or a fault-injection framework.
+switch or a fault-injection framework. The Linux CI stages that run these
+checks and their required-check configuration are documented in [ci.md](ci.md).
 
 ## Backend request and result
 
@@ -140,6 +141,13 @@ existing executable and unit-test executable to `BIN` and `UNIT_BIN`. The
 `cuda` uses `-Dtest-backend=false -Dcuda=true`. `test-artifacts` installs
 artifacts without executing the unit tests.
 
+Zig 0.16.0 supplies the standard test runner. Both the build protocol and the
+installed/copied `kotoba-tests` executable are exercised; the copied executable
+runs without protocol arguments, with stdin closed and a 120-second bound.
+CPU and deterministic counts must agree between build and direct execution.
+Only the named deterministic `translateSegments` SQLite fault test skips in
+CPU; skips are recorded separately, never counted as executed tests.
+
 The helper holds a directory lock under the repository `.zig-cache` only
 while building and copying the snapshot. It waits up to 600 seconds, reports
 `test harness: build lock timed out` on timeout, releases only a lock acquired
@@ -221,7 +229,9 @@ root and reap descendants. These are helper checks, not product CLI coverage.
 
 ## CLI contract matrix
 
-The stable entrypoint for automation (including the follow-up #15) is:
+The Linux integration stage unconditionally runs this full matrix and the
+parallel harness, and verifies all four group counts against passing case
+receipts. The stable entrypoint for automation is:
 
 ```bash
 bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"

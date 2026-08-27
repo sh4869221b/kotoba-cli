@@ -122,12 +122,36 @@ kotoba glossary validate
 
 ## Build
 
+Use Zig **0.16.0**, a native C/C++ toolchain, CMake, pkg-config, SQLite
+development headers, and Git. On Ubuntu 24.04, the CI dependency list and
+version-reporting commands are in [docs/ci.md](docs/ci.md).
+Builds target the native host only; cross compilation is unsupported.
+The Linux build check exercises both GCC and Clang.
+
 Initialize the pinned llama.cpp submodule before building from a fresh clone:
 
 ```bash
 git submodule update --init --recursive
 zig build
 ```
+
+The build checks the submodule checkout and parent gitlink against the fixed
+llama.cpp commit, and compiles an exact C API signature probe. CMake output
+lives under `.zig-cache/llama.cpp/cpu` or `cuda`; `--cache-dir` selects a
+different local cache. Existing vendor build caches are unused and are never
+automatically deleted. See the [API/build contract](docs/embedded-llama-api.md).
+
+| Platform | Native build | Test coverage | Release artifacts |
+| --- | --- | --- | --- |
+| Linux x86_64 CPU | Supported; default | Required CI target | Not provided by these checks |
+| macOS CPU | Native linker path exists; unverified | Not required; no verified coverage | Not established |
+| Windows | Unsupported | Not covered | Not established |
+| Linux CUDA | Explicit opt-in | Manual, model/hardware-dependent; not required | Not established |
+| Other architectures | Not verified by this job | Not covered by required CI | Not established |
+
+The four Linux stage commands and required-check configuration procedure are
+documented in [docs/ci.md](docs/ci.md). Workflow definitions alone do not make
+checks required; repository protection must be configured and read back.
 
 The default build is CPU-only and does not require CUDA. To build an
 opt-in CUDA-enabled binary, install the CUDA Toolkit and run:
@@ -190,9 +214,6 @@ KOTOBA_CUDA_MODEL=/path/to/model.gguf bash test/integration/cuda_smoke.sh
 
 If `KOTOBA_CUDA_MODEL` or `nvidia-smi` is unavailable, the CUDA smoke script
 prints a skip message and exits successfully.
-
-The embedded llama.cpp build is verified on Linux and has native macOS linker
-handling for the default CPU path; other hosts are not wired yet.
 
 Markdown translation protects code spans, code fences, URLs, frontmatter, and
 Markdown tables. Tables are intentionally left untranslated in v1.0 to avoid

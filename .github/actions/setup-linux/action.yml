@@ -7,7 +7,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        packages=(build-essential cmake pkg-config libsqlite3-dev git ripgrep python3 xz-utils ca-certificates curl)
+        packages=(build-essential clang cmake pkg-config libsqlite3-dev git ripgrep python3 xz-utils ca-certificates curl)
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends "${packages[@]}"
         # Ubuntu maintains these packages; record the actual resolution on every run.

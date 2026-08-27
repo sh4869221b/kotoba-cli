@@ -188,15 +188,27 @@ PYCODE
   assert 'every adapter function has an exact signature check' test "$STATUS" -eq 0
 }
 unit_count() {
-  local name="$1" mode="$2"
-  python3 - "$TMP/$name.stderr" "$mode" <<'PY'
+  local name="$1" mode="$2" profile="$3"
+  python3 - "$TMP/$name.stderr" "$mode" "$profile" <<'PY'
 import re, sys
 text = open(sys.argv[1]).read()
-pattern = r'(\d+)/(\d+) tests passed' if sys.argv[2] == 'build' else r'All (\d+) tests passed\.'
-m = re.search(pattern, text)
-if not m or int(m[1]) == 0 or (sys.argv[2] == 'build' and m[1] != m[2]):
-    raise SystemExit('missing positive passing test count')
-print(m[1])
+expected_skip = 1 if sys.argv[3] == 'false' else 0
+if sys.argv[2] == 'build':
+    matches = re.findall(r'^Build Summary: [^\n]*; (\d+)/(\d+) tests passed(?: \((\d+) skipped\))?$', text, re.M)
+    assert len(matches) == 1, 'missing positive passing test count'
+    passed, total, skipped = (int(value or 0) for value in matches[0])
+    failed = 0
+    assert passed + skipped == total
+else:
+    matches = re.findall(r'^(\d+) passed; (\d+) skipped; (\d+) failed\.$', text, re.M)
+    all_passed = re.findall(r'^All (\d+) tests passed\.$', text, re.M)
+    assert len(matches) + len(all_passed) == 1, 'missing direct test count'
+    passed, skipped, failed = map(int, matches[0]) if matches else (int(all_passed[0]), 0, 0)
+    skip_names = re.findall(r'^\d+/\d+ (.+)\.\.\.SKIP$', text, re.M)
+    expected_names = ['translate.test.translateSegments sqlite lookup and upsert failures retain prior rows and fresh fixtures recover'] if expected_skip else []
+    assert skip_names == expected_names, skip_names
+assert passed > 0 and skipped == expected_skip and failed == 0, (passed, skipped, failed)
+print(f'{passed}\t{skipped}\t{failed}')
 PY
 }
 case_runner() {
@@ -205,7 +217,7 @@ case_runner() {
   for profile in false true; do
     capture "runner-$profile-build" zig build test -Dtest-backend="$profile" --summary all -j2
     assert "$profile build test success" test "$STATUS" -eq 0
-    count="$(unit_count "runner-$profile-build" build)" || fail "$profile build test count"
+    count="$(unit_count "runner-$profile-build" build "$profile")" || fail "$profile build test count"
     # Use the existing locked install/copy contract before making a second copy.
     capture "runner-$profile-install" harness_build_snapshot "$([[ "$profile" == true ]] && echo test || echo cpu)"
     assert "$profile test artifacts installed" test "$STATUS" -eq 0
@@ -215,8 +227,8 @@ case_runner() {
     cd "$TMP/copied-$profile"
     capture "runner-$profile-direct" timeout 120 ./kotoba-tests </dev/null
     assert "$profile copied binary exited with stdin closed" test "$STATUS" -eq 0
-    copied="$(unit_count "runner-$profile-direct" direct)" || fail "$profile copied test count"
-    assert "$profile direct/build counts match ($count)" test "$count" -eq "$copied"
+    copied="$(unit_count "runner-$profile-direct" direct "$profile")" || fail "$profile copied test count"
+    assert "$profile direct/build counts match ($count)" test "$count" = "$copied"
     printf '%s\t%s\t%s\n' "$profile" "$count" "$copied" >>"$TMP/counts.tsv"
     cd "$ROOT"
   done
@@ -336,6 +348,28 @@ case_stages() {
     cp "$TMP/stage-$stage-main.saved" src/main.zig
     assert "$stage build source restored" cmp -s "$TMP/stage-$stage-build.saved" build.zig
     assert "$stage main source restored" cmp -s "$TMP/stage-$stage-main.saved" src/main.zig
+    if [[ "$stage" == build ]]; then
+      mkdir -p "$TMP/pollution-bin"
+      cat >"$TMP/pollution-bin/zig" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$PWD" == "$POLLUTION_ROOT" && "$#" == 1 && "$1" == build ]]; then
+  "$REAL_ZIG" "$@"
+  printf 'owned build artifact\n' >ci-pollution-owned.txt
+else
+  exec "$REAL_ZIG" "$@"
+fi
+WRAPPER
+      chmod +x "$TMP/pollution-bin/zig"
+      name=stage-build-polluted
+      capture "$name" env PATH="$TMP/pollution-bin:$ORIGINAL_PATH" REAL_ZIG="$(command -v zig)" POLLUTION_ROOT="$FIXTURE" KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh build
+      assert 'successful build with source pollution fails stage' test "$STATUS" -ne 0
+      assert 'pollution build itself succeeded' grep -qx 0 "$EVIDENCE/$name/production-build.status"
+      assert 'pollution source-state diagnostic' grep -Fq 'linux ci: source status changed' "$TMP/$name.stderr"
+      assert 'owned build artifact exists' test -f ci-pollution-owned.txt
+      rm -- ci-pollution-owned.txt
+      printf 'source-pollution\tbuild=0\tstage=nonzero\tartifact_removed=yes\n' >>"$TMP/counts.tsv"
+    fi
     name="stage-$stage-restored"
     capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh "$stage"
     assert "$stage real restored passes" test "$STATUS" -eq 0
