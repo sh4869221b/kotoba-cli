@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const doctor = @import("doctor.zig");
 const errors = @import("errors.zig");
 const file_close = @import("file_close.zig");
+const staged_output = @import("staged_output.zig");
 const glossary = @import("glossary.zig");
 const input = @import("input.zig");
 const lang = @import("lang.zig");
@@ -46,6 +47,7 @@ test {
     std.testing.refAllDecls(doctor);
     std.testing.refAllDecls(errors);
     std.testing.refAllDecls(file_close);
+    std.testing.refAllDecls(staged_output);
     std.testing.refAllDecls(glossary);
     std.testing.refAllDecls(input);
     std.testing.refAllDecls(lang);

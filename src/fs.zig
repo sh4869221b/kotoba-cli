@@ -81,6 +81,20 @@ pub const FileSystem = struct {
         self.finished(.rename);
     }
 
+    pub fn createExclusiveFile(self: *FileSystem, path: []const u8, permissions: std.Io.File.Permissions) !std.Io.File {
+        return self.dir.createFile(self.io, path, .{ .exclusive = true, .truncate = false, .permissions = permissions });
+    }
+
+    pub fn renameFilePreserve(self: *FileSystem, source: []const u8, destination: []const u8) !void {
+        if (self.injected(.rename)) |cause| return cause;
+        try self.dir.renamePreserve(source, self.dir, destination, self.io);
+        self.finished(.rename);
+    }
+
+    pub fn openReadOnly(self: *FileSystem, path: []const u8) !std.Io.File {
+        return self.dir.openFile(self.io, path, .{ .mode = .read_only });
+    }
+
     pub fn deleteFile(self: *FileSystem, path: []const u8) !void {
         if (self.injected(.delete)) |cause| return cause;
         try self.dir.deleteFile(self.io, path);
