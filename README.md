@@ -99,7 +99,7 @@ debug output may be written to stderr and never changes translated stdout.
 ### File output publication (Issue #25)
 
 File output is written to an
-exclusive staged sibling in the destination's directory, then publish it as a
+exclusive staged sibling in the destination's directory, then published as a
 single directory-entry replacement. The destination stays intact until
 publication, including when `--overwrite` is used. Before a caller validates
 the finished artifact, the stage is flushed, synced, and closed with checked
@@ -121,6 +121,32 @@ rename failures, including native resource-limit CLI failure. It does not
 promise a Translation Memory transaction or rollback, directory durability
 after a crash or power loss, process-kill cleanup, or protection against a
 hostile same-UID process modifying a named stage.
+### Text encoding
+
+Translation input (direct text, stdin, `.txt`, and Markdown), glossary text,
+and accepted generated or cached text must be valid UTF-8 without NUL bytes.
+Kotoba does not normalize Unicode, transcode, or repair malformed text. Valid
+non-NUL controls and Unicode bytes are preserved; JSON escapes controls so a
+standard JSON parser recovers the exact text, including `source_text` when
+requested with `--include-source`.
+
+Invalid UTF-8 exits 1 with `invalid_utf8` / `Text must be valid UTF-8.`; NUL
+exits 1 with `embedded_nul` / `Text must not contain NUL bytes.`. UTF-8 is
+checked first if both defects occur. Human errors go to stderr; JSON errors
+use the existing error envelope on stdout. Neither includes rejected text.
+
+A selected legacy translation-memory row with malformed source or translation
+fails before its hit counter is updated. SQLite reads preserve full byte
+lengths, including any legacy NUL: Kotoba does not truncate, repair, delete,
+or silently skip that row. Use `--no-memory` to bypass memory for a command;
+`kotoba memory clear --yes` explicitly removes **all** stored translations.
+There is no automatic migration or repair.
+
+Generation checks the complete accepted result, not individual token pieces.
+Encoding-valid partial, empty, whitespace, and `max_tokens` results retain
+their existing behavior; timeout and decode/context errors take precedence
+over text validation. See the [text contract](docs/design-v1.md#text-encoding-contract)
+for the distinction between translation text and future raw MOD containers.
 
 ## Commands
 

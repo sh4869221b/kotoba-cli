@@ -98,7 +98,7 @@ and two full matrices. Two CI rounds therefore have 18 children and eight unit
 logs. See [test-harness.md](test-harness.md#cli-contract-matrix) for separate CLI
 and component observations and explicit #13/#31/#32/#37 gaps. The checks cover
 the bounded Issue #25 staged-publication contract; they do not establish
-real-model quality, new result validation, TM rollback, directory durability, or
+real-model quality, content/structure or empty-result policy, TM rollback, directory durability, or
 protection against a hostile same-UID stage writer.
 
 ## Required-check configuration

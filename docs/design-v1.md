@@ -101,6 +101,46 @@ Kotoba follows XDG directories:
 - cache: `~/.cache/kotoba/`
 - state/logs: `~/.local/state/kotoba/`
 
+## Text encoding contract
+
+Translation text is valid UTF-8 and must not contain a NUL byte. This applies
+to plain and Markdown input, glossary text, generated text, and accepted
+translation-memory text. The contract preserves bytes: it does not normalize,
+transcode, trim, repair, or replace accepted text. Empty and whitespace-only
+text remain encoding-valid, as do a UTF-8 BOM, combining marks, supplementary
+characters, and valid control characters U+0001 through U+001F.
+
+Validation checks UTF-8 before NUL. A byte sequence containing both defects is
+reported as `invalid_utf8`; otherwise an embedded NUL is reported as
+`embedded_nul`. Both errors exit 1 and use the fixed messages `Text must be
+valid UTF-8.` and `Text must not contain NUL bytes.` without including rejected
+text in the diagnostic.
+
+Generation validates the complete accepted byte sequence only after its finish
+reason is accepted and before it is stored or accumulated. A timeout remains a
+`timeout` error and context/decode failures remain `llama_decode_failed`, even
+if their partial bytes are malformed. A selected legacy translation-memory row
+that violates this contract is rejected without repairing, deleting, or
+updating the row.
+
+Direct, file, and stdin text is validated before language detection, including
+when both language options are explicit. The complete glossary document is
+validated before parsing, and borrowed segment/glossary text is checked before
+segment work. Empty input still has its separate argument error; valid empty,
+whitespace, partial, and token-limited generated results remain accepted.
+
+SQLite transport copies text using its full byte length, not a NUL terminator.
+Both selected legacy source and translation are validated before any hit-count
+or timestamp update; rejection does not change rows or their bytes. This is a
+selected-row check, not a scan, migration, or transaction/repair mechanism.
+Success JSON validates every emitted variable string and escapes all controls
+U+0001 through U+001F. Standard JSON decoding preserves the original text;
+source remains omitted unless requested with `--include-source`.
+
+Future MOD support treats a binary container as raw bytes and separately
+extracts translation text for this validation. This document defines that
+responsibility only; it does not add a MOD adapter or container format.
+
 ## Translation Flow
 
 This section describes the **current v1 implementation flow**, not the target
@@ -120,8 +160,9 @@ Issues are authoritative when they differ from this current-state description.
 9. Save cacheable results and write plain, Markdown, or JSON output.
 
 The broader roadmap target for file/MOD output is intentionally stricter:
-generated candidates must pass finish/detokenization/text/structure/content
-validation, accepted Translation Memory rows are staged in memory, the staged
+generated candidates must pass the complete finish/detokenization/text/structure/content
+validation pipeline (UTF-8/no-NUL text checks are already enforced), accepted
+Translation Memory rows are staged in memory, the staged
 artifact receives final validation, accepted rows are committed in a short
 SQLite write transaction, and only then is the artifact atomically published.
 Roadmap #46 and the referenced implementation Issues govern that future

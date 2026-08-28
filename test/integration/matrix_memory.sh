@@ -160,6 +160,7 @@ PY
 matrix_memory() {
   local id kind source translated cache before after error_code error_message
   local -a flags
+  matrix_memory_text_contract
   for id in tm-miss tm-full-hit tm-partial-hit tm-disabled-flag tm-disabled-config \
     tm-directory-open-failure tm-corrupt-open-failure tm-statement-failure \
     glossary-prefer glossary-protect glossary-hash-change glossary-disabled-flag glossary-disabled-config \
@@ -229,4 +230,113 @@ matrix_memory() {
     else matrix_memory_preserved; fi
     matrix_finish
   done
+}
+
+matrix_memory_raw_snapshot() {
+  python3 - "$CASE_DB" "$CASE_DIR/raw-$1.json" <<'PY'
+from contextlib import closing
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import sys
+path, destination = map(Path, sys.argv[1:])
+before = hashlib.sha256(path.read_bytes()).hexdigest()
+sidecars = {suffix: Path(str(path) + suffix).exists() for suffix in ('-wal', '-shm', '-journal')}
+assert not any(sidecars.values()), 'unexpected fixture sidecar'
+with closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True)) as db:
+    cursor = db.execute('''SELECT source_hash, hex(CAST(source_text AS BLOB)) AS source_hex,
+        length(CAST(source_text AS BLOB)) AS source_bytes,
+        hex(CAST(translated_text AS BLOB)) AS translated_hex,
+        length(CAST(translated_text AS BLOB)) AS translated_bytes,
+        source_lang, target_lang, mode, model_id, glossary_hash, created_at, updated_at, hit_count
+        FROM translations ORDER BY source_hash, source_lang, target_lang, mode, model_id, glossary_hash''')
+    rows = cursor.fetchall()
+    columns = [column[0] for column in cursor.description]
+    count = db.execute('SELECT COUNT(*) FROM translations').fetchone()[0]
+assert count == len(rows)
+assert hashlib.sha256(path.read_bytes()).hexdigest() == before, 'observer mutated DB'
+assert all(Path(str(path) + suffix).exists() == exists for suffix, exists in sidecars.items())
+destination.write_text(json.dumps(dict(columns=columns, rows=rows, row_count=count,
+                                      database_sha256=before, sidecars=sidecars), indent=2) + '\n')
+PY
+}
+
+matrix_memory_text_contract() {
+  local field defect code message source
+  for field in source output; do
+    for defect in utf8 nul; do
+      matrix_memory_fixture "tm-text-contract-legacy-$field-$defect" healthy
+      matrix_memory_prime Hello
+      python3 - "$CASE_DB" "$field" "$defect" <<'PY'
+from contextlib import closing
+import sqlite3
+import sys
+path, field, defect = sys.argv[1:]
+column = {'source': 'source_text', 'output': 'translated_text'}[field]
+payload = {'utf8': b'A\xffB', 'nul': b'A\x00B'}[defect]
+with closing(sqlite3.connect(path)) as db:
+    assert db.execute('SELECT source_text, translated_text FROM translations').fetchall() == [('Hello', 'JA:Hello')]
+    db.execute(f'UPDATE translations SET {column}=CAST(? AS TEXT), hit_count=7, created_at=11, updated_at=13', (payload,))
+    db.commit()
+PY
+      matrix_memory_raw_snapshot before
+      matrix_run translate Hello --from en --to ja --format json
+      matrix_memory_raw_snapshot after
+      code=invalid_utf8 message='Text must be valid UTF-8.'
+      if [[ "$defect" == nul ]]; then code=embedded_nul message='Text must not contain NUL bytes.'; fi
+      printf '{"error":{"code":"%s","message":"%s"}}\n' "$code" "$message" >"$CASE_DIR/expected.stdout"
+      matrix_assert status 1
+      matrix_assert stdout "$CASE_DIR/expected.stdout"
+      matrix_assert stderr "$CASE_DIR/empty"
+      matrix_assert json error
+      matrix_assert json-values "$(cat "$CASE_DIR/expected.stdout")"
+      matrix_assert fs-equal
+      matrix_assert db-equal
+      matrix_assert custom raw-legacy-preserved python3 - "$CASE_DIR" "$field" "$defect" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+directory, field, defect = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+before, after = [json.loads((directory / f'raw-{phase}.json').read_text()) for phase in ('before', 'after')]
+assert before == after, 'raw DB rows/hash/sidecars changed'
+assert before['row_count'] == 1
+row = dict(zip(before['columns'], before['rows'][0], strict=True))
+payload = {'utf8': b'A\xffB', 'nul': b'A\x00B'}[defect]
+source, output = (payload, b'JA:Hello') if field == 'source' else (b'Hello', payload)
+assert row == dict(source_hash=hashlib.sha256(b'Hello').hexdigest(), source_hex=source.hex().upper(),
+    source_bytes=len(source), translated_hex=output.hex().upper(), translated_bytes=len(output),
+    source_lang='en', target_lang='ja', mode='default', model_id='matrix-memory',
+    glossary_hash='409638ee2bde459', created_at=11, updated_at=13, hit_count=7)
+print(json.dumps({'raw_equal': True, 'database_sha256': before['database_sha256'], 'row': row}))
+PY
+      matrix_finish
+    done
+  done
+
+  source='Hello 日本語😀é'
+  matrix_memory_fixture tm-text-contract-unicode-hit healthy
+  matrix_memory_prime "$source"
+  matrix_memory_raw_snapshot before
+  matrix_run translate "$source" --from en --to ja --format json
+  matrix_memory_raw_snapshot after
+  matrix_memory_success "JA:$source" full
+  matrix_memory_rows '[["Hello 日本語😀é",0,"empty"]]' '[["Hello 日本語😀é",1,"empty"]]'
+  matrix_assert custom raw-unicode-hit python3 - "$CASE_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+directory = Path(sys.argv[1])
+before, after = [json.loads((directory / f'raw-{phase}.json').read_text()) for phase in ('before', 'after')]
+assert before['row_count'] == after['row_count'] == 1
+assert before['columns'] == after['columns'] and before['sidecars'] == after['sidecars']
+old, new = [dict(zip(state['columns'], state['rows'][0], strict=True)) for state in (before, after)]
+assert new['hit_count'] == old['hit_count'] + 1
+assert new['updated_at'] >= old['updated_at']
+assert {k: v for k, v in old.items() if k not in ('hit_count', 'updated_at')} == {
+    k: v for k, v in new.items() if k not in ('hit_count', 'updated_at')}
+print(json.dumps({'before': old, 'after': new, 'only_allowed_changes': ['hit_count', 'updated_at']}))
+PY
+  matrix_finish
 }
