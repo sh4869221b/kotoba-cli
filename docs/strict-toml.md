@@ -207,8 +207,11 @@ model IDs, invalid language members, and wrong value types are errors. The
 first textual error wins; duplicate detection happens before decoding the
 duplicate value. The reserved bare keys `version`, `schema`, and
 `schema_version` are rejected at any key position. Syntactically valid table
-headers with exactly those names use the file-specific unsupported-schema
-error. A malformed header is an ordinary syntax error; another unsupported
+headers with exactly those bare names use the file-specific unsupported-schema
+error. Header names use the same bare-name grammar as keys, with optional
+spaces or tabs inside the brackets; quoted or dotted header names are
+unsupported syntax and return the ordinary file-invalid error, even
+`["version"]`. A malformed header is an ordinary syntax error; another unsupported
 header or key is an ordinary file-invalid error.
 
 These rules make previously ignored data visible. A file that used to skip an
