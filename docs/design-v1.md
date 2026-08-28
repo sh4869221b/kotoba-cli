@@ -125,14 +125,14 @@ validation, accepted Translation Memory rows are staged in memory, the staged
 artifact receives final validation, accepted rows are committed in a short
 SQLite write transaction, and only then is the artifact atomically published.
 Roadmap #46 and the referenced implementation Issues govern that future
-pipeline; this paragraph is not a claim that the current direct-write path or
-any Issue #25 implementation has already replaced it. Do not infer the target
-commit protocol from the simplified current flow above.
+pipeline. The current Issue #25 file-output implementation supplies only the
+stage/finish/publish boundary, so do not infer that full validation and commit
+protocol from the simplified current flow above.
 
-### File publication contract (Issue #25 target)
+### File publication contract (Issue #25)
 
-This section is Issue #25's filesystem target for this branch, not a claim that
-the current direct-write path or its CLI wiring has already been replaced.
+Translation file output uses this filesystem contract. It does not describe a
+Translation Memory transaction or the future validation pipeline.
 
 The output primitive creates a named sibling stage exclusively in the
 destination's parent directory. It opens and pins that parent for the stage,
@@ -167,7 +167,7 @@ commit accepted rows after exact staged-byte validation and before publish. If
 publish then fails, an already successful external commit cannot be undone by
 this module; no compensating transaction or rollback is attempted here.
 
-### Critical deletion failure contract (Issue #25 target)
+### Critical deletion failure contract (Issue #25)
 
 Important model removal steps distinguish a missing path from an access or
 other filesystem failure. A missing path can be an intentional no-op, but
