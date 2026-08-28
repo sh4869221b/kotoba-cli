@@ -20,6 +20,7 @@ matrix_case() {
   CASE_STDIN="${CASE_DIR}/stdin"
   CASE_SETUP_COUNT=0
   export CASE_DENY_READ=""
+  export CASE_FILE_SIZE_LIMIT=""
   export HOME="${CASE_ROOT}/home" XDG_CONFIG_HOME="${CASE_ROOT}/config" XDG_DATA_HOME="${CASE_ROOT}/data"
   export XDG_CACHE_HOME="${CASE_ROOT}/cache" XDG_STATE_HOME="${CASE_ROOT}/state"
   CASE_DB="${XDG_DATA_HOME}/kotoba/memory.sqlite3"
@@ -45,6 +46,10 @@ matrix_setup() {
 
 matrix_run() {
   [[ ! -e "$CASE_DIR/receipt.json" ]] || return 2
+  [[ -z "$CASE_FILE_SIZE_LIMIT" || "$CASE_FILE_SIZE_LIMIT" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'cli matrix: file size limit must be a positive integer' >&2
+    return 2
+  }
   matrix_python capture "$@" &
   MATRIX_CAPTURE_PID=$!
   local status=0
@@ -78,6 +83,7 @@ matrix_python() {
 import hashlib
 import json
 import os
+import resource
 from pathlib import Path
 import signal
 import sqlite3
@@ -186,13 +192,14 @@ def capture(args: list[str]) -> None:
     root, database = Path(os.environ["CASE_ROOT"]), Path(os.environ["CASE_DB"])
     executable = os.environ["CASE_BIN"]
     profile = os.environ["CASE_PROFILE"]
+    file_size_limit = int(os.environ["CASE_FILE_SIZE_LIMIT"]) if os.environ["CASE_FILE_SIZE_LIMIT"] else None
     receipt = {"case_id": directory.name, "level": "helper" if profile == "helper" else "cli", "profile": profile,
                "group": os.environ["MATRIX_GROUP"],
                "executable": executable, "executable_sha256": digest(Path(executable)), "argv": [executable, *args],
                "stdin_sha256": digest(directory / "stdin"), "cwd": str(Path.cwd()), "fixture_root": str(root),
                "stdout": "stdout", "stderr": "stderr", "fs_before": "fs-before.json", "fs_after": "fs-after.json",
                "db_before": "db-before.json", "db_after": "db-after.json", "verdict": "pending", "assertions": [],
-               "timeout_seconds": 120, "harness_timeout": False}
+               "timeout_seconds": 120, "harness_timeout": False, "file_size_limit_bytes": file_size_limit}
     snapshot(root, database, directory, "before")
     dump(directory / "receipt.json", receipt)
     interrupted = 0
@@ -206,6 +213,10 @@ def capture(args: list[str]) -> None:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    def limit_child() -> None:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_limit, file_size_limit))
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -224,7 +235,8 @@ def capture(args: list[str]) -> None:
             assert receipt["permission"]["execution_mode"] == 0 and not os.access(denied, os.R_OK)
             dump(directory / "receipt.json", receipt)
         with (directory / "stdin").open("rb") as stdin, (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
-            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True)
+            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True,
+                                       preexec_fn=limit_child if file_size_limit is not None else None)
             try:
                 process.wait(timeout=120)
             except subprocess.TimeoutExpired:

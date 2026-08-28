@@ -16,8 +16,8 @@ application error.
 
 | `FinishReason` | Producer condition | Consumer behavior |
 | --- | --- | --- |
-| `eog` | End-of-generation token. | Success; append text and upsert the segment. |
-| `max_tokens` | Generation limit reached. | Success; append text and upsert the segment. |
+| `eog` | End-of-generation token. | Validate complete UTF-8/no-NUL text, then append and upsert the segment. |
+| `max_tokens` | Generation limit reached. | Validate complete UTF-8/no-NUL text, then append and upsert the segment. |
 | `context` | Context/KV capacity was unavailable. | Return existing `LlamaDecodeFailed`; do not append or upsert this segment. |
 | `timeout` | Request deadline elapsed. | Return existing `Timeout`; do not append or upsert this segment. |
 | `decode` | Tokenization, token-piece conversion, or another decode failure. | Return existing `LlamaDecodeFailed`; do not append or upsert this segment. |
@@ -25,7 +25,9 @@ application error.
 Timeout takes precedence when a decode status arrives after the deadline.
 The embedded adapter maps status `1` to `context` and other nonzero decode
 statuses to `decode`. The configured token limit remains a successful
-`max_tokens` result. The consumer frees each returned buffer on every path;
+`max_tokens` result when its complete text is encoding-valid. Empty, whitespace,
+and valid partial results remain accepted. Finish-reason errors take precedence
+even when the partial payload is malformed. The consumer frees each returned buffer on every path;
 successful cache writes from earlier segments are not rolled back when a
 later segment fails.
 
@@ -34,8 +36,10 @@ explicit fixture copies arbitrary bytes exactly, including empty, whitespace,
 invalid UTF-8, and truncated bytes. Without a fixture it returns
 `JA:<source_text>` or `EN:<source_text>` according to `target_lang`. It uses
 the structured source and target fields and never parses prompt markers.
-Malformed bytes are payloads, not a new validation feature; #37 validation is
-outside this harness.
+The arbitrary-byte fixture remains a component seam: consumer tests reject
+malformed accepted results before storage/append without adding a runtime
+fixture flag. Structural/content validation from #37 remains outside this
+encoding contract; no malformed real-model generation CLI coverage is claimed.
 
 ## Private state and cleanup
 
@@ -243,9 +247,10 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The measured case counts come from each run's `summary.json`; never infer a
-pass from a historical total. Setup calls are captured separately, not counted
-as cases.
+The matrix currently records 332 measured CLI cases: translate 46, commands
+219, memory 22, files 45. Counts come from each run's `summary.json`; never
+infer a pass from a historical total. Setup calls are captured separately,
+not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
 unfinished cases, failed assertions and harness timeouts fail the suite.
 The per-command limit is 120 seconds and the suite limit is 20 minutes. A
@@ -312,6 +317,11 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | --- | --- | --- |
 | `translate-{en-ja,ja-en}-{direct,stdin,txt,md}-{plain,markdown,json}` (24) | 0; exact text or parsed JSON, empty stderr; file routing has empty stdout | Input unchanged; only designated sibling created; no TM changes |
 | `translate-{multiline-plain,multiline-json,include-source-json,technical-json}` | 0; quotes, backslash, tab, newline and UTF-8 preserved; include-source and technical fields checked | FS/TM unchanged |
+| `translate-text-contract-valid-json` | 0; standard JSON parser recovers every U+0001–U+001F, Japanese, emoji and combining mark; exact source and `JA:` translation bytes | FS/TM unchanged |
+| `translate-text-contract-{invalid-stdin-human,nul-stdin-json,truncated-file,nul-file}` | 1; exact human `invalid_utf8` or parsed `embedded_nul` envelope; NUL supplied through stdin/file | Input and TM unchanged; rejected output absent |
+| `translate-text-contract-{invalid-glossary,nul-glossary}`; `commands-glossary-text-contract-{utf8,nul}` | 1; exact encoding error, no success line or rejected body | FS/TM unchanged |
+| `tm-text-contract-legacy-{source,output}-{utf8,nul}` | 1; parsed encoding error only; copied CLI selects normally seeded then raw-corrupted row | Read-only SQL captures full hex/BLOB lengths, all keys, counts/timestamps and DB hash before/after; exact equality and no sidecars |
+| `tm-text-contract-unicode-hit` | 0; full cache hit, exact Unicode translation | Same row/text/keys/created timestamp, hit count +1; existing updated timestamp behavior |
 | `translate-debug-{flag,config,json}` | 0; exact debug diagnostic on stderr, no source/translated bodies there | FS/TM unchanged |
 | `translate-markdown-{fenced,inline,table,link-url,all-protected}` | 0; protected bytes preserved; tables untranslated; no quality claim | FS/TM unchanged |
 | `translate-empty-{direct,stdin,file}` | 2; empty stdout, exact human `invalid_arguments` | FS/TM unchanged |
@@ -319,7 +329,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-{top-missing,top-invalid,init-invalid,config-invalid,config-get-arity,models-info-arity,glossary-arity,doctor-arity,memory-clear-arity-absent-db}` and other family arity cases | 2; exact `invalid_arguments`; JSON variants `commands-{invalid-json,doctor-invalid-json}` have parsed error stdout and empty stderr | Initialized failures unchanged; absent-state mutations characterized separately |
 | `commands-doctor-{ready,absent,missing-db}-{human,json}` | 0 ready / 1 absent or missing DB; exact human or typed JSON, empty stderr | Does not create missing state |
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
-| `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity 2; unknown token succeeds as `JA:--bogus` | Model commands eagerly create registry/directories; memory commands create DB when parent exists; #32 characterization |
+| `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
 | `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
 | `tm-disabled-{flag,config}`; `tm-{directory-open-failure,corrupt-open-failure,statement-failure}` | Disabled/open failure 0 uncached, empty warnings; incompatible table 1 with parsed `sqlite_failed`; empty stderr | Disabled sentinel unchanged; invalid DB/directory unchanged, no replacement or new translation |
 | `glossary-{prefer,protect,hash-change,disabled-flag,disabled-config,empty-key-reuse,empty-key-reuse-config}` | 0; parsed JSON; no deterministic glossary substitution claim | Hash change/disable uses distinct key; disabled empty-glossary key reuse hits |
@@ -328,6 +338,11 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `files-{overwrite,alias-overwrite}-{enabled,disabled}` | 0; empty streams | Destination replaced, including source alias; TM +1 enabled / unchanged disabled |
 | `files-{output-exists,alias-exists,directory-exists,missing-parent,directory-open}-{enabled,disabled}` | 1; empty stdout, exact `output_exists` or Linux `io_error` (`FileNotFound` / `IsDir`) | Destination bytes/entries and siblings preserved, but fresh source already cached (+1 row) when enabled; no-memory unchanged |
 | `files-{empty-direct,empty-stdin,empty-file,conflicting-input,missing-input}-{enabled,disabled}` | 2 `invalid_arguments` or 1 `io_error: FileNotFound`; empty stdout | Fail before translation; destination and TM unchanged |
+| `files-atomic-native-prefix{,-absent}` | 1; exact `io_error: FileTooBig`, empty stdout | A real 1024-byte child file-size limit stops the CLI stage before publication; existing destination is byte-for-byte unchanged, absent destination remains absent, and no stage remains |
+| `files-atomic-{mode-600,mode-640}` | 0; empty streams | Existing regular destination mode is retained after replacement |
+| `files-atomic-{symlink,dangling,hardlink}-{reject,replace}` | Reject: 1 `output_exists`; replace: 0 | No-overwrite treats link entries as existing; overwrite replaces only the named link entry and preserves the symlink/hardlink referent bytes |
+| `files-atomic-parent-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Destination and entry set remain unchanged; fixture permission is restored during cleanup |
+| `commands-models-remove-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Managed-model deletion failure is not reported as `removed`; registry partial-state rules remain separate |
 
 Finalized initialization regression #9 remains in `smoke.sh` and
 `commands-init-remote-rejected`: URL-only init exits 1 with pull/model-path
@@ -349,20 +364,27 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 | --- | --- |
 | `result consumer frees failed partial payloads without appending or caching them` (`translate`) | Timeout maps to `Timeout` / `timeout`; context/decode to `LlamaDecodeFailed` / `llama_decode_failed`; failed payload not appended/cached, previous row retained, allocator cleanup checked |
 | `translateSegments sqlite lookup and upsert failures retain prior rows and fresh fixtures recover` (`translate`) | Borrowed faults at relative step 3/4 return `SqliteFailed`; exact counters and independent read-only observer prove first row retained, second absent; fresh fixtures recover |
-| `result consumer accepts completed and token-limited bytes verbatim` (`translate`) | `eog` and `max_tokens` append/cache partial, invalid UTF-8, empty and whitespace bytes verbatim (8 rows); #31/#37 characterization |
+| `result consumer accepts valid completed and token-limited text` (`translate`) | `eog` and `max_tokens` append/cache full Unicode, valid partial, empty and whitespace bytes unchanged |
+| `result consumer rejects invalid accepted text before persistence`; `result consumer preserves finish error precedence for malformed bytes` (`translate`) | FF/NUL/truncated sequences reject before append/cache with/without DB; timeout/context/decode retain original errors; prior output/rows and allocator cleanup checked |
+| `sqlite column text copies exact byte lengths`; `memory rejects invalid legacy text before bump` (`memory`) | Low-level transport copies legacy NUL without truncation; core lookup rejects malformed rows before mutation |
+| `JSON text contract round trips every emitted variable field`; `JSON text contract rejects invalid emitted fields` (`output`) | Standard-parser exact controls/Unicode for each emitted string; malformed UTF-8/NUL reject; omitted source stays omitted; allocation failures clean up |
 | `restore appends warning when token missing` (`markdown`) | Warning-only success; returned text stays `translation without protected tokens`; #37 |
 | `writeOutput rejects existing destination without overwrite` (`translate`) | `OutputExists`, existing `old` bytes unchanged |
 | `fault fs failure injected write preserves data and entry set`; `fault fs failure rename preserves existing and absent destinations` (`fs`) | Pre-operation injected failure preserves bytes/entries; not mid-write atomicity |
 | `fault io failure prefix and broken pipe cause`; `fault io failure deferred flush independent counters disarm and rearm`; `fault io failure full caller owned sink is bounded` (`sys`) | `WriteFailed`, partial/pending bytes and recorded `BrokenPipe`/`NoSpaceLeft` causes; not real CLI stdout failure |
 | `fault io failure read limit prefix independent instances and rearm` (`sys`) | Reader failure/limit, consumed prefix, independent counters and recovery |
+| `checked close {happy,failure,reuse}` (`file_close`) | A real owned descriptor is consumed once; injected late errno is recorded only after the real close; repeated cleanup cannot close a descriptor reused by an unrelated sentinel |
+| `staged output {happy,failure,gate,race,path,cleanup}` (`staged_output`) | Same-parent exclusive stage, exact finished bytes, captured modes, caller gate, collision/no-replace/path/link behavior, and cleanup ownership. Native prefix writes use real stage bytes; injected flush/sync/close/rename labels remain component evidence. |
+| `writeOutput failure boundaries propagate native errors without publication` (`translate`) | Existing and absent output targets retain the expected state across the staged write boundary; no CLI stream/status is inferred from this component test |
+| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Config preflight fails before mutation; missing managed file remains benign. Native registry-directory reload is `IsDir`, injected reload stays `ModelsInvalid`; realpath/reload/deletion failures propagate without `removed`. Registry removal may already be saved, with config/model retained; no transaction or rollback is added |
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |
-| gap | Broken stdout and control-byte serializer paths are not fully CLI covered; ordinary valid JSON is not proof for these paths | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
-| gap | Mid-write regular-file atomicity/rollback; pre-open failures and injected pre-call preservation cannot establish it | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
+| gap | Broken stdout is not fully CLI covered; valid control-byte JSON coverage does not prove stdout-failure handling | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
+| bounded | Issue #25 covers normal write/flush/sync/checked-close/rename failures through a same-parent stage. Native RLIMIT CLI failure and real component prefix bytes are distinct from injected late boundaries. It does not promise TM rollback, directory fsync/power-loss durability, process-kill cleanup, or adversarial same-UID stage-tampering protection. | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
 | gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
-| gap | Validation before mutation and truly read-only commands; unknown option as initial text is currently accepted | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
-| gap | Invalid/empty result validation and missing protected-token rejection; bytes are accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
+| covered | Rejected argv and read-only commands preserve absent state; unknown initial options are rejected. This does not establish concurrent-writer safety. | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
+| gap | Content/structure and empty-result policy, including missing protected-token rejection; encoding-valid empty text is accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
 
 Characterizations record today's behavior, not endorsements or permanent
 guarantees. Component failures do not invent corresponding CLI streams/status.

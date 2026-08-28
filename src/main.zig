@@ -5,6 +5,8 @@ const cli = @import("cli.zig");
 const config = @import("config.zig");
 const doctor = @import("doctor.zig");
 const errors = @import("errors.zig");
+const file_close = @import("file_close.zig");
+const staged_output = @import("staged_output.zig");
 const glossary = @import("glossary.zig");
 const input = @import("input.zig");
 const lang = @import("lang.zig");
@@ -21,6 +23,7 @@ const translation_contract = @import("translation_contract.zig");
 const xdg = @import("xdg.zig");
 const sys = @import("sys.zig");
 const strict_toml = @import("strict_toml.zig");
+const text = @import("text.zig");
 const url = @import("url.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -45,6 +48,8 @@ test {
     std.testing.refAllDecls(config);
     std.testing.refAllDecls(doctor);
     std.testing.refAllDecls(errors);
+    std.testing.refAllDecls(file_close);
+    std.testing.refAllDecls(staged_output);
     std.testing.refAllDecls(glossary);
     std.testing.refAllDecls(input);
     std.testing.refAllDecls(lang);
@@ -61,5 +66,6 @@ test {
     std.testing.refAllDecls(xdg);
     std.testing.refAllDecls(sys);
     std.testing.refAllDecls(strict_toml);
+    std.testing.refAllDecls(text);
     std.testing.refAllDecls(url);
 }

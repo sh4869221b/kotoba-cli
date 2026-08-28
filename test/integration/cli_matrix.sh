@@ -214,8 +214,8 @@ PY
     printf 'preserved bytes\n' >"$CASE_ROOT/work/denied"
     export CASE_DENY_READ="$CASE_ROOT/work/denied"
     permission_status=0
-    if [[ "$permission_variant" == signal ]]; then permission_status=143; fi
-    matrix_run -c '[[ ! -r "$1" ]] || exit 9; if [[ "$2" == signal ]]; then kill -TERM "$$"; fi' bash "$CASE_DENY_READ" "$permission_variant"
+    if [[ "$permission_variant" == signal ]]; then permission_status=143; else CASE_FILE_SIZE_LIMIT=1024; fi
+    matrix_run -c '[[ ! -r "$1" ]] || exit 9; if [[ "$2" == signal ]]; then kill -TERM "$$"; else python3 -c "import resource, signal; assert resource.getrlimit(resource.RLIMIT_FSIZE) == (1024, 1024); assert signal.getsignal(signal.SIGXFSZ) == signal.SIG_IGN"; fi' bash "$CASE_DENY_READ" "$permission_variant"
     matrix_assert status "$permission_status"
     matrix_assert fs-equal
     matrix_assert db-equal
@@ -240,6 +240,44 @@ CHECK
     matrix_assert json "$kind"
     matrix_finish
   done
+  matrix_case helper-file-size-limit helper
+  for value in invalid 0 -1 1.5; do
+    CASE_FILE_SIZE_LIMIT="$value"
+    rc=0
+    matrix_run -c 'touch child-launched' >"$CASE_DIR/limit-$value.stdout" 2>"$CASE_DIR/limit-$value.stderr" || rc=$?
+    printf '%s\n' "$rc" >"$CASE_DIR/limit-$value.status"
+    [[ "$rc" == 2 && ! -e "$CASE_DIR/receipt.json" && ! -e child-launched ]]
+  done
+  CASE_FILE_SIZE_LIMIT=1024
+  matrix_run -c 'exec python3 -c "import resource; print(resource.getrlimit(resource.RLIMIT_FSIZE))"'
+  matrix_assert status 0
+  printf '(1024, 1024)\n' >"$CASE_DIR/expected.stdout"
+  matrix_assert stdout "$CASE_DIR/expected.stdout"
+  matrix_assert fs-equal
+  matrix_assert custom bounded-limit python3 - "$CASE_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+assert json.loads((root / "receipt.json").read_text())["file_size_limit_bytes"] == 1024
+assert all(int(path.read_text()) == 2 for path in root.glob("limit-*.status"))
+assert len(list(root.glob("limit-*.status"))) == 4
+print('{"invalid_limits_rejected_before_launch":4,"child_limit":1024}')
+PY
+  matrix_finish
+  matrix_case helper-file-size-reset helper
+  [[ -z "$CASE_FILE_SIZE_LIMIT" ]]
+  matrix_run -c 'printf "%4096s" X > unlimited-file'
+  matrix_assert status 0
+  matrix_assert custom reset-limit python3 - "$CASE_DIR" "$CASE_ROOT/work/unlimited-file" <<'PY'
+import json
+from pathlib import Path
+import sys
+assert json.loads((Path(sys.argv[1]) / "receipt.json").read_text())["file_size_limit_bytes"] is None
+assert Path(sys.argv[2]).stat().st_size == 4096
+print('{"next_case_limit":null,"native_file_length":4096}')
+PY
+  matrix_finish
   python3 - "$MATRIX_CAPTURE" <<'PY'
 import json
 from pathlib import Path
@@ -256,7 +294,8 @@ assert (wal_mutation / "fs-before.json").read_bytes() != (wal_mutation / "fs-aft
 (root / "self-test.json").write_text(json.dumps({"level": "helper", "rejected": rejections, "absent_db_stayed_absent": True,
                                                "positive_captures": len(list((root / "cases").glob("*/receipt.json"))), "product_coverage": False,
                                                "wal_observer": "skipped unsafe WAL/header/sidecar without SQLite open",
-                                               "wal_sidecar_mutation_rejected": True}) + "\n")
+                                               "wal_sidecar_mutation_rejected": True, "invalid_limits_rejected": 4,
+                                               "file_size_limit_reset": True}) + "\n")
 PY
 }
 

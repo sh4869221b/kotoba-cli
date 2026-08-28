@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
+const text = @import("text.zig");
 
 pub const TermMode = enum { prefer, protect };
 
@@ -39,6 +40,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Glossary {
 }
 
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Glossary {
+    try text.validate(data);
     var terms = std.array_list.Managed(Term).init(allocator);
     var current: ?Term = null;
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -80,4 +82,89 @@ test "glossary hash changes" {
         \\mode = "protect"
     );
     try std.testing.expect(hash(g) != 0);
+}
+
+test "glossary text contract preserves Unicode fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.deinit();
+
+    const data =
+        "# comment with 日本語😀 and e\u{301}\n" ++
+        "[[terms]]\n" ++
+        "source = \"CLI\"\n" ++
+        "target = \"用語😀\"\n" ++
+        "mode = \"protect\"\n" ++
+        "comment = \"e\u{301}\"\n";
+    const g = try parse(arena.allocator(), data);
+
+    try std.testing.expectEqual(@as(usize, 1), g.terms.len);
+    try std.testing.expectEqualStrings("CLI", g.terms[0].source);
+    try std.testing.expectEqualStrings("用語😀", g.terms[0].target);
+    try std.testing.expectEqual(TermMode.protect, g.terms[0].mode);
+    try std.testing.expectEqualStrings("e\u{301}", g.terms[0].comment);
+    try std.testing.expectEqual(@as(u64, 0xe9bd77e300dcdb49), hash(g));
+}
+
+test "glossary text contract rejects invalid documents before allocation" {
+    const cases = [_]struct {
+        name: []const u8,
+        data: []const u8,
+        expected: anyerror,
+    }{
+        .{
+            .name = "source",
+            .data = "[[terms]]\nsource = \"CLI\xFF\"\ntarget = \"用語\"\ncomment = \"注釈\"\n",
+            .expected = error.InvalidUtf8,
+        },
+        .{
+            .name = "target",
+            .data = "[[terms]]\nsource = \"CLI\"\ntarget = \"用語\xFF\"\ncomment = \"注釈\"\n",
+            .expected = error.InvalidUtf8,
+        },
+        .{
+            .name = "comment",
+            .data = "[[terms]]\nsource = \"CLI\"\ntarget = \"用語\"\ncomment = \"注釈\xFF\"\n",
+            .expected = error.InvalidUtf8,
+        },
+        .{
+            .name = "document comment",
+            .data = "# コメント\xFF\n[[terms]]\nsource = \"CLI\"\ntarget = \"用語\"\n",
+            .expected = error.InvalidUtf8,
+        },
+        .{
+            .name = "source NUL",
+            .data = "[[terms]]\nsource = \"CLI\x00\"\ntarget = \"用語\"\ncomment = \"注釈\"\n",
+            .expected = error.EmbeddedNul,
+        },
+        .{
+            .name = "target NUL",
+            .data = "[[terms]]\nsource = \"CLI\"\ntarget = \"用語\x00\"\ncomment = \"注釈\"\n",
+            .expected = error.EmbeddedNul,
+        },
+        .{
+            .name = "comment NUL",
+            .data = "[[terms]]\nsource = \"CLI\"\ntarget = \"用語\"\ncomment = \"注釈\x00\"\n",
+            .expected = error.EmbeddedNul,
+        },
+        .{
+            .name = "document comment NUL",
+            .data = "# コメント\x00\n[[terms]]\nsource = \"CLI\"\ntarget = \"用語\"\n",
+            .expected = error.EmbeddedNul,
+        },
+    };
+
+    for (cases) |case| {
+        _ = case.name;
+        try std.testing.expectError(case.expected, parse(std.testing.allocator, case.data));
+    }
+}
+
+test "glossary parser preserves invalid mode errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer _ = arena.deinit();
+
+    try std.testing.expectError(errors.Error.GlossaryInvalid, parse(
+        arena.allocator(),
+        "[[terms]]\nsource = \"CLI\"\ntarget = \"用語\"\nmode = \"unknown\"\n",
+    ));
 }

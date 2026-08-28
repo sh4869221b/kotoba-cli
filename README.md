@@ -96,6 +96,58 @@ Use `--format json` when callers need metadata such as cache status, warnings,
 runtime, or elapsed time. Use `--debug` only when diagnosing runtime behavior;
 debug output may be written to stderr and never changes translated stdout.
 
+### File output publication (Issue #25)
+
+File output is written to an
+exclusive staged sibling in the destination's directory, then published as a
+single directory-entry replacement. The destination stays intact until
+publication, including when `--overwrite` is used. Before a caller validates
+the finished artifact, the stage is flushed, synced, and closed with checked
+errors; validation reads those exact finished bytes and does not rewrite them.
+
+The contract preserves an existing regular file's permission mode and
+uses the platform default creation mode (`0666 & ~umask`) when the destination
+is absent. Replacing a named entry replaces a symlink itself, never its target;
+other hardlinks continue to reference the old inode. A no-overwrite publish
+counts any existing entry, including a dangling symlink, and uses a race-free
+no-replace rename; it fails closed when that operation is unsupported.
+The parent directory is pinned for the stage and publish operations. Primary
+write, flush, sync, close, validation, or publish failures are nonzero errors;
+best-effort stage cleanup can leave a uniquely named orphan after cleanup
+failure or process termination.
+
+The documented evidence covers normal write, flush, sync, checked-close, and
+rename failures, including native resource-limit CLI failure. It does not
+promise a Translation Memory transaction or rollback, directory durability
+after a crash or power loss, process-kill cleanup, or protection against a
+hostile same-UID process modifying a named stage.
+### Text encoding
+
+Translation input (direct text, stdin, `.txt`, and Markdown), glossary text,
+and accepted generated or cached text must be valid UTF-8 without NUL bytes.
+Kotoba does not normalize Unicode, transcode, or repair malformed text. Valid
+non-NUL controls and Unicode bytes are preserved; JSON escapes controls so a
+standard JSON parser recovers the exact text, including `source_text` when
+requested with `--include-source`.
+
+Invalid UTF-8 exits 1 with `invalid_utf8` / `Text must be valid UTF-8.`; NUL
+exits 1 with `embedded_nul` / `Text must not contain NUL bytes.`. UTF-8 is
+checked first if both defects occur. Human errors go to stderr; JSON errors
+use the existing error envelope on stdout. Neither includes rejected text.
+
+A selected legacy translation-memory row with malformed source or translation
+fails before its hit counter is updated. SQLite reads preserve full byte
+lengths, including any legacy NUL: Kotoba does not truncate, repair, delete,
+or silently skip that row. Use `--no-memory` to bypass memory for a command;
+`kotoba memory clear --yes` explicitly removes **all** stored translations.
+There is no automatic migration or repair.
+
+Generation checks the complete accepted result, not individual token pieces.
+Encoding-valid partial, empty, whitespace, and `max_tokens` results retain
+their existing behavior; timeout and decode/context errors take precedence
+over text validation. See the [text contract](docs/design-v1.md#text-encoding-contract)
+for the distinction between translation text and future raw MOD containers.
+
 ## Commands
 
 ```bash
@@ -157,8 +209,9 @@ it with defaults. Missing files remain distinct from parse, schema, native I/O,
 and allocation failures. See the complete
 [strict persistence TOML contract](docs/strict-toml.md) for the field tables,
 accepted syntax, manual repair guidance, canonical URL behavior, and mutation
-preflight boundary. The contract does not promise full TOML support, atomic
-writes, rollback, locking, or crash durability.
+preflight boundary. The persistence contract does not promise full TOML support,
+atomic config/registry writes, rollback, locking, or crash durability. Translation
+output files use the separate staged-publication contract described above.
 
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
 before opening SQLite when examining a database without concurrent writers.
@@ -284,10 +337,14 @@ bash test/integration/parallel.sh --rounds 2 --evidence-dir "$PWD/.omo/evidence/
 The matrix records actual command streams, status, filesystem and translation
 memory state using private test/CPU snapshots. It supports `--group translate`,
 `commands`, `memory`, or `files`. The parallel driver runs two full matrices per
-round alongside existing smoke, benchmark and unit children. See the
+round alongside existing smoke, benchmark and unit children. File output is
+staged in the destination directory and published only after a checked finish;
+the matrix separately records native resource-limit write failure, links,
+permission modes, and destination state. See the
 [coverage and gaps](docs/test-harness.md#cli-contract-matrix) for the separate
-CLI/component evidence and deferred output, mutation and result-validation
-guarantees; these tests do not claim real-model quality or atomic file writes.
+CLI/component evidence and deferred stdout, validation, transaction, directory
+durability, and result-validation guarantees. These tests do not claim
+real-model quality.
 
 Real CUDA QA is guarded so non-CUDA machines can run it safely:
 

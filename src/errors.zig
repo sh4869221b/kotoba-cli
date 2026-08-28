@@ -23,6 +23,8 @@ pub const Code = enum {
     glossary_invalid,
     unsupported_language_pair,
     invalid_arguments,
+    invalid_utf8,
+    embedded_nul,
     interrupted,
     io_error,
 
@@ -49,6 +51,8 @@ pub const Code = enum {
             .glossary_invalid => "glossary_invalid",
             .unsupported_language_pair => "unsupported_language_pair",
             .invalid_arguments => "invalid_arguments",
+            .invalid_utf8 => "invalid_utf8",
+            .embedded_nul => "embedded_nul",
             .interrupted => "interrupted",
             .io_error => "io_error",
         };
@@ -77,6 +81,8 @@ pub const Error = error{
     GlossaryInvalid,
     UnsupportedLanguagePair,
     InvalidArguments,
+    InvalidUtf8,
+    EmbeddedNul,
     Interrupted,
 };
 
@@ -116,9 +122,29 @@ pub fn fromError(err: anyerror) AppError {
         Error.GlossaryInvalid => .{ .code = .glossary_invalid, .message = "glossary.toml is invalid." },
         Error.UnsupportedLanguagePair => .{ .code = .unsupported_language_pair, .message = "Only en -> ja and ja -> en are supported." },
         Error.InvalidArguments => .{ .code = .invalid_arguments, .message = "Invalid arguments." },
+        Error.InvalidUtf8 => .{ .code = .invalid_utf8, .message = "Text must be valid UTF-8." },
+        Error.EmbeddedNul => .{ .code = .embedded_nul, .message = "Text must not contain NUL bytes." },
         Error.Interrupted => .{ .code = .interrupted, .message = "Interrupted." },
         else => .{ .code = .io_error, .message = @errorName(err) },
     };
+}
+
+test "text encoding error mapping" {
+    const cases = [_]struct {
+        err: anyerror,
+        code: []const u8,
+        message: []const u8,
+    }{
+        .{ .err = Error.InvalidUtf8, .code = "invalid_utf8", .message = "Text must be valid UTF-8." },
+        .{ .err = Error.EmbeddedNul, .code = "embedded_nul", .message = "Text must not contain NUL bytes." },
+    };
+
+    for (cases) |case| {
+        const app_err = fromError(case.err);
+        try std.testing.expectEqualStrings(case.code, app_err.code.asText());
+        try std.testing.expectEqualStrings(case.message, app_err.message);
+        try std.testing.expectEqual(@as(u8, 1), app_err.exitCode());
+    }
 }
 
 pub fn printHuman(app_err: AppError) void {
@@ -167,4 +193,26 @@ test "strict persistence error categories have exact safe messages" {
         };
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "filesystem errors map to io error with native names" {
+    const filesystem_errors = [_]anyerror{
+        error.AccessDenied,
+        error.InputOutput,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.FileTooBig,
+        error.InvalidFileDescriptor,
+        error.OperationUnsupported,
+        error.StageNameCollision,
+    };
+    for (filesystem_errors) |err| {
+        const app_err = fromError(err);
+        try std.testing.expectEqual(Code.io_error, app_err.code);
+        try std.testing.expectEqual(@as(u8, 1), app_err.exitCode());
+        try std.testing.expectEqualStrings(@errorName(err), app_err.message);
+    }
+    const output_exists = fromError(Error.OutputExists);
+    try std.testing.expectEqual(Code.output_exists, output_exists.code);
+    try std.testing.expectEqualStrings("Output file already exists. Use --overwrite to replace it.", output_exists.message);
 }

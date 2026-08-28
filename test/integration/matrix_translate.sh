@@ -83,6 +83,7 @@ matrix_translate_plain_extra() {
 matrix_translate() {
   local from to source translated reader format destination id
   local -a input_args extra_args
+  matrix_translate_text_contract
   for from in en ja; do
     if [[ "$from" == en ]]; then
       to=ja source=Hello translated=JA:Hello
@@ -211,6 +212,78 @@ PY
     matrix_assert stderr "$CASE_DIR/expected.stderr"
     matrix_assert fs-equal
     matrix_translate_state
+    matrix_finish
+  done
+}
+
+matrix_translate_text_contract() {
+  local id code message
+  matrix_translate_fixture text-contract-valid-json
+  python3 - "$CASE_STDIN" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b'A' + bytes(range(1, 32)) + '日本語😀é'.encode() + b'Z')
+PY
+  matrix_run translate --from en --to ja --format json --include-source --no-memory
+  matrix_assert status 0
+  matrix_assert stderr "$CASE_DIR/empty"
+  matrix_translate_json en ja "JA:$(cat "$CASE_STDIN")" default "$(cat "$CASE_STDIN")"
+  matrix_assert custom exact-text-bytes python3 - "$CASE_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+directory = Path(sys.argv[1])
+source = (directory / 'stdin').read_bytes()
+value = json.loads((directory / 'stdout').read_bytes())
+assert value['source_text'].encode() == source
+assert value['translated_text'].encode() == b'JA:' + source
+print(json.dumps({'source_hex': source.hex(), 'translated_hex': value['translated_text'].encode().hex()}))
+PY
+  matrix_assert fs-equal
+  matrix_translate_state
+  matrix_finish
+
+  for id in invalid-stdin-human nul-stdin-json truncated-file nul-file invalid-glossary nul-glossary; do
+    matrix_translate_fixture "text-contract-$id"
+    code=invalid_utf8 message='Text must be valid UTF-8.'
+    if [[ "$id" == nul-* ]]; then code=embedded_nul message='Text must not contain NUL bytes.'; fi
+    case "$id" in
+      invalid-stdin-human) printf 'A\377B' >"$CASE_STDIN" ;;
+      nul-stdin-json) printf 'A\000B' >"$CASE_STDIN" ;;
+      truncated-file) printf '\343\201' >invalid.md ;;
+      nul-file) printf 'A\000B' >invalid.txt ;;
+      *-glossary)
+        printf '[[terms]]\nsource = "Hello"\ntarget = "A' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+        if [[ "$id" == invalid-* ]]; then printf '\377'; else printf '\000'; fi >>"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+        printf 'B"\n' >>"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+    esac
+    case "$id" in
+      invalid-stdin-human) matrix_run translate --from en --to ja ;;
+      nul-stdin-json) matrix_run translate --from en --to ja --format json ;;
+      truncated-file) matrix_run translate --file invalid.md --from en --to ja --output rejected.md ;;
+      nul-file) matrix_run translate --file invalid.txt --from en --to ja --output rejected.txt --format json ;;
+      *-glossary) matrix_run translate Hello --from en --to ja ;;
+    esac
+    matrix_assert status 1
+    if [[ "$id" == nul-stdin-json || "$id" == nul-file ]]; then
+      printf '{"error":{"code":"%s","message":"%s"}}\n' "$code" "$message" >"$CASE_DIR/expected.stdout"
+      matrix_assert stdout "$CASE_DIR/expected.stdout"
+      matrix_assert stderr "$CASE_DIR/empty"
+      matrix_assert json error
+      matrix_assert json-values "$(cat "$CASE_DIR/expected.stdout")"
+    else
+      printf 'kotoba: %s: %s\n' "$code" "$message" >"$CASE_DIR/expected.stderr"
+      matrix_assert stdout "$CASE_DIR/empty"
+      matrix_assert stderr "$CASE_DIR/expected.stderr"
+    fi
+    matrix_assert fs-equal
+    matrix_translate_state
+    if [[ "$id" == *-file ]]; then
+      matrix_assert custom no-output-files python3 - <<'PY'
+from pathlib import Path
+assert not Path('rejected.md').exists() and not Path('rejected.txt').exists()
+PY
+    fi
     matrix_finish
   done
 }

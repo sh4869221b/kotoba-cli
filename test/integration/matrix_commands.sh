@@ -17,6 +17,55 @@ entry = dict(id='fixture', name='Fixture', profile='local', languages=['en', 'ja
 PY
 }
 
+# Each permission fixture restores its mode even when a measured assertion fails.
+commands_remove_variant() (
+  local variant="$1" managed original_mode
+  matrix_case "commands-models-remove-$variant"
+  commands_fixture
+  managed="$XDG_DATA_HOME/kotoba/models"
+  if [[ "$variant" == permission ]]; then
+    [[ "$(id -u)" != 0 ]] || { echo 'permission removal requires an ordinary UID' >&2; exit 1; }
+    original_mode="$(stat -c %a "$managed")"
+    trap 'status=$?; chmod "$original_mode" "$managed" || exit 1; stat -c %a "$managed" >"$CASE_DIR/restored-mode.txt"; exit "$status"' EXIT
+    chmod 0555 "$managed"
+  fi
+  python3 - "$variant" <<'PYREMOVE'
+import json, os, sys, tomllib
+from pathlib import Path
+root, directory = Path(os.environ['CASE_ROOT']), Path(os.environ['CASE_DIR'])
+variant = sys.argv[1]
+registry = root / 'config/kotoba/models.toml'
+config_path = root / 'config/kotoba/config.toml'
+entry = tomllib.loads(registry.read_text())['models'][0]
+model = Path(entry['path'])
+entries = [entry]
+if variant == 'missing':
+    model.unlink()
+elif variant == 'shared':
+    entries.append(dict(entry, id='shared'))
+elif variant == 'external':
+    external = root / 'work/external.gguf'
+    model.rename(external)
+    entry['path'] = str(external)
+    config_path.write_text(config_path.read_text().replace(str(model), str(external)))
+registry.write_text(''.join('[[models]]\n' + ''.join(f'{k} = {json.dumps(v)}\n' for k,v in e.items()) for e in entries))
+config = tomllib.loads(config_path.read_text())
+if variant != 'permission':
+    config.update(model_id='', model_path='')
+(directory / 'expected-config.json').write_text(json.dumps(config))
+(directory / 'expected-models.json').write_text(json.dumps({'models': entries[1:]} if len(entries) > 1 else {}))
+PYREMOVE
+  matrix_run models remove fixture --yes
+  if [[ "$variant" == permission ]]; then
+    commands_streams 1 '' $'kotoba: io_error: AccessDenied\n'
+    matrix_assert custom permission-mode test "$(stat -c %a "$managed")" = 555
+    commands_state '' config/kotoba/models.toml ''
+  else
+    commands_streams 0 $'removed fixture\n'
+    commands_state '' config/kotoba/config.toml,config/kotoba/models.toml ''
+  fi
+)
+
 commands_streams() {
   local status="$1" stdout="$2" stderr="${3:-}"
   printf '%s' "$stdout" >"$CASE_DIR/expected.stdout"
@@ -47,6 +96,8 @@ commands_error() {
     sqlite_failed) message='SQLite translation memory operation failed.' ;;
     unsupported_language_pair) message='Only en -> ja and ja -> en are supported.' ;;
     glossary_invalid) message='glossary.toml is invalid.' ;;
+    invalid_utf8) message='Text must be valid UTF-8.' ;;
+    embedded_nul) message='Text must not contain NUL bytes.' ;;
     *) return 2 ;;
   esac
   commands_streams "$status" '' "kotoba: $code: $message"$'\n'
@@ -357,6 +408,10 @@ matrix_commands() {
   matrix_run version
   commands_streams 0 $'kotoba 0.0.1\n'
   commands_unchanged
+  matrix_case commands-help
+  matrix_run --help
+  commands_error
+  commands_unchanged
   matrix_case commands-version-extra
   matrix_run version extra
   commands_error
@@ -547,6 +602,9 @@ PY
         commands_state '' config/kotoba/config.toml,config/kotoba/models.toml data/kotoba/models/fixture.gguf ;;
     esac
   done
+  for variant in permission missing shared external; do
+    commands_remove_variant "$variant"
+  done
   for variant in fresh corrupt; do
     matrix_case "commands-models-pull-output-invalid-$variant"
     if [[ "$variant" == corrupt ]]; then
@@ -594,6 +652,17 @@ PY
     commands_unchanged
   done
 
+  for variant in text-contract-utf8 text-contract-nul; do
+    matrix_case "commands-glossary-$variant"
+    commands_fixture
+    printf '[[terms]]\nsource = "Hello"\ntarget = "A' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    if [[ "$variant" == text-contract-utf8 ]]; then printf '\377'; else printf '\000'; fi >>"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    printf 'B"\n' >>"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    matrix_run glossary validate
+    if [[ "$variant" == text-contract-utf8 ]]; then commands_error invalid_utf8
+    else commands_error embedded_nul; fi
+    commands_unchanged
+  done
   for variant in ready absent invalid-data; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi

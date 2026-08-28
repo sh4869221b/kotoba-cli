@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
+const fs = @import("../fs.zig");
 const errors = @import("../errors.zig");
 const models = @import("../models.zig");
 const sys = @import("../sys.zig");
@@ -249,6 +250,12 @@ fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
 }
 
 fn runRemove(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var filesystem = fs.FileSystem.init(sys.io(), sys.cwd(), null);
+    return runRemoveWithFileSystem(allocator, paths, cmd_args, &filesystem, models.load);
+}
+
+// The filesystem and reload callback are borrowed only for this command invocation.
+fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8, filesystem: *fs.FileSystem, reload: *const fn (std.mem.Allocator, []const u8) anyerror!models.List) !u8 {
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
     try validateCommandId(id);
@@ -257,9 +264,10 @@ fn runRemove(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
     try xdg.ensureDirs(paths);
     const removed = try models.removeById(allocator, paths.models_file, id);
-    if (models.load(allocator, paths.models_file)) |remaining| {
-        if (canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining)) sys.deleteFile(removed.path);
-    } else |_| {}
+    const remaining = try reload(allocator, paths.models_file);
+    if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, filesystem)) {
+        _ = try filesystem.removeFileIfExists(removed.path);
+    }
     if (std.mem.eql(u8, cfg.model_id, id)) {
         cfg.model_id = "";
         cfg.model_path = "";
@@ -274,17 +282,17 @@ fn validateCommandId(id: []const u8) !void {
     try models.validateId(id);
 }
 
-fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u8, path: []const u8, remaining: models.List) bool {
-    const real_models_dir = sys.realPathAlloc(allocator, models_dir) catch return false;
+fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u8, path: []const u8, remaining: models.List, filesystem: *fs.FileSystem) !bool {
+    const real_models_dir = (try filesystem.realPathIfExistsAlloc(allocator, models_dir)) orelse return false;
     defer allocator.free(real_models_dir);
-    const real_path = sys.realPathAlloc(allocator, path) catch return false;
+    const real_path = (try filesystem.realPathIfExistsAlloc(allocator, path)) orelse return false;
     defer allocator.free(real_path);
     if (real_path.len <= real_models_dir.len) return false;
     if (!std.mem.startsWith(u8, real_path, real_models_dir)) return false;
     if (real_path[real_models_dir.len] != std.fs.path.sep) return false;
     for (remaining.models) |m| {
         if (m.path.len == 0) continue;
-        const other_real_path = sys.realPathAlloc(allocator, m.path) catch continue;
+        const other_real_path = (try filesystem.realPathIfExistsAlloc(allocator, m.path)) orelse continue;
         defer allocator.free(other_real_path);
         if (std.mem.eql(u8, real_path, other_real_path)) return false;
     }
@@ -749,4 +757,165 @@ test "model mutations retain valid and absent config semantics" {
             if (command == .import_use or is_pull) try std.testing.expectEqualStrings(if (is_pull) "downloaded fixture" else "existing model", try sys.readFileAlloc(allocator, cfg.model_path, 1024));
         }
     }
+}
+
+const RemoveCase = enum { normal, missing, shared, external, directory };
+
+fn testRemoveNative(case: RemoveCase) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var paths = try testPullPaths(allocator, root);
+    paths.models_dir = try std.fs.path.join(allocator, &.{ root, "managed" });
+    try xdg.ensureDirs(paths);
+    const model_path = try std.fs.path.join(allocator, &.{ if (case == .external) root else paths.models_dir, "fixture.gguf" });
+    if (case == .directory) {
+        try sys.makePath(model_path);
+    } else if (case != .missing) {
+        try sys.writeFile(model_path, "model bytes");
+    }
+    var entries = [_]models.Model{ .{ .id = "fixture", .path = model_path }, .{ .id = "shared", .path = model_path } };
+    try models.save(paths.models_file, .{ .models = entries[0..if (case == .shared) @as(usize, 2) else 1] });
+    var cfg = config.default();
+    cfg.model_id = "fixture";
+    cfg.model_path = model_path;
+    try config.save(paths.config_file, cfg);
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    const result = runRemove(allocator, paths, &.{ "fixture", "--yes" });
+    capture.restore();
+    if (case == .directory) {
+        try std.testing.expectError(error.IsDir, result);
+    } else {
+        try std.testing.expectEqual(@as(u8, 0), try result);
+    }
+    const remaining = try models.load(allocator, paths.models_file);
+    try std.testing.expect(models.find(remaining, "fixture") == null);
+    try std.testing.expectEqual(@as(usize, if (case == .shared) 1 else 0), remaining.models.len);
+    const selected = try config.load(allocator, paths.config_file);
+    try std.testing.expectEqualStrings(if (case == .directory) "fixture" else "", selected.model_id);
+    try std.testing.expectEqualStrings(if (case == .directory) model_path else "", selected.model_path);
+    const stdout_path = try std.fs.path.join(allocator, &.{ root, "stdout" });
+    try std.testing.expectEqualStrings(if (case == .directory) "" else "removed fixture\n", try sys.readFileAlloc(allocator, stdout_path, 1024));
+    const state = try sys.pathState(model_path);
+    if (case == .normal or case == .missing) {
+        try std.testing.expect(state == .not_found);
+    } else if (case == .directory) {
+        try std.testing.expect(state == .present and state.present.kind == .directory);
+    } else {
+        try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
+    }
+}
+
+test "models remove strict baseline normal missing shared external" {
+    for ([_]RemoveCase{ .normal, .missing, .shared, .external }) |case| try testRemoveNative(case);
+}
+
+test "models remove strict native directory deletion failure" {
+    try testRemoveNative(.directory);
+}
+
+const RemoveFailure = enum { reload_injected, reload_directory, managed_root, candidate, remaining, delete };
+
+fn testRemoveFailure(failure: RemoveFailure) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var paths = try testPullPaths(allocator, root);
+    paths.models_dir = try std.fs.path.join(allocator, &.{ root, "managed" });
+    try xdg.ensureDirs(paths);
+    const model_path = try std.fs.path.join(allocator, &.{ paths.models_dir, "fixture.gguf" });
+    const other_path = try std.fs.path.join(allocator, &.{ paths.models_dir, "other.gguf" });
+    try sys.writeFile(model_path, "model bytes");
+    try sys.writeFile(other_path, "other bytes");
+    var entries = [_]models.Model{ .{ .id = "fixture", .path = model_path }, .{ .id = "empty" }, .{ .id = "other", .path = other_path } };
+    try models.save(paths.models_file, .{ .models = &entries });
+    var cfg = config.default();
+    cfg.model_id = "fixture";
+    cfg.model_path = model_path;
+    try config.save(paths.config_file, cfg);
+    const config_before = try sys.readFileAlloc(allocator, paths.config_file, 8192);
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+    var faults = fs.Faults{};
+    var filesystem = fs.FileSystem.init(sys.io(), sys.cwd(), &faults);
+    const realpath_ordinal: usize = switch (failure) {
+        .managed_root => 1,
+        .candidate => 2,
+        .remaining => 3,
+        else => 0,
+    };
+    if (realpath_ordinal != 0) try faults.arm(.realpath, realpath_ordinal, error.InputOutput);
+    if (failure == .delete) try faults.arm(.delete, 1, error.AccessDenied);
+    const Reload = struct {
+        fn injected(_: std.mem.Allocator, _: []const u8) !models.List {
+            return errors.Error.ModelsInvalid;
+        }
+        fn directory(a: std.mem.Allocator, path: []const u8) !models.List {
+            const saved = try std.fmt.allocPrint(a, "{s}.before-reload", .{path});
+            try sys.renameFile(path, saved);
+            try sys.makePath(path);
+            return models.load(a, path);
+        }
+    };
+    const result = runRemoveWithFileSystem(allocator, paths, &.{ "fixture", "--yes" }, &filesystem, switch (failure) {
+        .reload_injected => Reload.injected,
+        .reload_directory => Reload.directory,
+        else => models.load,
+    });
+    capture.restore();
+    const expected_error = switch (failure) {
+        .reload_injected => errors.Error.ModelsInvalid,
+        .reload_directory => error.IsDir,
+        .delete => error.AccessDenied,
+        else => error.InputOutput,
+    };
+    try std.testing.expectError(expected_error, result);
+    try std.testing.expectEqual(@as(usize, if (failure == .delete) 1 else 0), faults.attemptsFor(.delete));
+    try std.testing.expectEqual(@as(usize, 0), faults.completedFor(.delete));
+    try std.testing.expectEqual(if (failure == .delete) @as(usize, 3) else realpath_ordinal, faults.attemptsFor(.realpath));
+    const registry_path = if (failure == .reload_directory) try std.fmt.allocPrint(allocator, "{s}.before-reload", .{paths.models_file}) else paths.models_file;
+    const remaining = try models.load(allocator, registry_path);
+    try std.testing.expect(models.find(remaining, "fixture") == null);
+    try std.testing.expectEqual(@as(usize, 2), remaining.models.len);
+    if (failure == .reload_directory) try std.testing.expectError(error.IsDir, models.load(allocator, paths.models_file));
+    try std.testing.expectEqualStrings(config_before, try sys.readFileAlloc(allocator, paths.config_file, 8192));
+    try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
+    try std.testing.expectEqualStrings("other bytes", try sys.readFileAlloc(allocator, other_path, 1024));
+    const stdout_path = try std.fs.path.join(allocator, &.{ root, "stdout" });
+    try std.testing.expectEqualStrings("", try sys.readFileAlloc(allocator, stdout_path, 1024));
+}
+
+test "models remove strict injected reload failure" {
+    try testRemoveFailure(.reload_injected);
+}
+
+test "models remove strict native registry directory before reload" {
+    try testRemoveFailure(.reload_directory);
+}
+
+test "models remove strict managed root realpath failure" {
+    try testRemoveFailure(.managed_root);
+}
+
+test "models remove strict candidate realpath failure" {
+    try testRemoveFailure(.candidate);
+}
+
+test "models remove strict remaining reference realpath failure" {
+    try testRemoveFailure(.remaining);
+}
+
+test "models remove strict injected deletion failure" {
+    try testRemoveFailure(.delete);
 }
