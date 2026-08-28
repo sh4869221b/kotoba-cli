@@ -4,6 +4,7 @@ const lang = @import("lang.zig");
 const sys = @import("sys.zig");
 const text = @import("text.zig");
 
+/// Borrowed serializer view; its slices remain valid only while their owner lives.
 pub const Result = struct {
     source_lang: lang.Language,
     target_lang: lang.Language,
@@ -16,6 +17,52 @@ pub const Result = struct {
     warnings: []const []const u8 = &.{},
     elapsed_ms: u64,
     source_text: ?[]const u8 = null,
+};
+
+/// Independent result graph. Move-only by convention; deinit invalidates all views.
+pub const OwnedResult = struct {
+    allocator: std.mem.Allocator,
+    result: Result,
+
+    pub fn clone(allocator: std.mem.Allocator, borrowed: Result) !OwnedResult {
+        const translated = try allocator.dupe(u8, borrowed.translated_text);
+        errdefer allocator.free(translated);
+        const source = if (borrowed.source_text) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (source) |s| allocator.free(s);
+        const model = try allocator.dupe(u8, borrowed.model_id);
+        errdefer allocator.free(model);
+        const runtime = try allocator.dupe(u8, borrowed.runtime);
+        errdefer allocator.free(runtime);
+        const warnings = try allocator.alloc([]const u8, borrowed.warnings.len);
+        errdefer allocator.free(warnings);
+        var initialized: usize = 0;
+        errdefer for (warnings[0..initialized]) |warning| allocator.free(warning);
+        for (borrowed.warnings, 0..) |warning, i| {
+            warnings[i] = try allocator.dupe(u8, warning);
+            initialized += 1;
+        }
+        var result = borrowed;
+        result.translated_text = translated;
+        result.source_text = source;
+        result.model_id = model;
+        result.runtime = runtime;
+        result.warnings = warnings;
+        return .{ .allocator = allocator, .result = result };
+    }
+
+    pub fn view(self: *const OwnedResult) Result {
+        return self.result;
+    }
+
+    pub fn deinit(self: *OwnedResult) void {
+        self.allocator.free(self.result.translated_text);
+        if (self.result.source_text) |source| self.allocator.free(source);
+        self.allocator.free(self.result.model_id);
+        self.allocator.free(self.result.runtime);
+        for (self.result.warnings) |warning| self.allocator.free(warning);
+        self.allocator.free(self.result.warnings);
+        self.* = undefined;
+    }
 };
 
 pub fn cacheStatus(r: Result) []const u8 {
@@ -286,4 +333,72 @@ fn checkJsonTextAllocations(allocator: std.mem.Allocator) !void {
 
 test "JSON text contract frees partial buffers on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkJsonTextAllocations, .{});
+}
+
+const ownership_fixture: Result = .{
+    .source_lang = .en,
+    .target_lang = .ja,
+    .mode = .technical,
+    .model_id = "owned-model",
+    .runtime = "synthetic-runtime",
+    .cached_segments = 1,
+    .total_segments = 2,
+    .translated_text = "translated",
+    .source_text = "Hello",
+    .warnings = &.{ "first warning", "second warning" },
+    .elapsed_ms = 7,
+};
+
+test "ownership/result lifetime and serialization" {
+    const a = std.testing.allocator;
+    var owner: OwnedResult = undefined;
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var borrowed = ownership_fixture;
+        borrowed.model_id = try arena.allocator().dupe(u8, borrowed.model_id);
+        borrowed.runtime = try arena.allocator().dupe(u8, borrowed.runtime);
+        borrowed.translated_text = try arena.allocator().dupe(u8, borrowed.translated_text);
+        borrowed.source_text = try arena.allocator().dupe(u8, borrowed.source_text.?);
+        const warnings = try arena.allocator().alloc([]const u8, 2);
+        for (borrowed.warnings, 0..) |w, i| warnings[i] = try arena.allocator().dupe(u8, w);
+        borrowed.warnings = warnings;
+        owner = try OwnedResult.clone(a, borrowed);
+        try std.testing.expect(arena.reset(.retain_capacity));
+        @memset(try arena.allocator().alloc(u8, 2048), 'x');
+    }
+    defer owner.deinit();
+    const expected = try renderJson(a, ownership_fixture, true);
+    defer a.free(expected);
+    const actual = try renderJson(a, owner.view(), true);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqualStrings("first warning", ownership_fixture.warnings[0]);
+    std.debug.print("ownership/result lifetime reset=reused+destroyed fields=text,source,model,runtime,2warnings serialized=equal\n", .{});
+}
+
+fn exerciseResultClone(a: std.mem.Allocator, source: ?[]const u8, populated: bool, runs: *usize) !void {
+    runs.* += 1;
+    var borrowed = ownership_fixture;
+    borrowed.source_text = source;
+    if (!populated) {
+        borrowed.translated_text = "";
+        borrowed.model_id = "";
+        borrowed.runtime = "";
+        borrowed.warnings = &.{};
+    }
+    var owner = try OwnedResult.clone(a, borrowed);
+    defer owner.deinit();
+    try std.testing.expectEqualStrings(borrowed.translated_text, owner.view().translated_text);
+    try std.testing.expectEqual(source == null, owner.view().source_text == null);
+}
+
+test "ownership/result oom" {
+    var runs: usize = 0;
+    for ([_]?[]const u8{ null, "", "Hello" }) |source| {
+        for ([_]bool{ false, true }) |populated| {
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseResultClone, .{ source, populated, &runs });
+        }
+    }
+    std.debug.print("ownership/result OOM exercise_invocations={d} optional=null,empty,populated warnings=0,2\n", .{runs});
 }

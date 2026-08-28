@@ -60,7 +60,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
     }
     const kind = translate.readKindForOptions(opts.format, opts.file_path);
-    const res = try translate.run(allocator, paths, cfg, opts);
+    var result_owner = try translate.run(allocator, paths, cfg, opts);
+    defer result_owner.deinit();
+    const res = result_owner.view();
     if (try translate.writeOutput(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;
     const fmt = opts.format orelse if (kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
     try output.write(fmt, res, opts.include_source);
