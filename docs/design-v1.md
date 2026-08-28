@@ -100,6 +100,23 @@ text. TTY detection must not enable extra output. Diagnostics are opt-in through
 `--debug` or `log_level = "debug"` and go to stderr. JSON output remains the
 only stdout format that includes metadata.
 
+### Invocation ownership
+
+Each command invocation owns temporary XDG, argument, parse, and diagnostic
+graphs in short-lived arenas. `cli.run` owns the dispatch/XDG arena; every
+public command adapter owns its invocation arena; `doctor.run` owns its own
+diagnostic arena even when called directly. `main` releases its argv arena
+before calling `process.exit`.
+
+Translation is deliberately different at its return boundary: the adapter
+passes the original caller allocator into `translate.run`, which returns an
+independent `OwnedResult`. The adapter keeps that owner through rendering and
+file publication, then deinitializes it. The result's text, optional source,
+model/runtime strings, warning array, and warning strings are copied into the
+owner; its serializer view cannot outlive it. This allocation contract does
+not alter CLI strings, JSON fields, staged publication, persistence ordering,
+or the storage atomicity limits above.
+
 ## Data Locations
 
 Kotoba follows XDG directories:
