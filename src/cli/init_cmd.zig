@@ -63,7 +63,10 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         if (registry_model.checksum.len > 0) try models.verifySha256(allocator, model_path, registry_model.checksum);
         selected_registry_model = registry_model;
     }
-    var cfg = config.load(allocator, paths.config_file) catch config.default();
+    var cfg = config.load(allocator, paths.config_file) catch |err| switch (err) {
+        error.NotInitialized => config.default(),
+        else => return err,
+    };
     cfg.model_id = model_id;
     cfg.model_path = model_path;
     try xdg.ensureDirs(paths);
