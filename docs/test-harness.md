@@ -247,8 +247,8 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The matrix currently has 180 measured CLI cases: translate 39, commands 79,
-memory 17, files 45. Setup calls are captured separately, not counted as cases.
+The matrix currently has 195 measured CLI cases: translate 46, commands 82,
+memory 22, files 45. Setup calls are captured separately, not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
 unfinished cases, failed assertions and harness timeouts fail the suite.
 The per-command limit is 120 seconds and the suite limit is 20 minutes. A
