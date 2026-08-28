@@ -17,34 +17,42 @@ pub const Check = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
-    var checks = std.array_list.Managed(Check).init(allocator);
+    var invocation_arena = std.heap.ArenaAllocator.init(allocator);
+    defer invocation_arena.deinit();
+    const command_allocator = invocation_arena.allocator();
+    var checks = std.array_list.Managed(Check).init(command_allocator);
+    defer checks.deinit();
     var ok = true;
 
     var have_config = true;
-    const cfg = config.load(allocator, paths.config_file) catch |err| blk: {
+    var owned_config: ?config.OwnedConfig = config.load(command_allocator, paths.config_file) catch |err| blk: {
         const app_err = errors.fromError(err);
         try checks.append(.{ .name = "config", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         have_config = false;
-        break :blk config.default();
+        break :blk null;
     };
+    defer if (owned_config) |*owner| owner.deinit();
+    const cfg = if (owned_config) |*owner| owner.view() else config.default();
     if (have_config) try checks.append(.{ .name = "config", .status = .ok, .message = "config.toml is readable" });
 
     if (have_config) try checks.append(.{ .name = "llama_cpp", .status = .ok, .message = "embedded llama.cpp runtime is linked" });
 
-    const list = models.load(allocator, paths.models_file) catch |err| {
+    var list_owner = models.load(command_allocator, paths.models_file) catch |err| {
         const app_err = errors.fromError(err);
         try checks.append(.{ .name = "models", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
-        if (!have_config) return print(allocator, checks.items, ok, json);
-        try appendModelChecks(allocator, null, cfg, &checks, &ok);
-        return continueAfterModelCheck(allocator, paths, cfg, &checks, ok, json);
+        if (!have_config) return print(command_allocator, checks.items, ok, json);
+        try appendModelChecks(command_allocator, null, cfg, &checks, &ok);
+        return continueAfterModelCheck(command_allocator, paths, cfg, &checks, ok, json);
     };
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try checks.append(.{ .name = "models", .status = .ok, .message = "models.toml is readable" });
     try appendUnsafeRemoteUrlCheck(list, &checks);
-    if (!have_config) return print(allocator, checks.items, ok, json);
-    try appendModelChecks(allocator, list, cfg, &checks, &ok);
-    return continueAfterModelCheck(allocator, paths, cfg, &checks, ok, json);
+    if (!have_config) return print(command_allocator, checks.items, ok, json);
+    try appendModelChecks(command_allocator, list, cfg, &checks, &ok);
+    return continueAfterModelCheck(command_allocator, paths, cfg, &checks, ok, json);
 }
 
 fn appendUnsafeRemoteUrlCheck(list: models.List, checks: *std.array_list.Managed(Check)) !void {
@@ -108,11 +116,12 @@ fn continueAfterModelCheck(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: 
         return print(allocator, checks.items, ok, json);
     };
     try checks.append(.{ .name = "memory", .status = .ok, .message = "memory DB is readable" });
-    _ = glossary.load(allocator, paths.glossary_file) catch {
+    var glossary_owner = glossary.load(allocator, paths.glossary_file) catch {
         try checks.append(.{ .name = "glossary", .status = .@"error", .code = "glossary_invalid", .message = "glossary.toml is invalid" });
         ok = false;
         return print(allocator, checks.items, ok, json);
     };
+    defer glossary_owner.deinit();
     try checks.append(.{ .name = "glossary", .status = .ok, .message = "glossary.toml is readable" });
     if (!cfg.privacy_mode) try checks.append(.{ .name = "privacy", .status = .warn, .message = "privacy_mode is disabled" }) else try checks.append(.{ .name = "privacy", .status = .ok, .message = "privacy_mode is enabled" });
     return print(allocator, checks.items, ok, json);
@@ -165,6 +174,26 @@ fn testDoctorPaths(allocator: std.mem.Allocator, root: []const u8) !xdg.Paths {
         .glossary_file = try std.fs.path.join(allocator, &.{ root, "glossary.toml" }),
         .memory_file = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" }),
     };
+}
+
+test "ownership/doctor direct invocation releases checks" {
+    var counter = @import("ownership_test_support.zig").CountingAllocator.init(std.testing.allocator);
+    const allocator = counter.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup_arena.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", setup_arena.allocator());
+    const paths = try testDoctorPaths(setup_arena.allocator(), root);
+    const output = try tmp.dir.createFile(std.testing.io, "stdout", .{});
+    defer output.close(std.testing.io);
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    try std.testing.expectEqual(@as(u8, 1), try run(allocator, paths, false));
+    capture.restore();
+    try std.testing.expectEqual(@as(usize, 0), counter.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), counter.live_allocations);
 }
 
 fn countText(haystack: []const u8, needle: []const u8) usize {

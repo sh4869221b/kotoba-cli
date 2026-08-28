@@ -44,6 +44,7 @@ pub const OutputFormat = enum {
     }
 };
 
+/// Borrowed configuration. Default string literals require no deinit.
 pub const Config = struct {
     default_source_lang: ?lang.Language = null,
     default_target_lang: lang.Language = .ja,
@@ -61,6 +62,70 @@ pub const Config = struct {
     glossary_enabled: bool = true,
     privacy_mode: bool = true,
     log_level: []const u8 = "warn",
+};
+
+/// Owns all three strings; move-only by convention. Deinit invalidates its views.
+pub const OwnedConfig = struct {
+    allocator: std.mem.Allocator,
+    value: Config,
+
+    pub fn clone(allocator: std.mem.Allocator, cfg: Config) !OwnedConfig {
+        const model_id = try allocator.dupe(u8, cfg.model_id);
+        errdefer allocator.free(model_id);
+        const model_path = try allocator.dupe(u8, cfg.model_path);
+        errdefer allocator.free(model_path);
+        const log_level = try allocator.dupe(u8, cfg.log_level);
+        var value = cfg;
+        value.model_id = model_id;
+        value.model_path = model_path;
+        value.log_level = log_level;
+        return .{ .allocator = allocator, .value = value };
+    }
+
+    /// Borrowed until mutation or deinit; the caller must not free its fields.
+    pub fn view(self: *const OwnedConfig) Config {
+        return self.value;
+    }
+
+    pub fn deinit(self: *OwnedConfig) void {
+        self.allocator.free(self.value.model_id);
+        self.allocator.free(self.value.model_path);
+        self.allocator.free(self.value.log_level);
+        self.* = undefined;
+    }
+
+    /// Validation or allocation failure leaves every previous field valid.
+    pub fn setValue(self: *OwnedConfig, key: []const u8, value: []const u8) !void {
+        const allocator = self.allocator;
+        const cfg = &self.value;
+        inline for (settable_keys) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) {
+                const T = @TypeOf(@field(cfg, candidate));
+                if (T == []const u8) {
+                    strict.validateString(value) catch return error.InvalidArguments;
+                    const replacement = try allocator.dupe(u8, value);
+                    allocator.free(@field(cfg, candidate));
+                    @field(cfg, candidate) = replacement;
+                } else switch (@typeInfo(T)) {
+                    .optional => cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value),
+                    .@"enum" => @field(cfg, candidate) = try T.parse(value),
+                    .int => @field(cfg, candidate) = if (T == i32)
+                        toml.signedIntValue(value) orelse return error.InvalidArguments
+                    else
+                        std.fmt.parseInt(T, value, 10) catch return error.InvalidArguments,
+                    .float => {
+                        const parsed = std.fmt.parseFloat(f32, value) catch return error.InvalidArguments;
+                        if (!std.math.isFinite(parsed)) return error.InvalidArguments;
+                        @field(cfg, candidate) = parsed;
+                    },
+                    .bool => @field(cfg, candidate) = try parseBool(value),
+                    else => unreachable,
+                }
+                return;
+            }
+        }
+        return error.InvalidArguments;
+    }
 };
 
 pub const settable_keys = [_][]const u8{
@@ -86,7 +151,7 @@ pub fn default() Config {
     return .{};
 }
 
-pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !OwnedConfig {
     const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return errors.Error.NotInitialized,
         else => return err,
@@ -150,7 +215,9 @@ test "strict config loader preserves parse schema and allocation failures" {
     try sys.writeFile(path, valid);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), path));
-    try std.testing.expectEqualStrings("local", (try load(allocator, path)).model_id);
+    var loaded = try load(allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("local", loaded.view().model_id);
     try std.testing.expectEqualStrings(valid, try sys.readFileAlloc(allocator, path, 1024));
 }
 
@@ -175,8 +242,8 @@ test "strict config loader preserves native access denied" {
     try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
 }
 
-/// String fields present in the input are caller-owned; omitted fields borrow defaults.
-pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Config {
+/// Returns independent owned strings, including omitted defaults; caller deinits.
+pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
     return parseStrict(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.ConfigSchemaUnsupported => error.ConfigSchemaUnsupported,
@@ -184,7 +251,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Config {
     };
 }
 
-fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !Config {
+fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
     var cfg = default();
     var seen = [_]bool{false} ** settable_keys.len;
     var owned = [_]bool{false} ** settable_keys.len;
@@ -229,7 +296,13 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !Config {
         }
         if (!matched) return error.Invalid;
     }
-    return cfg;
+    inline for (settable_keys, 0..) |key, index| {
+        if (@TypeOf(@field(cfg, key)) == []const u8 and !owned[index]) {
+            @field(cfg, key) = try allocator.dupe(u8, @field(cfg, key));
+            owned[index] = true;
+        }
+    }
+    return .{ .allocator = allocator, .value = cfg };
 }
 
 pub fn save(path: []const u8, cfg: Config) !void {
@@ -261,34 +334,7 @@ fn appendConfig(out: *strict.Buffer, cfg: Config) !void {
     }
 }
 
-pub fn setValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, value: []const u8) !void {
-    inline for (settable_keys) |candidate| {
-        if (std.mem.eql(u8, key, candidate)) {
-            const T = @TypeOf(@field(cfg, candidate));
-            if (T == []const u8) {
-                strict.validateString(value) catch return error.InvalidArguments;
-                @field(cfg, candidate) = try allocator.dupe(u8, value);
-            } else switch (@typeInfo(T)) {
-                .optional => cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value),
-                .@"enum" => @field(cfg, candidate) = try T.parse(value),
-                .int => @field(cfg, candidate) = if (T == i32)
-                    toml.signedIntValue(value) orelse return error.InvalidArguments
-                else
-                    std.fmt.parseInt(T, value, 10) catch return error.InvalidArguments,
-                .float => {
-                    const parsed = std.fmt.parseFloat(f32, value) catch return error.InvalidArguments;
-                    if (!std.math.isFinite(parsed)) return error.InvalidArguments;
-                    @field(cfg, candidate) = parsed;
-                },
-                .bool => @field(cfg, candidate) = try parseBool(value),
-                else => unreachable,
-            }
-            return;
-        }
-    }
-    return error.InvalidArguments;
-}
-
+/// Returns caller-owned bytes allocated with allocator.
 pub fn getValue(allocator: std.mem.Allocator, cfg: *const Config, key: []const u8) ![]const u8 {
     if (std.mem.eql(u8, key, "model_id")) return allocator.dupe(u8, cfg.model_id);
     if (std.mem.eql(u8, key, "model_path")) return allocator.dupe(u8, cfg.model_path);

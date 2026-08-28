@@ -91,6 +91,7 @@ commands_error() {
     models_schema_unsupported) message='models.toml uses an unsupported schema or version.' ;;
     io_error) message="$2" ;;
     model_missing) message='Configured model file does not exist.' ;;
+    model_registry_invalid) message='Model registry entry is invalid.' ;;
     models_invalid) message='models.toml is invalid.' ;;
     model_not_selected) message='No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`.' ;;
     sqlite_failed) message='SQLite translation memory operation failed.' ;;
@@ -481,6 +482,39 @@ TOML
   matrix_run config set gpu_layers 0
   commands_streams 0 ''
   commands_state '' config/kotoba/config.toml ''
+
+  matrix_case commands-config-string-replacements
+  commands_fixture
+  matrix_setup config set model_id first-id
+  matrix_setup config set model_id intermediate-id
+  matrix_setup config set model_path "$CASE_ROOT/work/first.gguf"
+  matrix_setup config set model_path "$CASE_ROOT/work/final.gguf"
+  matrix_setup config set log_level debug
+  cp "$XDG_CONFIG_HOME/kotoba/config.toml" "$CASE_DIR/before-final-replacement.toml"
+  python3 - <<'PY'
+import json, os, tomllib
+from pathlib import Path
+root, directory = Path(os.environ['CASE_ROOT']), Path(os.environ['CASE_DIR'])
+config = tomllib.loads((directory / 'before-final-replacement.toml').read_text())
+assert config['model_id'] == 'intermediate-id'
+assert config['model_path'] == str(root / 'work/final.gguf')
+assert config['log_level'] == 'debug'
+config['model_id'] = 'final-id'
+(directory / 'expected-config.json').write_text(json.dumps(config))
+PY
+  matrix_run config set model_id final-id
+  commands_streams 0 ''
+  matrix_assert custom replacement-setup python3 - "$CASE_DIR" <<'PY'
+from pathlib import Path
+import sys
+directory = Path(sys.argv[1])
+for index in range(1, 6):
+    assert (directory / f'setup-{index}.status').read_text() == '0\n'
+    assert (directory / f'setup-{index}.stdout').read_bytes() == b''
+    assert (directory / f'setup-{index}.stderr').read_bytes() == b''
+print('{"setup_replacements":5,"all_setup_statuses":0}')
+PY
+  commands_state '' config/kotoba/config.toml ''
   matrix_case commands-config-get-absent
   matrix_run config get gpu_layers
   commands_error not_initialized
@@ -602,6 +636,28 @@ PY
         commands_state '' config/kotoba/config.toml,config/kotoba/models.toml data/kotoba/models/fixture.gguf ;;
     esac
   done
+
+  matrix_case commands-models-remove-then-use-removed
+  commands_fixture
+  matrix_setup models remove fixture --yes
+  matrix_run models use fixture
+  commands_error model_registry_invalid
+  matrix_assert custom removed-before-use python3 - "$CASE_DIR" "$CASE_ROOT" <<'PY'
+import json, sys, tomllib
+from pathlib import Path
+directory, root = map(Path, sys.argv[1:])
+assert (directory / 'setup-1.status').read_text() == '0\n'
+assert (directory / 'setup-1.stdout').read_bytes() == b'removed fixture\n'
+assert (directory / 'setup-1.stderr').read_bytes() == b''
+config = tomllib.loads((root / 'config/kotoba/config.toml').read_text())
+assert config['model_id'] == '' and config['model_path'] == ''
+assert tomllib.loads((root / 'config/kotoba/models.toml').read_text()) == {}
+assert not (root / 'data/kotoba/models/fixture.gguf').exists()
+before = json.loads((directory / 'fs-before.json').read_text())
+assert not any(item['path'] == 'data/kotoba/models/fixture.gguf' for item in before)
+print('{"remove_reset":true,"managed_model_deleted":true,"use_error_no_mutation":true}')
+PY
+  commands_unchanged
   for variant in permission missing shared external; do
     commands_remove_variant "$variant"
   done

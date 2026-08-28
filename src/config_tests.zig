@@ -4,7 +4,7 @@ const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 
 test "config round trip parse" {
-    const cfg = try config.parse(std.heap.page_allocator,
+    var cfg_owner = try config.parse(std.testing.allocator,
         \\default_source_lang = ""
         \\default_target_lang = "ja"
         \\model_id = "local-ja"
@@ -16,6 +16,8 @@ test "config round trip parse" {
         \\timeout_sec = 120
         \\memory_enabled = true
     );
+    defer cfg_owner.deinit();
+    const cfg = cfg_owner.view();
     try std.testing.expectEqual(lang.Language.ja, cfg.default_target_lang);
     try std.testing.expectEqualStrings("local-ja", cfg.model_id);
     try std.testing.expectEqualStrings("/tmp/local-ja.gguf", cfg.model_path);
@@ -28,14 +30,15 @@ test "config round trip parse" {
 }
 
 test "embedded config rejects removed server keys and negative unsigned settings" {
-    var cfg = config.default();
+    var cfg = try config.OwnedConfig.clone(std.testing.allocator, config.default());
+    defer cfg.deinit();
     inline for (.{
         .{ "runtime", "llama_server" },
         .{ "server_url", "http://127.0.0.1:8080" },
         .{ "server_autostart", "true" },
         .{ "llama_server_path", "llama-server" },
         .{ "server_startup_timeout_sec", "60" },
-    }) |case| try std.testing.expectError(errors.Error.InvalidArguments, config.setValue(std.testing.allocator, &cfg, case[0], case[1]));
+    }) |case| try std.testing.expectError(errors.Error.InvalidArguments, cfg.setValue(case[0], case[1]));
     inline for (.{ "threads", "context_length", "max_tokens", "timeout_sec" }) |key| {
         try std.testing.expectError(errors.Error.ConfigInvalid, config.parse(std.testing.allocator, key ++ " = -1\n"));
     }
@@ -46,17 +49,22 @@ test "config parses saves gets sets and lists signed gpu layers" {
         .{ "gpu_layers = -1\n", -1 },
         .{ "gpu_layers = 0\n", 0 },
         .{ "gpu_layers = 24\n", 24 },
-    }) |case| try std.testing.expectEqual(@as(i32, case[1]), (try config.parse(std.testing.allocator, case[0])).gpu_layers);
-    var cfg = config.default();
-    try std.testing.expectEqual(@as(i32, -1), cfg.gpu_layers);
+    }) |case| {
+        var owner = try config.parse(std.testing.allocator, case[0]);
+        defer owner.deinit();
+        try std.testing.expectEqual(@as(i32, case[1]), owner.view().gpu_layers);
+    }
+    var cfg = try config.OwnedConfig.clone(std.testing.allocator, config.default());
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(i32, -1), cfg.view().gpu_layers);
     inline for (.{ "model_id", "gpu_layers", "timeout_sec" }) |key| try std.testing.expect(containsKey(key));
     inline for (.{ "server_url", "runtime" }) |key| try std.testing.expect(!containsKey(key));
-    try config.setValue(std.testing.allocator, &cfg, "gpu_layers", "0");
-    const got = try config.getValue(std.testing.allocator, &cfg, "gpu_layers");
+    try cfg.setValue("gpu_layers", "0");
+    const got = try config.getValue(std.testing.allocator, &cfg.view(), "gpu_layers");
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("0", got);
-    try config.setValue(std.testing.allocator, &cfg, "gpu_layers", "-2");
-    try std.testing.expectEqual(@as(i32, -2), cfg.gpu_layers);
+    try cfg.setValue("gpu_layers", "-2");
+    try std.testing.expectEqual(@as(i32, -2), cfg.view().gpu_layers);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -64,14 +72,16 @@ test "config parses saves gets sets and lists signed gpu layers" {
     defer std.testing.allocator.free(root);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "config.toml" });
     defer std.testing.allocator.free(path);
-    try config.save(path, cfg);
-    const loaded = try config.load(std.heap.page_allocator, path);
+    try config.save(path, cfg.view());
+    var loaded_owner = try config.load(std.testing.allocator, path);
+    defer loaded_owner.deinit();
+    const loaded = loaded_owner.view();
     try std.testing.expectEqual(@as(i32, -2), loaded.gpu_layers);
     inline for (.{ "auto", "all", "1.5", "\"auto\"", "\"all\"" }) |value| {
         try std.testing.expectError(errors.Error.ConfigInvalid, config.parse(std.testing.allocator, "gpu_layers = " ++ value ++ "\n"));
     }
     for ([_][]const u8{ "auto", "all", "1.5" }) |value| {
-        try std.testing.expectError(errors.Error.InvalidArguments, config.setValue(std.testing.allocator, &cfg, "gpu_layers", value));
+        try std.testing.expectError(errors.Error.InvalidArguments, cfg.setValue("gpu_layers", value));
     }
 }
 
@@ -101,7 +111,9 @@ test "strict config escaped string save load regression" {
     var cfg = config.default();
     cfg.model_path = "C:\\Users\\日本語\\quoted\"#=model.gguf";
     try config.save(path, cfg);
-    const loaded = try config.load(arena.allocator(), path);
+    var loaded_owner = try config.load(arena.allocator(), path);
+    defer loaded_owner.deinit();
+    const loaded = loaded_owner.view();
     try std.testing.expectEqualStrings(cfg.model_path, loaded.model_path);
 }
 
@@ -114,7 +126,9 @@ test "strict config duplicate keys regression" {
 test "strict config escape decoding regression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const cfg = try config.parse(arena.allocator(), "model_id = \"line\\n\\u65E5\"\n");
+    var cfg_owner = try config.parse(arena.allocator(), "model_id = \"line\\n\\u65E5\"\n");
+    defer cfg_owner.deinit();
+    const cfg = cfg_owner.view();
     try std.testing.expectEqualStrings("line\n日", cfg.model_id);
 }
 
@@ -137,13 +151,6 @@ const complete_fixture =
     \\log_level = "arbitrary\n\t\r\b\f\u007f"
 ;
 
-// Only complete fixtures and save output allocate every arbitrary string field.
-fn freeCompleteConfig(allocator: std.mem.Allocator, cfg: config.Config) void {
-    allocator.free(cfg.model_id);
-    allocator.free(cfg.model_path);
-    allocator.free(cfg.log_level);
-}
-
 fn expectConfigEqual(expected: config.Config, actual: config.Config) !void {
     try std.testing.expectEqualDeep(expected, actual);
     try std.testing.expectEqual(@as(u32, @bitCast(expected.temperature)), @as(u32, @bitCast(actual.temperature)));
@@ -152,7 +159,9 @@ fn expectConfigEqual(expected: config.Config, actual: config.Config) !void {
 test "strict config typed complete input and line endings" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "", "# comment\t日本語", " \t\r\n# comment\r\n\r\n" }) |data| {
-        try expectConfigEqual(config.default(), try config.parse(allocator, data));
+        var owner = try config.parse(allocator, data);
+        defer owner.deinit();
+        try expectConfigEqual(config.default(), owner.view());
     }
     const expected: config.Config = .{
         .default_source_lang = .en,
@@ -172,13 +181,15 @@ test "strict config typed complete input and line endings" {
         .privacy_mode = false,
         .log_level = "arbitrary\n\t\r\x08\x0c\x7f",
     };
-    const lf = try config.parse(allocator, complete_fixture);
-    defer freeCompleteConfig(allocator, lf);
+    var lf_owner = try config.parse(allocator, complete_fixture);
+    defer lf_owner.deinit();
+    const lf = lf_owner.view();
     try expectConfigEqual(expected, lf);
     const crlf = try std.mem.replaceOwned(u8, allocator, complete_fixture, "\n", "\r\n");
     defer allocator.free(crlf);
-    const windows = try config.parse(allocator, crlf);
-    defer freeCompleteConfig(allocator, windows);
+    var windows_owner = try config.parse(allocator, crlf);
+    defer windows_owner.deinit();
+    const windows = windows_owner.view();
     try expectConfigEqual(expected, windows);
 }
 
@@ -212,8 +223,9 @@ test "strict config all fields round trip" {
                 .log_level = string,
             };
             try config.save(path, original);
-            const loaded = try config.load(allocator, path);
-            defer freeCompleteConfig(allocator, loaded);
+            var loaded_owner = try config.load(allocator, path);
+            defer loaded_owner.deinit();
+            const loaded = loaded_owner.view();
             try expectConfigEqual(original, loaded);
         }
     }
@@ -222,23 +234,51 @@ test "strict config all fields round trip" {
 test "strict config accepts every enum and integer endpoints" {
     const allocator = std.testing.allocator;
     inline for (.{ "", "en", "ja" }) |value| {
-        const cfg = try config.parse(allocator, "default_source_lang = \"" ++ value ++ "\" # source");
+        var cfg_owner = try config.parse(allocator, "default_source_lang = \"" ++ value ++ "\" # source");
+        defer cfg_owner.deinit();
+        const cfg = cfg_owner.view();
         try std.testing.expectEqual(if (value.len == 0) null else try lang.Language.parse(value), cfg.default_source_lang);
     }
-    inline for (.{ "en", "ja" }) |value| try std.testing.expectEqual(try lang.Language.parse(value), (try config.parse(allocator, "default_target_lang='" ++ value ++ "'")).default_target_lang);
-    inline for (.{ "default", "technical" }) |value| try std.testing.expectEqual(try config.Mode.parse(value), (try config.parse(allocator, "default_mode='" ++ value ++ "'")).default_mode);
-    inline for (.{ "plain", "json", "markdown" }) |value| try std.testing.expectEqual(try config.OutputFormat.parse(value), (try config.parse(allocator, "default_output='" ++ value ++ "'")).default_output);
+    inline for (.{ "en", "ja" }) |value| {
+        var owner = try config.parse(allocator, "default_target_lang='" ++ value ++ "'");
+        defer owner.deinit();
+        try std.testing.expectEqual(try lang.Language.parse(value), owner.view().default_target_lang);
+    }
+    inline for (.{ "default", "technical" }) |value| {
+        var owner = try config.parse(allocator, "default_mode='" ++ value ++ "'");
+        defer owner.deinit();
+        try std.testing.expectEqual(try config.Mode.parse(value), owner.view().default_mode);
+    }
+    inline for (.{ "plain", "json", "markdown" }) |value| {
+        var owner = try config.parse(allocator, "default_output='" ++ value ++ "'");
+        defer owner.deinit();
+        try std.testing.expectEqual(try config.OutputFormat.parse(value), owner.view().default_output);
+    }
     inline for (.{ "context_length", "threads", "max_tokens", "timeout_sec" }) |key| {
         inline for (.{ "0", "+0", "4294967295" }) |value| {
-            const cfg = try config.parse(allocator, key ++ " = " ++ value);
+            var cfg_owner = try config.parse(allocator, key ++ " = " ++ value);
+            defer cfg_owner.deinit();
+            const cfg = cfg_owner.view();
             try std.testing.expectEqual(try std.fmt.parseInt(u32, value, 10), @field(cfg, key));
         }
     }
-    inline for (.{ "-2147483648", "2147483647", "-0", "+0", "+2147483647" }) |value| try std.testing.expectEqual(try std.fmt.parseInt(i32, value, 10), (try config.parse(allocator, "gpu_layers = " ++ value)).gpu_layers);
-    inline for (.{ "memory_enabled", "glossary_enabled", "privacy_mode" }) |key| {
-        inline for (.{ "true", "false" }) |value| try std.testing.expectEqual(std.mem.eql(u8, value, "true"), @field(try config.parse(allocator, key ++ " = " ++ value), key));
+    inline for (.{ "-2147483648", "2147483647", "-0", "+0", "+2147483647" }) |value| {
+        var owner = try config.parse(allocator, "gpu_layers = " ++ value);
+        defer owner.deinit();
+        try std.testing.expectEqual(try std.fmt.parseInt(i32, value, 10), owner.view().gpu_layers);
     }
-    inline for (.{ "0", "+1", "-0", "1.25", "2e-1", "-2E+1" }) |value| try std.testing.expectEqual(try std.fmt.parseFloat(f32, value), (try config.parse(allocator, "temperature = " ++ value)).temperature);
+    inline for (.{ "memory_enabled", "glossary_enabled", "privacy_mode" }) |key| {
+        inline for (.{ "true", "false" }) |value| {
+            var owner = try config.parse(allocator, key ++ " = " ++ value);
+            defer owner.deinit();
+            try std.testing.expectEqual(std.mem.eql(u8, value, "true"), @field(owner.view(), key));
+        }
+    }
+    inline for (.{ "0", "+1", "-0", "1.25", "2e-1", "-2E+1" }) |value| {
+        var owner = try config.parse(allocator, "temperature = " ++ value);
+        defer owner.deinit();
+        try std.testing.expectEqual(try std.fmt.parseFloat(f32, value), owner.view().temperature);
+    }
 }
 
 test "strict config rejects malformed and future schema" {
@@ -280,12 +320,13 @@ test "strict config rejects duplicate of every key before decoding" {
 
 fn checkConfigOwnership(allocator: std.mem.Allocator) !void {
     const input = try allocator.dupe(u8, complete_fixture);
-    const cfg = config.parse(allocator, input) catch |err| {
+    var owner = config.parse(allocator, input) catch |err| {
         allocator.free(input);
         return err;
     };
     allocator.free(input);
-    defer freeCompleteConfig(allocator, cfg);
+    defer owner.deinit();
+    const cfg = owner.view();
     try std.testing.expectEqualStrings("quote\" slash\\ # = 日本語 🐈", cfg.model_id);
     try std.testing.expectEqualStrings("C:\\Users\\日本語\\model.gguf", cfg.model_path);
     try std.testing.expectEqualStrings("arbitrary\n\t\r\x08\x0c\x7f", cfg.log_level);
@@ -294,8 +335,9 @@ fn checkConfigOwnership(allocator: std.mem.Allocator) !void {
 fn checkInvalidConfigOwnership(allocator: std.mem.Allocator, suffix: []const u8, expected: anyerror) !void {
     const input = try std.mem.concat(allocator, u8, &.{ complete_fixture, "\n", suffix });
     defer allocator.free(input);
-    if (config.parse(allocator, input)) |cfg| {
-        freeCompleteConfig(allocator, cfg);
+    if (config.parse(allocator, input)) |result| {
+        var owner = result;
+        owner.deinit();
         return error.TestUnexpectedResult;
     } else |err| {
         if (err == error.OutOfMemory) return err;
@@ -347,32 +389,133 @@ test "strict config save validates before touching sentinel destination" {
 }
 
 test "strict config set preserves raw strings and rejects before mutation" {
-    var cfg = config.default();
-    const allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cfg = try config.OwnedConfig.clone(failing.allocator(), config.default());
+    defer cfg.deinit();
     inline for (.{ "model_id", "model_path", "log_level" }) |key| {
         const raw = "C:\\日本語\\quote\"#=\n\t\x7f";
-        try config.setValue(allocator, &cfg, key, raw);
-        defer {
-            allocator.free(@field(cfg, key));
-            @field(cfg, key) = @field(config.default(), key);
-        }
-        try std.testing.expectEqualStrings(raw, @field(cfg, key));
-        const before = cfg;
+        try cfg.setValue(key, raw);
+        try std.testing.expectEqualStrings(raw, @field(cfg.view(), key));
+        const before = cfg.view();
         for ([_][]const u8{ "bad\x00", "\xff" }) |value| {
-            try std.testing.expectError(error.InvalidArguments, config.setValue(allocator, &cfg, key, value));
-            try expectConfigEqual(before, cfg);
+            try std.testing.expectError(error.InvalidArguments, cfg.setValue(key, value));
+            try expectConfigEqual(before, cfg.view());
         }
-        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-        try std.testing.expectError(error.OutOfMemory, config.setValue(failing.allocator(), &cfg, key, "new"));
-        try expectConfigEqual(before, cfg);
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, cfg.setValue(key, "new"));
+        try expectConfigEqual(before, cfg.view());
+        failing.fail_index = std.math.maxInt(usize);
     }
-    const before = cfg;
+    const before = cfg.view();
     inline for (.{ "nan", "inf", "-inf", "1e100", "not-number" }) |value| {
-        try std.testing.expectError(error.InvalidArguments, config.setValue(allocator, &cfg, "temperature", value));
-        try expectConfigEqual(before, cfg);
+        try std.testing.expectError(error.InvalidArguments, cfg.setValue("temperature", value));
+        try expectConfigEqual(before, cfg.view());
     }
     inline for (.{ "context_length", "threads", "max_tokens", "timeout_sec" }) |key| {
-        try std.testing.expectError(error.InvalidArguments, config.setValue(allocator, &cfg, key, "-1"));
-        try expectConfigEqual(before, cfg);
+        try std.testing.expectError(error.InvalidArguments, cfg.setValue(key, "-1"));
+        try expectConfigEqual(before, cfg.view());
     }
+}
+
+test "ownership/config lifecycle repeated replacement" {
+    const allocator = std.testing.allocator;
+    var cfg = try config.parse(allocator, "model_id='previous'\nmodel_path='/tmp/model.gguf'\nlog_level='warn'\n");
+    defer cfg.deinit();
+    inline for (.{ "model_id", "model_path", "log_level" }) |key| {
+        for (0..2048) |index| {
+            const next = if (index % 2 == 0) "next" else "previous";
+            try cfg.setValue(key, next);
+            try std.testing.expectEqualStrings(next, @field(cfg.view(), key));
+        }
+    }
+}
+
+test "ownership/config lifecycle defaults clone and destroyed parse input" {
+    const allocator = std.testing.allocator;
+    const defaults = config.default();
+    var cloned = try config.OwnedConfig.clone(allocator, defaults);
+    defer cloned.deinit();
+    try cloned.setValue("log_level", "debug");
+    try expectConfigEqual(config.default(), defaults);
+    try std.testing.expectEqualStrings("debug", cloned.view().log_level);
+
+    const input = try allocator.dupe(u8, "model_id='previous'\nmodel_path='/tmp/model.gguf'\nlog_level='warn'\n");
+    var parsed = config.parse(allocator, input) catch |err| {
+        allocator.free(input);
+        return err;
+    };
+    defer parsed.deinit();
+    @memset(input, 'x');
+    allocator.free(input);
+    try std.testing.expectEqualStrings("previous", parsed.view().model_id);
+    try std.testing.expectEqualStrings("/tmp/model.gguf", parsed.view().model_path);
+    try std.testing.expectEqualStrings("warn", parsed.view().log_level);
+    // A replacement may itself borrow the owner's current string.
+    try parsed.setValue("model_id", parsed.view().model_id[1..]);
+    try std.testing.expectEqualStrings("revious", parsed.view().model_id);
+    const got = try config.getValue(allocator, &parsed.view(), "model_id");
+    defer allocator.free(got);
+    try parsed.setValue("model_id", "changed");
+    try std.testing.expectEqualStrings("revious", got);
+}
+
+fn exerciseConfigClone(allocator: std.mem.Allocator, source: config.Config) !void {
+    var owner = try config.OwnedConfig.clone(allocator, source);
+    defer owner.deinit();
+    try expectConfigEqual(source, owner.view());
+}
+
+fn exerciseConfigParse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var owner = try config.parse(allocator, input);
+    defer owner.deinit();
+    const got = try config.getValue(allocator, &owner.view(), "log_level");
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(owner.view().log_level, got);
+}
+
+fn exerciseConfigReplacement(allocator: std.mem.Allocator, key: []const u8) !void {
+    var owner = try config.OwnedConfig.clone(allocator, .{
+        .model_id = "previous",
+        .model_path = "previous",
+        .log_level = "previous",
+    });
+    defer owner.deinit();
+    const previous = owner.view();
+    owner.setValue(key, "next") catch |err| {
+        try expectConfigEqual(previous, owner.view());
+        inline for (.{ "model_id", "model_path", "log_level" }) |field| {
+            try std.testing.expectEqualStrings("previous", @field(owner.view(), field));
+        }
+        return err;
+    };
+    const got = try config.getValue(allocator, &owner.view(), key);
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("next", got);
+}
+
+fn exerciseMalformedConfig(allocator: std.mem.Allocator) !void {
+    if (config.parse(allocator, "model_id='x'\ncontext_length=\"bad\"\n")) |result| {
+        var owner = result;
+        owner.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.ConfigInvalid, err);
+    }
+}
+
+test "ownership/config oom clone parse replacement and malformed cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigClone, .{config.default()});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigClone, .{config.Config{
+        .model_id = "previous",
+        .model_path = "/tmp/model.gguf",
+        .log_level = "debug",
+    }});
+    for ([_][]const u8{ "", "model_id='previous'\n", "model_path='/tmp/model.gguf'\n", "log_level='warn'\n", complete_fixture }) |input| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigParse, .{input});
+    }
+    inline for (.{ "model_id", "model_path", "log_level" }) |key| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigReplacement, .{key});
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseMalformedConfig, .{});
 }

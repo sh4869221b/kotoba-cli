@@ -9,6 +9,8 @@ const validation = @import("models/validation.zig");
 
 pub const Model = types.Model;
 pub const List = types.List;
+pub const OwnedList = types.OwnedList;
+pub const OwnedModel = types.OwnedModel;
 pub const HfSpec = huggingface.HfSpec;
 pub const url = @import("url.zig");
 

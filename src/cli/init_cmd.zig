@@ -9,7 +9,10 @@ const xdg = @import("../xdg.zig");
 const args = @import("args.zig");
 const models_cmd = @import("models_cmd.zig");
 
-pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
+    defer invocation_arena.deinit();
+    const allocator = invocation_arena.allocator();
     var cursor = args.ArgCursor.init(cmd_args);
     var model_id: []const u8 = "";
     var model_path: []const u8 = "";
@@ -31,7 +34,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     if (model_path.len > 0 and model_id.len == 0) model_id = "custom";
     if (model_id.len > 0) try models.validateId(model_id);
     if (explicit_model_path) try models.validateGgufPath(model_path);
-    const list = try models.loadReadOnly(allocator, paths.models_file);
+    var list_owner = try models.loadReadOnly(allocator, paths.models_file);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     if (!yes and model_id.len == 0 and model_path.len == 0) {
         printInitChoices(list);
         sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});
@@ -64,18 +69,19 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         selected_registry_model = registry_model;
     }
     var cfg = config.load(allocator, paths.config_file) catch |err| switch (err) {
-        error.NotInitialized => config.default(),
+        error.NotInitialized => try config.OwnedConfig.clone(allocator, config.default()),
         else => return err,
     };
-    cfg.model_id = model_id;
-    cfg.model_path = model_path;
+    defer cfg.deinit();
+    try cfg.setValue("model_id", model_id);
+    try cfg.setValue("model_path", model_path);
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
     try glossary.ensure(paths.glossary_file);
     if (selected_registry_model) |registry_model| {
         if (explicit_model_path) try models.upsert(allocator, paths.models_file, registry_model);
     }
-    try config.save(paths.config_file, cfg);
+    try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
     sys.stdoutPrint("initialized\n", .{});

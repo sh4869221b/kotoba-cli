@@ -1,6 +1,7 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 
+/// Every field borrows from the allocator passed to `paths`; cli.run keeps it alive for dispatch.
 pub const Paths = struct {
     config_dir: []const u8,
     data_dir: []const u8,

@@ -28,12 +28,14 @@ fn appendFmt(allocator: std.mem.Allocator, buf: *std.array_list.Managed(u8), com
 }
 
 test "prompt includes glossary" {
-    const g = try glossary.parse(std.heap.page_allocator,
+    var g_owner = try glossary.parse(std.testing.allocator,
         \\[[terms]]
         \\source = "CLI"
         \\target = "CLI"
         \\mode = "protect"
     );
+    defer g_owner.deinit();
+    const g = g_owner.view();
     const p = try build(std.testing.allocator, .en, .ja, .technical, g, "Hello `CLI`");
     defer std.testing.allocator.free(p);
     try std.testing.expect(std.mem.indexOf(u8, p, "CLI") != null);

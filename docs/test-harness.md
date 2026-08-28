@@ -247,8 +247,8 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The matrix currently records 332 measured CLI cases: translate 46, commands
-219, memory 22, files 45. Counts come from each run's `summary.json`; never
+The final Issue #54 matrix run records 334 measured CLI cases: translate 46,
+commands 221, memory 22, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
@@ -272,6 +272,25 @@ state includes column names, ordered row values and hit counts. The observer
 does not initialize or repair a database. `summary.json` lists every case and
 group count; `cleanup.json` records removed TMP and released lock ownership.
 Evidence contains synthetic source/translation fixtures; no user state is read.
+
+Issue #54 adds two real CLI characterizations without using a subprocess as
+an allocator measurement. `commands-config-string-replacements` performs five
+preparatory string replacements plus one measured final replacement in one
+initialized fixture, preserves their setup captures, and checks the final TOML
+value set. `commands-models-remove-then-use-removed`
+captures a successful removal, then proves a use of that removed ID returns
+`model_registry_invalid` without changing the reset config, registry, or
+managed-file state. The existing `files-atomic-native-prefix{,-absent}`
+failure receipts precede fresh-fixture `files-atomic-mode-{600,640}` successful
+publication receipts; their final evidence index does not claim recovery
+inside one CLI process or one persisted state.
+
+The matrix's JSON success cases prove the exposed empty `warnings` array,
+plain/Markdown/JSON serialization, and `--include-source`. A nonempty warning
+is currently covered by direct `OwnedResult` and Markdown component tests,
+because the deterministic CLI path does not expose one without changing output
+routing or the backend. The matrix therefore makes no invented nonempty-warning
+CLI claim.
 
 
 The commands group includes `strict61-` persistence cases: exact config
