@@ -16,6 +16,7 @@ const memory = @import("memory.zig");
 const models = @import("models.zig");
 const net = @import("net.zig");
 const output = @import("output.zig");
+const ownership_test_support = @import("ownership_test_support.zig");
 const prompt = @import("prompt.zig");
 const fs = @import("fs.zig");
 const translate = @import("translate.zig");
@@ -59,6 +60,7 @@ test {
     std.testing.refAllDecls(models);
     std.testing.refAllDecls(net);
     std.testing.refAllDecls(output);
+    std.testing.refAllDecls(ownership_test_support);
     std.testing.refAllDecls(prompt);
     std.testing.refAllDecls(fs);
     std.testing.refAllDecls(translate);
