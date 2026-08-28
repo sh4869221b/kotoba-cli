@@ -208,6 +208,25 @@ PY
   matrix_assert json success
   matrix_assert json-values '{"translated_text":"JA:Hello","cached_segments":0,"total_segments":1}'
   matrix_finish
+  local permission_variant permission_status
+  for permission_variant in normal signal; do
+    matrix_case "helper-permission-$permission_variant" helper
+    printf 'preserved bytes\n' >"$CASE_ROOT/work/denied"
+    export CASE_DENY_READ="$CASE_ROOT/work/denied"
+    permission_status=0
+    if [[ "$permission_variant" == signal ]]; then permission_status=143; fi
+    matrix_run -c '[[ ! -r "$1" ]] || exit 9; if [[ "$2" == signal ]]; then kill -TERM "$$"; fi' bash "$CASE_DENY_READ" "$permission_variant"
+    matrix_assert status "$permission_status"
+    matrix_assert fs-equal
+    matrix_assert db-equal
+    matrix_assert custom permission-restored python3 - "$CASE_DIR/receipt.json" <<'CHECK'
+import json, sys
+p = json.load(open(sys.argv[1]))['permission']
+assert p['uid'] == p['euid'] != 0 and p['execution_mode'] == 0 and p['restored']
+print(json.dumps(p))
+CHECK
+    matrix_finish
+  done
   local kind payload
   for kind in error doctor success-source; do
     case "$kind" in
@@ -235,7 +254,7 @@ assert json.loads((wal_noop / "db-before.json").read_text()) == json.loads((wal_
 assert int((wal_mutation / "wal-sidecar-rejection.status").read_text()) != 0
 assert (wal_mutation / "fs-before.json").read_bytes() != (wal_mutation / "fs-after.json").read_bytes()
 (root / "self-test.json").write_text(json.dumps({"level": "helper", "rejected": rejections, "absent_db_stayed_absent": True,
-                                               "positive_captures": 9, "product_coverage": False,
+                                               "positive_captures": len(list((root / "cases").glob("*/receipt.json"))), "product_coverage": False,
                                                "wal_observer": "skipped unsafe WAL/header/sidecar without SQLite open",
                                                "wal_sidecar_mutation_rejected": True}) + "\n")
 PY

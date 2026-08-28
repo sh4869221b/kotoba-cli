@@ -243,8 +243,9 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The matrix currently has 155 measured CLI cases: translate 39, commands 65,
-memory 17, files 34. Setup calls are captured separately, not counted as cases.
+The measured case counts come from each run's `summary.json`; never infer a
+pass from a historical total. Setup calls are captured separately, not counted
+as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
 unfinished cases, failed assertions and harness timeouts fail the suite.
 The per-command limit is 120 seconds and the suite limit is 20 minutes. A
@@ -266,6 +267,28 @@ state includes column names, ordered row values and hit counts. The observer
 does not initialize or repair a database. `summary.json` lists every case and
 group count; `cleanup.json` records removed TMP and released lock ownership.
 Evidence contains synthetic source/translation fixtures; no user state is read.
+
+
+The commands group includes `strict61-` persistence cases: exact config
+set/get and registry string round trips checked by independent `tomllib`,
+malformed/unknown/duplicate/schema state, native directory/size/permission
+errors, and human/JSON doctor reports. Each rejected-operation case seeds an
+actual SQLite row and requires exact exit/stdout/stderr plus equal filesystem bytes, modes,
+entries, mtimes, and logical database state. The operation matrix includes
+init, use, remove, import with `--use`, registered/direct-URL/Hugging Face
+pulls with `--use` (including HF metadata discovery), config set and model
+list. Failed preflight must return before acquisition; these cases require no
+model or remote service.
+
+For native permission cases the observer runs as an ordinary non-root UID.
+It snapshots readable state, changes only the target file to mode `000` for
+the actual child, and restores its original mode in `finally` before the
+second snapshot. `receipt.json.permission` distinguishes snapshot and execution
+modes and records UID/EUID and restoration. A root-run suite fails explicitly
+instead of silently skipping this proof. The helper self-test exercises both
+normal child completion and a signal-terminated child; it is observer coverage,
+not product coverage. These are pre-read permission faults, not mid-write
+atomicity or crash-durability tests.
 
 JSON assertions parse the real stdout. Success has exactly `source_lang`,
 `target_lang`, `mode`, `model_id`, `runtime`, `cached`, `cache_status`,

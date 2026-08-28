@@ -316,3 +316,23 @@ Three approaches were considered:
 This choice adds no runtime dependency and does not introduce a schema field.
 It is a persistence contract for the existing Linux CPU Zig CLI and its local
 XDG state, not a promise to accept every TOML document.
+
+
+## Verification surfaces
+
+```bash
+mise exec -- bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/strict-toml"
+```
+
+The existing commands matrix contains `strict61-` receipts for real config
+set/get and registry writes,
+independent standard-library TOML decoding, exact error streams, doctor
+reports, and failed-mutation filesystem/mtime/SQLite preservation. Permission
+cases require an ordinary non-root UID, deny reads only while the measured
+child runs, and record restoration separately from snapshots. See the
+[CLI matrix contract](test-harness.md#cli-contract-matrix) for capture and
+cleanup details. Component tests additionally cover finite f32 bit equality,
+parser tables, allocation failures, and canonical URL byte stability; CLI
+receipts do not stand in for those component guarantees. No check here claims
+real-model translation quality, external transfer success, atomic replacement,
+or transaction safety.

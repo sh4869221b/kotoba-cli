@@ -156,7 +156,7 @@ def doctor(json_format: bool, missing: bool = False, unsafe: bool = True, label:
             assert any(check["name"] == "model_checksum" and check["status"] == "ok" for check in document["checks"])
     else:
         assert raw.decode().count("warn: model_source_credentials: " + warning + "\n") == int(unsafe)
-        assert (b"error: config: config.toml is missing or invalid\n" in raw) == missing
+        assert (b"error: config: Kotoba is not initialized. Run `kotoba init`.\n" in raw) == missing
     unchanged(before, label)
 
 
