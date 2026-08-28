@@ -8,7 +8,10 @@ const translate = @import("../translate.zig");
 const xdg = @import("../xdg.zig");
 const args = @import("args.zig");
 
-pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
+    defer invocation_arena.deinit();
+    const allocator = invocation_arena.allocator();
     var cursor = args.ArgCursor.init(cmd_args);
     var opts = translate.Options{};
     while (cursor.peek()) |a| {
@@ -60,7 +63,7 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
     }
     const kind = translate.readKindForOptions(opts.format, opts.file_path);
-    var result_owner = try translate.run(allocator, paths, cfg, opts);
+    var result_owner = try translate.run(original_allocator, paths, cfg, opts);
     defer result_owner.deinit();
     const res = result_owner.view();
     if (try translate.writeOutput(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;

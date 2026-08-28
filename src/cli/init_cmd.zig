@@ -9,7 +9,10 @@ const xdg = @import("../xdg.zig");
 const args = @import("args.zig");
 const models_cmd = @import("models_cmd.zig");
 
-pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
+    defer invocation_arena.deinit();
+    const allocator = invocation_arena.allocator();
     var cursor = args.ArgCursor.init(cmd_args);
     var model_id: []const u8 = "";
     var model_path: []const u8 = "";

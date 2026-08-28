@@ -7,7 +7,10 @@ const sys = @import("../sys.zig");
 const xdg = @import("../xdg.zig");
 const args = @import("args.zig");
 
-pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
+    defer invocation_arena.deinit();
+    const allocator = invocation_arena.allocator();
     if (cmd_args.len < 1) return errors.Error.InvalidArguments;
     const sub = cmd_args[0];
     if (std.mem.eql(u8, sub, "list")) {
@@ -127,6 +130,7 @@ fn runPull(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     return runPullWithAcquirer(allocator, paths, cmd_args, models.acquire);
 }
 
+/// `allocator` is the public adapter's invocation arena; no command graph escapes this call.
 fn runPullWithAcquirer(
     allocator: std.mem.Allocator,
     paths: xdg.Paths,

@@ -4,7 +4,10 @@ const errors = @import("../errors.zig");
 const sys = @import("../sys.zig");
 const xdg = @import("../xdg.zig");
 
-pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
+    defer invocation_arena.deinit();
+    const allocator = invocation_arena.allocator();
     if (cmd_args.len < 1) return errors.Error.InvalidArguments;
     if (std.mem.eql(u8, cmd_args[0], "list")) {
         if (cmd_args.len != 1) return errors.Error.InvalidArguments;

@@ -29,16 +29,19 @@ const url = @import("url.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const args = try init.minimal.args.toSlice(allocator);
-
-    const exit_code = cli.run(allocator, args) catch |err| blk: {
-        const app_err = errors.fromError(err);
-        if (cli.errorPrefersJson(args)) {
-            errors.writeJson(app_err);
-        } else {
-            errors.printHuman(app_err);
-        }
-        break :blk app_err.exitCode();
+    var argv_arena = std.heap.ArenaAllocator.init(allocator);
+    const exit_code = blk: {
+        defer argv_arena.deinit();
+        const args = try init.minimal.args.toSlice(argv_arena.allocator());
+        break :blk cli.run(allocator, args) catch |err| err_blk: {
+            const app_err = errors.fromError(err);
+            if (cli.errorPrefersJson(args)) {
+                errors.writeJson(app_err);
+            } else {
+                errors.printHuman(app_err);
+            }
+            break :err_blk app_err.exitCode();
+        };
     };
     std.process.exit(exit_code);
 }
