@@ -8,6 +8,8 @@ const validation = @import("validation.zig");
 
 pub const Model = types.Model;
 pub const List = types.List;
+pub const OwnedList = types.OwnedList;
+pub const OwnedModel = types.OwnedModel;
 
 pub fn defaultTemplate() []const u8 {
     return
@@ -51,16 +53,17 @@ pub fn defaultTemplate() []const u8 {
 pub fn ensure(path: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    _ = load(arena.allocator(), path) catch |err| switch (err) {
+    var owner = load(arena.allocator(), path) catch |err| switch (err) {
         error.NotInitialized => {
             try sys.writeFile(path, defaultTemplate());
             return;
         },
         else => return err,
     };
+    defer owner.deinit();
 }
 
-pub fn load(allocator: std.mem.Allocator, path: []const u8) !List {
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !OwnedList {
     const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return errors.Error.NotInitialized,
         else => return err,
@@ -69,7 +72,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !List {
     return parse(allocator, data);
 }
 
-pub fn loadReadOnly(allocator: std.mem.Allocator, path: []const u8) !List {
+pub fn loadReadOnly(allocator: std.mem.Allocator, path: []const u8) !OwnedList {
     const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return parse(allocator, defaultTemplate()),
         else => return err,
@@ -96,7 +99,7 @@ const Field = enum {
     notes,
 };
 
-pub fn parse(allocator: std.mem.Allocator, data: []const u8) !List {
+pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedList {
     return parseStrict(allocator, data) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.ModelsSchemaUnsupported => error.ModelsSchemaUnsupported,
@@ -104,7 +107,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !List {
     };
 }
 
-fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !List {
+fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedList {
     var items = std.array_list.Managed(Model).init(allocator);
     errdefer {
         freeParsedModels(allocator, items.items);
@@ -113,8 +116,8 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !List {
     // IDs borrow decoded model strings; the set owns only its backing storage.
     var ids = std.StringHashMap(void).init(allocator);
     defer ids.deinit();
-    var current: ?Model = null;
-    errdefer if (current) |m| freeParsedModel(allocator, m);
+    var current: ?OwnedModel = null;
+    errdefer if (current) |*m| m.deinit();
     var seen = [_]bool{false} ** std.meta.fields(Field).len;
     var reader: strict.Reader = .{ .data = data };
     while (try reader.next()) |line| {
@@ -123,14 +126,14 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !List {
                 if (strict.isSchemaMarker(header.name)) return error.ModelsSchemaUnsupported;
                 if (!header.array or !std.mem.eql(u8, header.name, "models")) return error.Invalid;
                 try finishModel(&items, &ids, &current);
-                current = try parsedModelDefaults(allocator);
+                current = try OwnedModel.clone(allocator, .{});
                 @memset(&seen, false);
                 continue;
             },
             .pair => |pair| pair,
         };
         if (strict.isSchemaMarker(pair.key)) return error.ModelsSchemaUnsupported;
-        const model = if (current) |*m| m else return error.Invalid;
+        const model = if (current) |*m| &m.value else return error.Invalid;
         const field = std.meta.stringToEnum(Field, pair.key) orelse return error.Invalid;
         if (seen[@intFromEnum(field)]) return error.Invalid;
         seen[@intFromEnum(field)] = true;
@@ -146,11 +149,12 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !List {
         }
     }
     try finishModel(&items, &ids, &current);
-    return .{ .models = try items.toOwnedSlice() };
+    return .{ .allocator = allocator, .value = .{ .models = try items.toOwnedSlice() } };
 }
 
-fn finishModel(items: *std.array_list.Managed(Model), ids: *std.StringHashMap(void), current: *?Model) !void {
-    const model = current.* orelse return;
+fn finishModel(items: *std.array_list.Managed(Model), ids: *std.StringHashMap(void), current: *?OwnedModel) !void {
+    const owner = current.* orelse return;
+    const model = owner.view();
     try validation.validateId(model.id);
     const entry = try ids.getOrPut(model.id);
     if (entry.found_existing) return error.Invalid;
@@ -158,6 +162,7 @@ fn finishModel(items: *std.array_list.Managed(Model), ids: *std.StringHashMap(vo
     current.* = null;
 }
 
+/// Returns a view borrowed until its list owner is mutated or deinitialized.
 pub fn find(list: List, id: []const u8) ?Model {
     for (list.models) |m| {
         if (std.mem.eql(u8, m.id, id)) return m;
@@ -175,46 +180,55 @@ pub fn installedPath(allocator: std.mem.Allocator, models_dir: []const u8, id: [
 pub fn upsert(allocator: std.mem.Allocator, registry_path: []const u8, model: Model) !void {
     try validation.validateId(model.id);
     var list = try load(allocator, registry_path);
-    var replaced = false;
-    for (list.models) |*m| {
+    defer list.deinit();
+    var replacement = try OwnedModel.clone(allocator, model);
+    var transferred = false;
+    defer if (!transferred) replacement.deinit();
+    for (list.value.models) |*m| {
         if (std.mem.eql(u8, m.id, model.id)) {
-            m.* = model;
-            replaced = true;
+            var old: OwnedModel = .{ .allocator = allocator, .value = m.* };
+            m.* = replacement.value;
+            transferred = true;
+            old.deinit();
             break;
         }
     }
-    if (!replaced) {
+    if (!transferred) {
         var items = std.array_list.Managed(Model).init(allocator);
-        errdefer items.deinit();
-        try items.appendSlice(list.models);
-        try items.append(model);
-        list.models = try items.toOwnedSlice();
+        defer items.deinit();
+        try items.appendSlice(list.value.models);
+        try items.append(replacement.value);
+        const next = try items.toOwnedSlice();
+        allocator.free(list.value.models);
+        list.value.models = next;
+        transferred = true;
     }
-    try save(registry_path, list);
+    try saveWithAllocator(allocator, registry_path, list.view());
 }
 
-pub fn removeById(allocator: std.mem.Allocator, registry_path: []const u8, id: []const u8) !Model {
+/// Transfers an independent clone to the caller only after save succeeds.
+pub fn removeById(allocator: std.mem.Allocator, registry_path: []const u8, id: []const u8) !OwnedModel {
     try validation.validateId(id);
-    const list = try load(allocator, registry_path);
+    var list = try load(allocator, registry_path);
+    defer list.deinit();
+    const found = find(list.view(), id) orelse return errors.Error.ModelRegistryInvalid;
+    var removed = try OwnedModel.clone(allocator, found);
+    errdefer removed.deinit();
     var items = std.array_list.Managed(Model).init(allocator);
-    errdefer items.deinit();
-    var removed: ?Model = null;
-    for (list.models) |m| {
-        if (std.mem.eql(u8, m.id, id)) {
-            removed = m;
-        } else {
-            try items.append(m);
-        }
+    defer items.deinit();
+    for (list.view().models) |m| {
+        if (!std.mem.eql(u8, m.id, id)) try items.append(m);
     }
-    const found = removed orelse return errors.Error.ModelRegistryInvalid;
-    const kept = try items.toOwnedSlice();
-    errdefer allocator.free(kept);
-    try save(registry_path, .{ .models = kept });
-    return found;
+    try saveWithAllocator(allocator, registry_path, .{ .models = items.items });
+    return removed;
 }
 
 pub fn save(path: []const u8, list: List) !void {
-    var out = strict.Buffer.init(std.heap.page_allocator);
+    return saveWithAllocator(std.heap.page_allocator, path, list);
+}
+
+fn saveWithAllocator(allocator: std.mem.Allocator, path: []const u8, list: List) !void {
+    var out = strict.Buffer.init(allocator);
     defer out.deinit();
     validateModels(out.allocator, list) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -240,54 +254,17 @@ fn validateModels(allocator: std.mem.Allocator, list: List) !void {
     }
 }
 
-fn parsedModelDefaults(allocator: std.mem.Allocator) !Model {
-    var model: Model = .{};
-    errdefer freeParsedModel(allocator, model);
-    model.id = try allocator.dupe(u8, "");
-    model.name = try allocator.dupe(u8, "");
-    model.profile = try allocator.dupe(u8, "custom");
-    model.format = try allocator.dupe(u8, "gguf");
-    model.quantization = try allocator.dupe(u8, "");
-    model.size = try allocator.dupe(u8, "");
-    model.path = try allocator.dupe(u8, "");
-    model.download_url = try allocator.dupe(u8, "");
-    model.source_url = try allocator.dupe(u8, "");
-    model.checksum = try allocator.dupe(u8, "");
-    model.license = try allocator.dupe(u8, "");
-    model.notes = try allocator.dupe(u8, "");
-    return model;
-}
-
 fn replaceString(allocator: std.mem.Allocator, field: *[]const u8, value: []const u8) !void {
     const next = try strict.parseString(allocator, value);
-    freeOwnedString(allocator, field.*);
+    allocator.free(field.*);
     field.* = next;
 }
 
 fn freeParsedModels(allocator: std.mem.Allocator, models: []Model) void {
-    for (models) |m| freeParsedModel(allocator, m);
-}
-
-fn freeParsedModel(allocator: std.mem.Allocator, m: Model) void {
-    freeOwnedString(allocator, m.id);
-    freeOwnedString(allocator, m.name);
-    freeOwnedString(allocator, m.profile);
-    freeOwnedString(allocator, m.format);
-    freeOwnedString(allocator, m.quantization);
-    freeOwnedString(allocator, m.size);
-    freeOwnedString(allocator, m.path);
-    freeOwnedString(allocator, m.download_url);
-    freeOwnedString(allocator, m.source_url);
-    freeOwnedString(allocator, m.checksum);
-    freeOwnedString(allocator, m.license);
-    freeOwnedString(allocator, m.notes);
-}
-
-fn freeOwnedString(allocator: std.mem.Allocator, value: []const u8) void {
-    if (value.len == 0 and value.ptr == "".ptr) return;
-    if (std.mem.eql(u8, value, "custom") and value.ptr == "custom".ptr) return;
-    if (std.mem.eql(u8, value, "gguf") and value.ptr == "gguf".ptr) return;
-    allocator.free(value);
+    for (models) |m| {
+        var owner: OwnedModel = .{ .allocator = allocator, .value = m };
+        owner.deinit();
+    }
 }
 
 fn appendModel(out: *std.array_list.Managed(u8), m: Model) !void {
@@ -330,14 +307,16 @@ fn appendFmt(out: *std.array_list.Managed(u8), comptime fmt: []const u8, args: a
 }
 
 test "parse model list" {
-    const list = try parse(std.heap.page_allocator, defaultTemplate());
+    var list_owner = try parse(std.testing.allocator, defaultTemplate());
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expect(list.models.len >= 1);
     try std.testing.expect(find(list, "custom") != null);
 }
 
 test "strict registry baseline preserves plain fields defaults and raw URLs" {
     const allocator = std.testing.allocator;
-    const list = try parse(allocator,
+    var list_owner = try parse(allocator,
         \\[[models]]
         \\id = "baseline61"
         \\name = "Baseline model"
@@ -357,8 +336,8 @@ test "strict registry baseline preserves plain fields defaults and raw URLs" {
         \\[[models]]
         \\id = "defaults61"
     );
-    defer allocator.free(list.models);
-    defer freeParsedModels(allocator, list.models);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expectEqual(@as(usize, 2), list.models.len);
     try std.testing.expectEqualDeep(Model{
         .id = "baseline61",
@@ -390,14 +369,18 @@ test "load read only uses the default template only for missing registries" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     const missing_path = try std.fs.path.join(allocator, &.{ root, "missing", "models.toml" });
 
-    const missing = try loadReadOnly(allocator, missing_path);
+    var missing_owner = try loadReadOnly(allocator, missing_path);
+    defer missing_owner.deinit();
+    const missing = missing_owner.view();
     try std.testing.expectEqual(@as(usize, 2), missing.models.len);
     try std.testing.expect(find(missing, "custom") != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
 
     const registry_path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
     try sys.writeFile(registry_path, defaultTemplate());
-    const existing = try loadReadOnly(allocator, registry_path);
+    var existing_owner = try loadReadOnly(allocator, registry_path);
+    defer existing_owner.deinit();
+    const existing = existing_owner.view();
     try std.testing.expectEqual(@as(usize, 2), existing.models.len);
     try std.testing.expect(find(existing, "example-light") != null);
 
@@ -415,7 +398,9 @@ test "strict registry loaders distinguish missing files and ensure creates defau
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     const path = try std.fs.path.join(allocator, &.{ root, "missing", "models.toml" });
     try std.testing.expectError(error.NotInitialized, load(allocator, path));
-    try std.testing.expectEqual(@as(usize, 2), (try loadReadOnly(allocator, path)).models.len);
+    var defaults = try loadReadOnly(allocator, path);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 2), defaults.view().models.len);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
     try std.testing.expectError(error.FileNotFound, ensure(path));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
@@ -470,7 +455,9 @@ test "strict registry ensure preserves existing bytes and loaders preserve alloc
     try sys.writeFile(path, data);
     try ensure(path);
     try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
-    try std.testing.expectEqualStrings("existing", (try load(allocator, path)).models[0].id);
+    var existing = try load(allocator, path);
+    defer existing.deinit();
+    try std.testing.expectEqualStrings("existing", existing.view().models[0].id);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), path));
     try std.testing.expectError(error.OutOfMemory, loadReadOnly(failing.allocator(), path));
@@ -518,7 +505,7 @@ test "registry upsert and remove round trip" {
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy.gguf" });
     defer std.testing.allocator.free(model_path);
     try save(path, .{ .models = &.{} });
-    try upsert(std.heap.page_allocator, path, .{
+    try upsert(std.testing.allocator, path, .{
         .id = "toy",
         .name = "Toy",
         .profile = "local",
@@ -531,12 +518,18 @@ test "registry upsert and remove round trip" {
     const saved = try sys.readFileAlloc(std.testing.allocator, path, 2 * 1024 * 1024);
     defer std.testing.allocator.free(saved);
     try std.testing.expect(std.mem.indexOf(u8, saved, "KOTOBA_QUERY_SECRET_36") == null);
-    const list = try load(std.heap.page_allocator, path);
+    var list_owner = try load(std.testing.allocator, path);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(model_path, toy.path);
-    const removed = try removeById(std.heap.page_allocator, path, "toy");
+    var removed_owner = try removeById(std.testing.allocator, path, "toy");
+    defer removed_owner.deinit();
+    const removed = removed_owner.view();
     try std.testing.expectEqualStrings("toy", removed.id);
-    const after = try load(std.heap.page_allocator, path);
+    var after_owner = try load(std.testing.allocator, path);
+    defer after_owner.deinit();
+    const after = after_owner.view();
     try std.testing.expect(find(after, "toy") == null);
 }
 
@@ -553,10 +546,12 @@ test "registry upsert replaces existing model fields" {
     defer std.testing.allocator.free(second_model_path);
     try save(path, .{ .models = &.{} });
 
-    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy", .path = first_model_path });
-    try upsert(std.heap.page_allocator, path, .{ .id = "toy", .name = "Toy v2", .path = second_model_path });
+    try upsert(std.testing.allocator, path, .{ .id = "toy", .name = "Toy", .path = first_model_path });
+    try upsert(std.testing.allocator, path, .{ .id = "toy", .name = "Toy v2", .path = second_model_path });
 
-    const list = try load(std.heap.page_allocator, path);
+    var list_owner = try load(std.testing.allocator, path);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expectEqual(@as(usize, 1), list.models.len);
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("Toy v2", toy.name);
@@ -572,7 +567,7 @@ test "registry upsert preserves missing registry errors" {
     defer std.testing.allocator.free(path);
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy.gguf" });
     defer std.testing.allocator.free(model_path);
-    try std.testing.expectError(errors.Error.NotInitialized, upsert(std.heap.page_allocator, path, .{
+    try std.testing.expectError(errors.Error.NotInitialized, upsert(std.testing.allocator, path, .{
         .id = "toy",
         .name = "Toy",
         .profile = "local",
@@ -599,12 +594,16 @@ test "registries with identical model IDs remain independent" {
 
     try save(left_path, .{ .models = &.{} });
     try save(right_path, .{ .models = &.{} });
-    try upsert(std.heap.page_allocator, left_path, .{ .id = "same", .name = "left" });
-    try upsert(std.heap.page_allocator, right_path, .{ .id = "same", .name = "right" });
+    try upsert(std.testing.allocator, left_path, .{ .id = "same", .name = "left" });
+    try upsert(std.testing.allocator, right_path, .{ .id = "same", .name = "right" });
 
-    const left = find(try load(std.heap.page_allocator, left_path), "same") orelse return error.TestExpectedEqual;
+    var left_owner = try load(std.testing.allocator, left_path);
+    defer left_owner.deinit();
+    const left = find(left_owner.view(), "same") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("left", left.name);
-    const right = find(try load(std.heap.page_allocator, right_path), "same") orelse return error.TestExpectedEqual;
+    var right_owner = try load(std.testing.allocator, right_path);
+    defer right_owner.deinit();
+    const right = find(right_owner.view(), "same") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("right", right.name);
 }
 
@@ -661,16 +660,23 @@ test "secret URL registry writes sanitize all entries" {
         try appendStringField(&fixture, "download_url", &oversized);
         try appendStringField(&fixture, "source_url", &oversized);
         try sys.writeFile(path, fixture.items);
-        const before = try load(allocator, path);
+        var before_owner = try load(allocator, path);
+        defer before_owner.deinit();
+        const before = before_owner.view();
         switch (operation) {
             0 => try save(path, before),
             1 => try upsert(allocator, path, .{ .id = "new", .name = "Unrelated import" }),
-            2 => _ = try removeById(allocator, path, "other"),
+            2 => {
+                var removed = try removeById(allocator, path, "other");
+                removed.deinit();
+            },
             else => unreachable,
         }
         const saved = try sys.readFileAlloc(allocator, path, 2 * 1024 * 1024);
         try std.testing.expect(std.mem.indexOf(u8, saved, "KOTOBA_") == null);
-        const after = try parse(allocator, saved);
+        var after_owner = try parse(allocator, saved);
+        defer after_owner.deinit();
+        const after = after_owner.view();
         const original = find(before, "legacy").?;
         const migrated = find(after, "legacy").?;
         try std.testing.expectEqualStrings("", migrated.download_url);
@@ -720,9 +726,9 @@ test "secret URL registry read is nonmutating" {
     const path = try std.fs.path.join(allocator, &.{ root, "registry.toml" });
     defer allocator.free(path);
     try sys.writeFile(path, legacy_url_fixture);
-    const list = try load(allocator, path);
-    defer allocator.free(list.models);
-    defer freeParsedModels(allocator, list.models);
+    var list_owner = try load(allocator, path);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expect(std.mem.indexOf(u8, find(list, "legacy").?.download_url, "KOTOBA_PASSWORD_36") != null);
     try std.testing.expect(std.mem.indexOf(u8, find(list, "signed").?.source_url, "KOTOBA_USER_36") != null);
     const after = try sys.readFileAlloc(allocator, path, 2 * 1024 * 1024);
@@ -757,7 +763,9 @@ test "secret URL source identity is never reusable" {
         var original = case.model;
         original.id = "source";
         try appendModel(&out, original);
-        const model = (try parse(allocator, out.items)).models[0];
+        var parsed = try parse(allocator, out.items);
+        defer parsed.deinit();
+        const model = parsed.view().models[0];
         try std.testing.expectEqualStrings(case.expected_source, model.source_url);
         try std.testing.expectEqualStrings("", model.download_url);
         var second = std.array_list.Managed(u8).init(allocator);
@@ -775,7 +783,9 @@ test "secret URL registry preserves local metadata" {
             var out = std.array_list.Managed(u8).init(allocator);
             const original: Model = .{ .id = "local", .path = "/installed/model?#.gguf", .download_url = download, .source_url = source, .checksum = "abc123" };
             try appendModel(&out, original);
-            const model = (try parse(allocator, out.items)).models[0];
+            var parsed = try parse(allocator, out.items);
+            defer parsed.deinit();
+            const model = parsed.view().models[0];
             try std.testing.expectEqualStrings(download, model.download_url);
             try std.testing.expectEqualStrings(if (source.len > 0) source else if (url.isRemote(download)) download else "", model.source_url);
             try std.testing.expectEqualStrings(original.id, model.id);
@@ -791,13 +801,13 @@ fn checkSourceOwnership(allocator: std.mem.Allocator) !void {
         "[[models]]\nid = \"owned61\"\nname = \"Owned\\tname\"\n" ++
         "source_url = \"https://origin.example.invalid/owned\"\n" ++
         "notes = \"Decoded \\u65e5\\u672c\\u8a9e\"\nlanguages = [\"ja\",\"en\",]\n");
-    const list = parse(allocator, data) catch |err| {
+    var list_owner = parse(allocator, data) catch |err| {
         allocator.free(data);
         return err;
     };
     allocator.free(data);
-    defer allocator.free(list.models);
-    defer freeParsedModels(allocator, list.models);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expectEqualStrings("https://origin.example.invalid/final", find(list, "http").?.source_url);
     try std.testing.expectEqualStrings("", find(list, "legacy").?.source_url);
     try std.testing.expectEqualStrings("Owned\tname", find(list, "owned61").?.name);
@@ -926,9 +936,11 @@ test "strict registry canonical model round trip" {
     const path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
     const text = "日本語 🐈 \"quoted\" \\ # =\n\r\t\x08\x0c\x01\x1f\x7f";
     try save(path, .{ .models = &.{} });
-    try std.testing.expectEqual(@as(usize, 0), (try load(allocator, path)).models.len);
+    var empty = try load(allocator, path);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.view().models.len);
     const empty_bytes = try sys.readFileAlloc(allocator, path, 8192);
-    try save(path, try load(allocator, path));
+    try save(path, empty.view());
     try std.testing.expectEqualStrings(empty_bytes, try sys.readFileAlloc(allocator, path, 8192));
     for (0..4) |flags| {
         for ([_][]const u8{ "/local/model?#.gguf", "file:///local/model?#.gguf", "https://models.example.invalid/model%2Bname.gguf" }) |download| {
@@ -952,7 +964,9 @@ test "strict registry canonical model round trip" {
             }};
             try save(path, .{ .models = &originals });
             const bytes = try sys.readFileAlloc(allocator, path, 8192);
-            const loaded = try load(allocator, path);
+            var loaded_owner = try load(allocator, path);
+            defer loaded_owner.deinit();
+            const loaded = loaded_owner.view();
             try std.testing.expectEqualDeep(&originals, loaded.models);
             try save(path, loaded);
             try std.testing.expectEqualStrings(bytes, try sys.readFileAlloc(allocator, path, 8192));
@@ -964,13 +978,14 @@ test "strict registry canonical model round trip" {
 test "strict registry parses literal strings whitespace defaults and empty list" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "", "# empty\r\n\t\n" }) |input| {
-        const list = try parse(allocator, input);
-        defer allocator.free(list.models);
+        var list_owner = try parse(allocator, input);
+        defer list_owner.deinit();
+        const list = list_owner.view();
         try std.testing.expectEqual(@as(usize, 0), list.models.len);
     }
-    const list = try parse(allocator, "\t[[ models ]] # record\r\nid = \"case\\u0036\\U00000031\"\r\nname = 'C:\\日本語\\#=model'\r\nlanguages = ['ja', \"\\u0065n\",]\r\ncontext_length = +0\r\nrecommended = false\r\n[[models]]\nid = 'CASE61'\nlanguages = []");
-    defer allocator.free(list.models);
-    defer freeParsedModels(allocator, list.models);
+    var list_owner = try parse(allocator, "\t[[ models ]] # record\r\nid = \"case\\u0036\\U00000031\"\r\nname = 'C:\\日本語\\#=model'\r\nlanguages = ['ja', \"\\u0065n\",]\r\ncontext_length = +0\r\nrecommended = false\r\n[[models]]\nid = 'CASE61'\nlanguages = []");
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try std.testing.expectEqualDeep(Model{ .id = "case61", .name = "C:\\日本語\\#=model", .languages_en = true, .languages_ja = true }, list.models[0]);
     try std.testing.expectEqualDeep(Model{ .id = "CASE61" }, list.models[1]);
 }
@@ -1031,13 +1046,12 @@ test "strict registry ensure rejects corrupt state without changing bytes or ent
 }
 
 fn checkInvalidRegistryOwnership(allocator: std.mem.Allocator, data: []const u8, expected: anyerror) !void {
-    const list = parse(allocator, data) catch |err| {
+    var list_owner = parse(allocator, data) catch |err| {
         if (err == error.OutOfMemory) return err;
         try std.testing.expectEqual(expected, err);
         return;
     };
-    defer allocator.free(list.models);
-    defer freeParsedModels(allocator, list.models);
+    defer list_owner.deinit();
     return error.TestExpectedError;
 }
 
@@ -1050,4 +1064,160 @@ test "strict registry invalid records clean every allocation failure" {
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkInvalidRegistryOwnership, .{ "[[models]]\nid = 'complete'\nsource_url = 'one'\nsource_url = 'two'", error.ModelsInvalid });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkInvalidRegistryOwnership, .{ "[[models]]\nid = 'complete'\n[[models]]\nid = 'current'\nnotes = 'allocated'\nversion = 2", error.ModelsSchemaUnsupported });
+}
+
+const ownership_fixture = "[[models]]\nid = 'same'\nname = 'first'\nnotes = 'owned note'\n[[models]]\nid = 'kept'\n";
+
+test "ownership/registry lifecycle 2048 literal upserts and independent removal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "models.toml" });
+    defer a.free(path);
+    try sys.writeFile(path, "");
+    for (0..2048) |i| {
+        const literal: Model = .{ .id = "same", .name = if (i == 2047) "last" else "first", .context_length = @intCast(i) };
+        try upsert(a, path, literal);
+        try std.testing.expectEqualStrings("custom", literal.profile);
+    }
+    {
+        var list = try load(a, path);
+        defer list.deinit();
+        try std.testing.expectEqual(@as(usize, 1), list.view().models.len);
+        const last = find(list.view(), "same").?;
+        try std.testing.expectEqualStrings("last", last.name);
+        try std.testing.expectEqual(@as(u32, 2047), last.context_length);
+    }
+    var removed = try removeById(a, path, "same");
+    defer removed.deinit();
+    try std.testing.expectEqualStrings("last", removed.view().name);
+    try std.testing.expectEqualStrings("custom", removed.view().profile);
+    try std.testing.expectEqualStrings("gguf", removed.view().format);
+    var empty = try load(a, path);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.view().models.len);
+    try std.testing.expectError(error.ModelRegistryInvalid, removeById(a, path, "same"));
+    std.debug.print("registry pid={d} same-process upserts=2048 final_count=1 final_context=2047 removed=last\n", .{std.os.linux.getpid()});
+}
+
+test "ownership/registry lifecycle input and list destruction before removal use" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "models.toml" });
+    defer a.free(path);
+    try sys.writeFile(path, "");
+    {
+        const input = try a.dupe(u8, ownership_fixture);
+        defer a.free(input);
+        var list = try parse(a, input);
+        defer list.deinit();
+        try upsert(a, path, find(list.view(), "same").?);
+    }
+    var removed = try removeById(a, path, "same");
+    defer removed.deinit();
+    try std.testing.expectEqualStrings("first", removed.view().name);
+    try std.testing.expectEqualStrings("owned note", removed.view().notes);
+}
+
+fn exerciseRegistryParse(backing: std.mem.Allocator, data: []const u8, invalid: bool, runs: *usize) !void {
+    runs.* += 1;
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    var owner = parse(no_resize.allocator(), data) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        if (!invalid) return err;
+        try std.testing.expectEqual(error.ModelsInvalid, err);
+        return;
+    };
+    defer owner.deinit();
+    try std.testing.expect(!invalid);
+}
+
+fn exerciseModelClone(allocator: std.mem.Allocator, runs: *usize) !void {
+    runs.* += 1;
+    const literal: Model = .{ .id = "literal", .name = "name", .size = "small", .quantization = "Q4", .path = "local.gguf", .download_url = "file:///model.gguf", .source_url = "source", .checksum = "abc", .license = "MIT", .notes = "note" };
+    var owner = try OwnedModel.clone(allocator, literal);
+    defer owner.deinit();
+    try std.testing.expectEqualDeep(literal, owner.view());
+}
+
+const MutationCase = enum { append, replace, remove, missing, save_upsert, save_remove };
+
+fn exerciseRegistryMutation(backing: std.mem.Allocator, scenario: MutationCase, runs: *usize) !void {
+    runs.* += 1;
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const allocator = no_resize.allocator();
+    // Fixture setup uses the test allocator so every injected index reaches the operation.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "models.toml" });
+    defer a.free(path);
+    try sys.writeFile(path, ownership_fixture);
+    const file = try tmp.dir.openFile(std.testing.io, "models.toml", .{});
+    defer file.close(std.testing.io);
+    const save_error = scenario == .save_upsert or scenario == .save_remove;
+    if (save_error) try file.setPermissions(std.testing.io, .fromMode(0o400));
+    defer if (save_error) file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
+    switch (scenario) {
+        .append, .replace, .save_upsert => {
+            upsert(allocator, path, .{ .id = if (scenario == .append) "new" else "same", .name = "replacement" }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (!save_error) return err;
+                try std.testing.expectEqual(error.AccessDenied, err);
+                return;
+            };
+            try std.testing.expect(!save_error);
+        },
+        .remove, .missing, .save_remove => {
+            var removed = removeById(allocator, path, if (scenario == .missing) "absent" else "same") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                const expected: anyerror = if (scenario == .missing) error.ModelRegistryInvalid else if (save_error) error.AccessDenied else return err;
+                try std.testing.expectEqual(expected, err);
+                return;
+            };
+            defer removed.deinit();
+            try std.testing.expectEqualStrings("first", removed.view().name);
+            try std.testing.expect(!save_error and scenario != .missing);
+        },
+    }
+    var reloaded = try load(a, path);
+    defer reloaded.deinit();
+    if (scenario == .remove) {
+        try std.testing.expect(find(reloaded.view(), "same") == null);
+        try std.testing.expect(find(reloaded.view(), "kept") != null);
+    } else {
+        try std.testing.expectEqualStrings("replacement", find(reloaded.view(), if (scenario == .append) "new" else "same").?.name);
+    }
+    try expectOnlyEntry(tmp.dir, "models.toml");
+}
+
+test "ownership/registry failure exhaustive defaults clone parse and mutations" {
+    var runs: usize = 0;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseModelClone, .{&runs});
+    for ([_][]const u8{ "", "[[models]]\nid = 'defaults'", ownership_fixture, "[[models]]\nid = '1'\n[[models]]\nid = '2'\n[[models]]\nid = '3'\n[[models]]\nid = '4'\n[[models]]\nid = '5'\n[[models]]\nid = '6'\n[[models]]\nid = '7'\n[[models]]\nid = '8'\n[[models]]\nid = '9'", ownership_fixture ++ "[[models]]\nid = 'partial'\nnotes = 'one'\nnotes = 'duplicate'" }) |data| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseRegistryParse, .{ data, std.mem.endsWith(u8, data, "'duplicate'"), &runs });
+    }
+    inline for (std.meta.tags(MutationCase)) |scenario| {
+        const before = runs;
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseRegistryMutation, .{ scenario, &runs });
+        std.debug.print("registry OOM scenario={s} exercise_invocations={d} failed_alloc_indices=0..{d} resize_remap=denied\n", .{ @tagName(scenario), runs - before, runs - before - 2 });
+    }
+    try std.testing.expect(runs > 100);
+    std.debug.print("registry exhaustive exercise invocations={d}\n", .{runs});
+}
+
+test "ownership/registry failure replacement preserves previous value" {
+    const a = std.testing.allocator;
+    var previous: []const u8 = try a.dupe(u8, "previous");
+    defer a.free(previous);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, replaceString(failing.allocator(), &previous, "'next'"));
+    try std.testing.expectEqualStrings("previous", previous);
 }

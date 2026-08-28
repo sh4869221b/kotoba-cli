@@ -31,7 +31,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     if (model_path.len > 0 and model_id.len == 0) model_id = "custom";
     if (model_id.len > 0) try models.validateId(model_id);
     if (explicit_model_path) try models.validateGgufPath(model_path);
-    const list = try models.loadReadOnly(allocator, paths.models_file);
+    var list_owner = try models.loadReadOnly(allocator, paths.models_file);
+    defer list_owner.deinit();
+    const list = list_owner.view();
     if (!yes and model_id.len == 0 and model_path.len == 0) {
         printInitChoices(list);
         sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});

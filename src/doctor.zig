@@ -34,7 +34,7 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
 
     if (have_config) try checks.append(.{ .name = "llama_cpp", .status = .ok, .message = "embedded llama.cpp runtime is linked" });
 
-    const list = models.load(allocator, paths.models_file) catch |err| {
+    var list_owner = models.load(allocator, paths.models_file) catch |err| {
         const app_err = errors.fromError(err);
         try checks.append(.{ .name = "models", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
@@ -42,6 +42,8 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
         try appendModelChecks(allocator, null, cfg, &checks, &ok);
         return continueAfterModelCheck(allocator, paths, cfg, &checks, ok, json);
     };
+    defer list_owner.deinit();
+    const list = list_owner.view();
     try checks.append(.{ .name = "models", .status = .ok, .message = "models.toml is readable" });
     try appendUnsafeRemoteUrlCheck(list, &checks);
     if (!have_config) return print(allocator, checks.items, ok, json);
@@ -110,11 +112,12 @@ fn continueAfterModelCheck(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: 
         return print(allocator, checks.items, ok, json);
     };
     try checks.append(.{ .name = "memory", .status = .ok, .message = "memory DB is readable" });
-    _ = glossary.load(allocator, paths.glossary_file) catch {
+    var glossary_owner = glossary.load(allocator, paths.glossary_file) catch {
         try checks.append(.{ .name = "glossary", .status = .@"error", .code = "glossary_invalid", .message = "glossary.toml is invalid" });
         ok = false;
         return print(allocator, checks.items, ok, json);
     };
+    defer glossary_owner.deinit();
     try checks.append(.{ .name = "glossary", .status = .ok, .message = "glossary.toml is readable" });
     if (!cfg.privacy_mode) try checks.append(.{ .name = "privacy", .status = .warn, .message = "privacy_mode is disabled" }) else try checks.append(.{ .name = "privacy", .status = .ok, .message = "privacy_mode is enabled" });
     return print(allocator, checks.items, ok, json);

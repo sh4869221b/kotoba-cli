@@ -6,7 +6,9 @@ const xdg = @import("../xdg.zig");
 
 pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 1 or !std.mem.eql(u8, cmd_args[0], "validate")) return errors.Error.InvalidArguments;
-    const g = try glossary.load(allocator, paths.glossary_file);
+    var g_owner = try glossary.load(allocator, paths.glossary_file);
+    defer g_owner.deinit();
+    const g = g_owner.view();
     sys.stdoutPrint("terms: {d}\nhash: {x}\n", .{ g.terms.len, glossary.hash(g) });
     return 0;
 }

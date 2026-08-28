@@ -66,7 +66,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: config.Config, o
     const start = sys.millis();
 
     const read = try readInput(allocator, opts);
-    const g = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else glossary.Glossary{ .terms = &.{} };
+    var glossary_owner: ?glossary.OwnedGlossary = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else null;
+    defer if (glossary_owner) |*owner| owner.deinit();
+    const g = if (glossary_owner) |*owner| owner.view() else glossary.Glossary{ .terms = &.{} };
     const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, read.text);
     const mode = opts.mode orelse cfg.default_mode;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
