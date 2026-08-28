@@ -221,6 +221,44 @@ PY
     matrix_assert json "$kind"
     matrix_finish
   done
+  matrix_case helper-file-size-limit helper
+  for value in invalid 0 -1 1.5; do
+    CASE_FILE_SIZE_LIMIT="$value"
+    rc=0
+    matrix_run -c 'touch child-launched' >"$CASE_DIR/limit-$value.stdout" 2>"$CASE_DIR/limit-$value.stderr" || rc=$?
+    printf '%s\n' "$rc" >"$CASE_DIR/limit-$value.status"
+    [[ "$rc" == 2 && ! -e "$CASE_DIR/receipt.json" && ! -e child-launched ]]
+  done
+  CASE_FILE_SIZE_LIMIT=1024
+  matrix_run -c 'exec python3 -c "import resource; print(resource.getrlimit(resource.RLIMIT_FSIZE))"'
+  matrix_assert status 0
+  printf '(1024, 1024)\n' >"$CASE_DIR/expected.stdout"
+  matrix_assert stdout "$CASE_DIR/expected.stdout"
+  matrix_assert fs-equal
+  matrix_assert custom bounded-limit python3 - "$CASE_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+assert json.loads((root / "receipt.json").read_text())["file_size_limit_bytes"] == 1024
+assert all(int(path.read_text()) == 2 for path in root.glob("limit-*.status"))
+assert len(list(root.glob("limit-*.status"))) == 4
+print('{"invalid_limits_rejected_before_launch":4,"child_limit":1024}')
+PY
+  matrix_finish
+  matrix_case helper-file-size-reset helper
+  [[ -z "$CASE_FILE_SIZE_LIMIT" ]]
+  matrix_run -c 'printf "%4096s" X > unlimited-file'
+  matrix_assert status 0
+  matrix_assert custom reset-limit python3 - "$CASE_DIR" "$CASE_ROOT/work/unlimited-file" <<'PY'
+import json
+from pathlib import Path
+import sys
+assert json.loads((Path(sys.argv[1]) / "receipt.json").read_text())["file_size_limit_bytes"] is None
+assert Path(sys.argv[2]).stat().st_size == 4096
+print('{"next_case_limit":null,"native_file_length":4096}')
+PY
+  matrix_finish
   python3 - "$MATRIX_CAPTURE" <<'PY'
 import json
 from pathlib import Path
@@ -235,9 +273,10 @@ assert json.loads((wal_noop / "db-before.json").read_text()) == json.loads((wal_
 assert int((wal_mutation / "wal-sidecar-rejection.status").read_text()) != 0
 assert (wal_mutation / "fs-before.json").read_bytes() != (wal_mutation / "fs-after.json").read_bytes()
 (root / "self-test.json").write_text(json.dumps({"level": "helper", "rejected": rejections, "absent_db_stayed_absent": True,
-                                               "positive_captures": 9, "product_coverage": False,
+                                               "positive_captures": 11, "product_coverage": False,
                                                "wal_observer": "skipped unsafe WAL/header/sidecar without SQLite open",
-                                               "wal_sidecar_mutation_rejected": True}) + "\n")
+                                               "wal_sidecar_mutation_rejected": True, "invalid_limits_rejected": 4,
+                                               "file_size_limit_reset": True}) + "\n")
 PY
 }
 

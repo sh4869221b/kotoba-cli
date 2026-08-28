@@ -210,11 +210,17 @@ pub fn diagnosticsEnabled(cfg: config.Config, opts: Options) bool {
 }
 
 pub fn writeOutput(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
-    const target_path = explicit_output orelse if (read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else return false;
-    if (!overwrite) {
-        if (sys.exists(target_path)) return errors.Error.OutputExists;
-    }
-    try sys.writeFile(target_path, res.translated_text);
+    return writeOutputWithOptions(allocator, res, read_kind, file_path, explicit_output, .{ .mode = if (overwrite) .replace else .no_replace });
+}
+
+fn writeOutputWithOptions(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, options: sys.StagedFileOptions) !bool {
+    const owned_path = if (explicit_output == null and read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else null;
+    defer if (owned_path) |path| allocator.free(path);
+    const target_path = explicit_output orelse owned_path orelse return false;
+    sys.atomicWriteFile(allocator, target_path, res.translated_text, options) catch |err| switch (err) {
+        error.DestinationExists => return errors.Error.OutputExists,
+        else => return err,
+    };
     return true;
 }
 
@@ -323,7 +329,7 @@ test "writeOutput writes markdown default output path" {
         .total_segments = 1,
         .translated_text = "# 翻訳\n",
         .elapsed_ms = 1,
-    }, .markdown, src_path, out_path, false);
+    }, .markdown, src_path, null, false);
     try std.testing.expect(wrote);
     const written = try sys.readFileAlloc(std.testing.allocator, out_path, 1024 * 1024);
     defer std.testing.allocator.free(written);
@@ -353,6 +359,62 @@ test "writeOutput rejects existing destination without overwrite" {
     const preserved = try sys.readFileAlloc(std.testing.allocator, out_path, 1024);
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("old", preserved);
+}
+
+test "writeOutput failure boundaries propagate native errors without publication" {
+    const staged = @import("staged_output.zig");
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |existing| {
+        for ([_]staged.Faults.Operation{ .write, .flush, .sync, .close, .rename }) |operation| {
+            var tmp = std.testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+            defer allocator.free(root);
+            const target = try std.fs.path.join(allocator, &.{ root, "target" });
+            defer allocator.free(target);
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "UNRELATED" });
+            if (existing) try sys.writeFile(target, "OLD");
+            var faults = staged.Faults{};
+            const cause = if (operation == .write) error.NoSpaceLeft else error.InputOutput;
+            if (operation == .write) faults.prefix_remaining = 4 else try faults.arm(operation, 1, cause);
+            const result = writeOutputWithOptions(allocator, .{
+                .source_lang = .en,
+                .target_lang = .ja,
+                .mode = .default,
+                .model_id = "m",
+                .runtime = "embedded",
+                .cached_segments = 0,
+                .total_segments = 1,
+                .translated_text = "NEW-BYTES",
+                .elapsed_ms = 1,
+            }, .text, null, target, .{ .faults = &faults });
+            try std.testing.expectError(cause, result);
+            if (result) |_| unreachable else |err| {
+                const mapped = errors.fromError(err);
+                try std.testing.expectEqual(errors.Code.io_error, mapped.code);
+                try std.testing.expectEqualStrings(@errorName(cause), mapped.message);
+                try std.testing.expectEqual(@as(u8, 1), mapped.exitCode());
+            }
+            try std.testing.expectEqual(@as(usize, 0), faults.completedFor(.rename));
+            if (operation == .write) try std.testing.expectEqual(@as(usize, 4), faults.native_prefix_bytes);
+            if (existing) {
+                const bytes = try sys.readFileAlloc(allocator, target, 1024);
+                defer allocator.free(bytes);
+                try std.testing.expectEqualStrings("OLD", bytes);
+            } else try std.testing.expect((try sys.pathState(target)) == .not_found);
+            var entries = tmp.dir.iterate();
+            var count: usize = 0;
+            while (try entries.next(std.testing.io)) |entry| {
+                try std.testing.expect(std.mem.eql(u8, entry.name, "sibling") or (existing and std.mem.eql(u8, entry.name, "target")));
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, if (existing) 2 else 1), count);
+            const sibling = try tmp.dir.readFileAlloc(std.testing.io, "sibling", allocator, .limited(1024));
+            defer allocator.free(sibling);
+            try std.testing.expectEqualStrings("UNRELATED", sibling);
+            std.debug.print("[output-boundary] existing={any} operation={s} error={s} exit=1 published=0 entries={d} prefix={d}\n", .{ existing, @tagName(operation), @errorName(cause), count, faults.native_prefix_bytes });
+        }
+    }
 }
 
 test "result consumer frees failed partial payloads without appending or caching them" {
