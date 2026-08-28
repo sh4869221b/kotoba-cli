@@ -1,43 +1,36 @@
 # PROJECT KNOWLEDGE BASE
 
 ## OVERVIEW
-`src/` is the Zig application layer for the `kotoba` binary: command orchestration, config/XDG, translation flow, embedded llama.cpp session, model management, memory, and output.
-
-## STRUCTURE
-```text
-src/
-|-- main.zig          # process entry, error rendering, refAllDecls test root
-|-- cli.zig           # top-level command dispatch
-|-- cli/              # per-command argv parsing and command adapters
-|-- models.zig        # facade over model registry/download/checksum modules
-|-- models/           # model registry, install, HF URL, validation
-|-- translate.zig     # translation orchestrator
-|-- llama.zig         # embedded llama.cpp session and C API wrappers
-|-- backend.zig       # real vs build-time deterministic test backend
-|-- config.zig        # TOML config contract
-|-- memory.zig        # SQLite translation memory
-`-- sys.zig           # thin OS/std wrappers used by tests and commands
-```
+`src/` owns translation orchestration, runtime ownership, persistent state, and shared I/O boundaries; `cli/` and `models/` have their own guides.
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
 | --- | --- | --- |
-| Add a command | `src/cli.zig`, `src/cli/<name>_cmd.zig`, `README.md`, `docs/design-v1.md` | Dispatch in `cli.run`, parse in submodule. |
-| Change translate output | `src/translate.zig`, `src/output.zig`, `src/cli/translate_cmd.zig` | Preserve stdout contract. |
-| Change config | `src/config.zig`, `src/config_tests.zig`, `test/integration/smoke.sh` | Update settable keys and smoke assertions together. |
-| Change embedded runtime | `src/llama.zig`, `src/backend.zig`, `build.zig`, `docs/embedded-llama-api.md` | Keep API probe and docs aligned. |
-| Add module | `src/main.zig` | Add to root `test { std.testing.refAllDecls(...) }`. |
+| Translation/cache sequencing | `translate.zig` | `translateSegments` and `consumeResult` own session timing and cache acceptance. |
+| Backend payload ownership | `translation_contract.zig`, `backend.zig`, `llama.zig` | Shared `Request`, `Result`, and `FinishReason` contract. |
+| Config round trips | `config.zig`, `config_tests.zig`, `toml.zig` | Keep fields, key lists, parsing, serialization, and accessors aligned. |
+| Read-only memory inspection | `memory.zig` | `openReadOnly`, sidecar/header preflight, statement lifetime. |
+| Filesystem failure seams | `fs.zig` | `FileSystem` borrows an optional per-instance `Faults` controller. |
+| Stream adapters and failure seams | `sys.zig` | POSIX stdin semantics, bounded reads, flushes, `ScriptedReader`/`ScriptedWriter`. |
+| Request versus metadata URLs | `url.zig`, `net.zig` | Encoded request bytes, safe identities, redirect validation, bounded responses. |
 
 ## CONVENTIONS
-- Prefer small modules with explicit allocator arguments and no global mutable state except tightly scoped runtime guards.
-- CLI command modules return `!u8` exit codes and use `errors.Error` for user-facing failures.
-- Public command behavior should be covered by module tests where cheap and by `test/integration/smoke.sh` when it crosses XDG/filesystem/process boundaries.
-- Use project-owned parsers/helpers (`toml.zig`, `cli/args.zig`, `sys.zig`) instead of ad hoc parsing in command bodies.
-- Keep `backend.TestSession` deterministic and available only through `-Dtest-backend=true`.
+- `Request` slices are borrowed for the translation call. Every `Result.text` is caller-owned, including empty and failed payloads; always call `Result.deinit`.
+- `translateSegments` initializes one backend session lazily on the first translatable cache miss. Protected segments and cache hits do not initialize it.
+- `consumeResult` accepts and caches `eog` and `max_tokens`. `timeout`, `context`, and `decode` fail without appending or caching that payload; earlier successful cache rows remain.
+- Config changes must update `Config`, `settable_keys`, `parse`, `save`, `setValue`, `getValue`, and relevant `config_tests.zig` assertions together.
+- `openReadOnly` resolves an existing database and checks WAL headers, WAL/SHM sidecars, and unsafe journals before opening SQLite. This protects stopped databases, not races with external writers.
+- Use `url.zig` for request and metadata representations; `models/AGENTS.md` specifies the persistence rules.
+- `net.zig` validates each redirect, limits redirect count, and rejects HTTPS-to-HTTP downgrades. Keep these checks at the request boundary.
+
+## FAULT-TEST SEAMS
+- `fs.Faults` and `memory.Faults` are caller-owned and borrowed by filesystem/database handles; controllers must outlive the handles and SQLite statements that use them.
+- `sys.ScriptedReader`/`ScriptedWriter` borrow their buffers and short-I/O scripts. Keep values at stable addresses before exposing interface pointers, and keep borrowed storage alive through use.
+- Fault schedules are per instance and one-shot, relative to the next matching operation. Reuse these seams for failure tests instead of process-global fault switches.
+- SQLite injection happens before the C call and does not simulate SQLite side effects. Real locking, corruption, and transaction behavior need real local database fixtures.
+- Writer acceptance is not delivery: buffered bytes are excluded from `bytes_written` until drained. Exercise flush failures through `writeWriterAll`.
 
 ## ANTI-PATTERNS
-- Do not let `translate` produce metadata on stdout for `plain` or `markdown`.
-- Do not store source or translated bodies in debug logs.
-- Do not make normal translation download models or call HTTP.
-- Do not bypass model ID/path validation when writing files under XDG model directories.
-- Do not add broad compatibility shims for removed server-runtime behavior.
+- Do not use schema-creating `memory.open` for read-only inspection or weaken preflight to assume `SQLITE_OPEN_READONLY` has no side effects.
+- Do not return borrowed/static text from a backend result or retain request slices beyond the call.
+- Do not turn an unsuccessful generation's partial text into a successful translation or cache entry.

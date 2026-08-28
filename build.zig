@@ -207,6 +207,9 @@ fn linkLlama(b: *std.Build, artifact: *std.Build.Step.Compile, target: std.Build
     }
     switch (target.result.os.tag) {
         .linux => {
+            // Use LLVM with LLD to handle .sframe relocations in system CRT objects.
+            artifact.use_llvm = true;
+            artifact.use_lld = true;
             if (options.cuda) linkLinuxCudaLibraries(b, artifact, options);
             linkLinuxCxxRuntime(b, artifact, options.build_dir);
         },

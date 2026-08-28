@@ -165,6 +165,41 @@ version-reporting commands are in [docs/ci.md](docs/ci.md).
 Builds target the native host only; cross compilation is unsupported.
 The Linux build check exercises both GCC and Clang.
 
+### Project toolchain with mise
+
+With [mise](https://mise.jdx.dev/) installed, install the Zig version pinned in
+`mise.toml` from the repository root:
+
+```bash
+mise trust
+mise install
+mise exec -- zig version
+```
+
+Zig uses version **0.16.0**. This does not change global tool versions or
+shell startup files; mise keeps the downloaded binaries in its normal shared
+installation directory. Prefix build and test commands with `mise exec --`,
+including scripts that invoke Zig:
+
+```bash
+mise exec -- zig build
+mise exec -- zig build test
+mise exec -- bash test/integration/smoke.sh
+```
+
+Commands in the remaining sections and linked guides assume Zig 0.16.0 is
+already on PATH. For local use without mise shell activation, apply the
+`mise exec --` prefix shown above. CI installs its pinned Zig directly and
+does not require mise.
+
+ZLS is managed separately from mise. Install ZLS **0.16.0** globally and ensure
+`zls --version` reports that version on PATH. In Codex, use the OMO built-in ZLS
+for Zig symbols, navigation, and diagnostics; it is enabled in
+`.codex/lsp-client.json`. Use `mise exec -- zig ast-check <file>` for standalone
+syntax checks and the build/test commands for compilation diagnostics.
+
+### Build from source
+
 Initialize the pinned llama.cpp submodule before building from a fresh clone:
 
 ```bash
