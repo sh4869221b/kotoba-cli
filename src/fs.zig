@@ -1,13 +1,19 @@
 const std = @import("std");
 
-pub const Faults = struct {
-    pub const Operation = enum { write, rename, delete };
-    pub const Cause = error{ AccessDenied, NoSpaceLeft };
-    const Rule = struct { target: usize, cause: Cause };
+pub const PathState = union(enum) {
+    not_found,
+    present: std.Io.File.Stat,
+};
 
-    attempts: [3]usize = .{ 0, 0, 0 },
-    completed: [3]usize = .{ 0, 0, 0 },
-    rules: [3]?Rule = .{ null, null, null },
+pub const Faults = struct {
+    pub const Operation = enum { write, rename, delete, stat, realpath };
+    pub const Cause = error{ AccessDenied, NoSpaceLeft, InputOutput };
+    const Rule = struct { target: usize, cause: Cause };
+    const operation_count = @typeInfo(Operation).@"enum".fields.len;
+
+    attempts: [operation_count]usize = @splat(0),
+    completed: [operation_count]usize = @splat(0),
+    rules: [operation_count]?Rule = @splat(null),
     last_cause: ?Cause = null,
 
     pub fn attemptsFor(self: *const Faults, operation: Operation) usize {
@@ -20,13 +26,18 @@ pub const Faults = struct {
 
     pub fn arm(self: *Faults, operation: Operation, ordinal: usize, cause: Cause) !void {
         if (ordinal == 0) return error.InvalidFaultOrdinal;
-        if (operation != .write and cause != error.AccessDenied) return error.InvalidFaultCause;
+        const valid_cause = switch (operation) {
+            .write => cause == error.AccessDenied or cause == error.NoSpaceLeft,
+            .rename, .delete => cause == error.AccessDenied,
+            .stat, .realpath => cause == error.InputOutput,
+        };
+        if (!valid_cause) return error.InvalidFaultCause;
         const index = @intFromEnum(operation);
         self.rules[index] = .{ .target = try std.math.add(usize, self.attempts[index], ordinal), .cause = cause };
     }
 
     pub fn disarm(self: *Faults) void {
-        self.rules = .{ null, null, null };
+        self.rules = @splat(null);
     }
 
     fn check(self: *Faults, operation: Operation) ?Cause {
@@ -74,6 +85,36 @@ pub const FileSystem = struct {
         if (self.injected(.delete)) |cause| return cause;
         try self.dir.deleteFile(self.io, path);
         self.finished(.delete);
+    }
+
+    pub fn pathState(self: *FileSystem, path: []const u8) !PathState {
+        if (self.injected(.stat)) |cause| return cause;
+        const stat = self.dir.statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .not_found,
+            else => |cause| return cause,
+        };
+        self.finished(.stat);
+        return .{ .present = stat };
+    }
+
+    pub fn removeFileIfExists(self: *FileSystem, path: []const u8) !bool {
+        if (self.injected(.delete)) |cause| return cause;
+        self.dir.deleteFile(self.io, path) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => |cause| return cause,
+        };
+        self.finished(.delete);
+        return true;
+    }
+
+    pub fn realPathIfExistsAlloc(self: *FileSystem, allocator: std.mem.Allocator, path: []const u8) !?[:0]u8 {
+        if (self.injected(.realpath)) |cause| return cause;
+        const real_path = self.dir.realPathFileAlloc(self.io, path, allocator) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |cause| return cause,
+        };
+        self.finished(.realpath);
+        return real_path;
     }
 
     fn injected(self: *FileSystem, operation: Faults.Operation) ?Faults.Cause {
@@ -244,4 +285,69 @@ test "fault fs failure second matching call ignores unrelated operations and con
     try std.testing.expectError(error.FileNotFound, right_tmp.dir.access(std.testing.io, "destination", .{}));
     try std.testing.expectEqual(@as(usize, 1), right_faults.attemptsFor(.rename));
     try std.testing.expectEqual(@as(usize, 0), right_faults.completedFor(.rename));
+}
+
+test "strict fs happy distinguishes missing entries and removes regular files" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var filesystem = FileSystem.init(std.testing.io, tmp.dir, null);
+
+    try std.testing.expectEqual(PathState.not_found, try filesystem.pathState("missing"));
+    try put(tmp.dir, "target", "target bytes");
+    try tmp.dir.symLink(std.testing.io, "missing-target", "dangling", .{});
+    try put(tmp.dir, "unrelated", "keep");
+
+    switch (try filesystem.pathState("target")) {
+        .not_found => return error.TestUnexpectedResult,
+        .present => |stat| try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind),
+    }
+    switch (try filesystem.pathState("dangling")) {
+        .not_found => return error.TestUnexpectedResult,
+        .present => |stat| try std.testing.expectEqual(std.Io.File.Kind.sym_link, stat.kind),
+    }
+    try std.testing.expect(try filesystem.removeFileIfExists("target"));
+    try std.testing.expect(!(try filesystem.removeFileIfExists("target")));
+    try expectBytes(tmp.dir, "unrelated", "keep");
+    try expectEntries(tmp.dir, &.{ "dangling", "unrelated" });
+}
+
+test "strict fs failure propagates native and injected errors" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "locked", .default_dir);
+    try put(tmp.dir, "locked/victim", "keep");
+
+    var faults: Faults = .{};
+    try std.testing.expectError(error.InvalidFaultOrdinal, faults.arm(.stat, 0, error.InputOutput));
+    try std.testing.expectError(error.InvalidFaultCause, faults.arm(.stat, 1, error.AccessDenied));
+    try std.testing.expectError(error.InvalidFaultCause, faults.arm(.delete, 1, error.InputOutput));
+    try faults.arm(.stat, 1, error.InputOutput);
+    var filesystem = FileSystem.init(std.testing.io, tmp.dir, &faults);
+
+    try std.testing.expectError(error.InputOutput, filesystem.pathState("directory"));
+    try std.testing.expectEqual(@as(usize, 1), faults.attemptsFor(.stat));
+    try std.testing.expectEqual(@as(usize, 0), faults.completedFor(.stat));
+    switch (try filesystem.pathState("directory")) {
+        .not_found => return error.TestUnexpectedResult,
+        .present => |stat| try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind),
+    }
+    try std.testing.expectEqual(@as(usize, 2), faults.attemptsFor(.stat));
+    try std.testing.expectEqual(@as(usize, 1), faults.completedFor(.stat));
+    try std.testing.expectError(error.IsDir, filesystem.removeFileIfExists("directory"));
+    try faults.arm(.realpath, 1, error.InputOutput);
+    try std.testing.expectError(error.InputOutput, filesystem.realPathIfExistsAlloc(std.testing.allocator, "directory"));
+    try std.testing.expectEqual(@as(usize, 1), faults.attemptsFor(.realpath));
+    try std.testing.expectEqual(@as(usize, 0), faults.completedFor(.realpath));
+    const real_directory = (try filesystem.realPathIfExistsAlloc(std.testing.allocator, "directory")) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(real_directory);
+    try std.testing.expectEqual(@as(usize, 2), faults.attemptsFor(.realpath));
+    try std.testing.expectEqual(@as(usize, 1), faults.completedFor(.realpath));
+
+    var locked = try tmp.dir.openDir(std.testing.io, "locked", .{ .iterate = true });
+    defer locked.close(std.testing.io);
+    defer locked.setPermissions(std.testing.io, .default_dir) catch unreachable;
+    try locked.setPermissions(std.testing.io, .fromMode(0));
+    try std.testing.expectError(error.AccessDenied, filesystem.pathState("locked/victim"));
+    try std.testing.expectError(error.AccessDenied, filesystem.removeFileIfExists("locked/victim"));
 }

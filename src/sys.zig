@@ -5,6 +5,8 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
+pub const PathState = fs.PathState;
+
 pub fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -33,6 +35,21 @@ pub fn renameFile(src: []const u8, dest: []const u8) !void {
 
 pub fn realPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return cwd().realPathFileAlloc(io(), path, allocator);
+}
+
+pub fn realPathIfExistsAlloc(allocator: std.mem.Allocator, path: []const u8) !?[:0]u8 {
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    return filesystem.realPathIfExistsAlloc(allocator, path);
+}
+
+pub fn pathState(path: []const u8) !PathState {
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    return filesystem.pathState(path);
+}
+
+pub fn removeFileIfExists(path: []const u8) !bool {
+    var filesystem = fs.FileSystem.init(io(), cwd(), null);
+    return filesystem.removeFileIfExists(path);
 }
 
 pub fn exists(path: []const u8) bool {
@@ -486,6 +503,49 @@ test "fault boundary failure default errors propagate while missing delete is sw
     try std.testing.expectEqualStrings("source bytes", bytes);
     deleteFile(missing);
     try std.testing.expect(!exists(missing));
+}
+
+test "strict fs happy wrappers preserve missing and dangling entry states" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, "target" });
+    defer std.testing.allocator.free(target);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ root, "missing" });
+    defer std.testing.allocator.free(missing);
+    const dangling = try std.fs.path.join(std.testing.allocator, &.{ root, "dangling" });
+    defer std.testing.allocator.free(dangling);
+
+    switch (try pathState(missing)) {
+        .not_found => {},
+        .present => return error.TestUnexpectedResult,
+    }
+    try writeFile(target, "target bytes");
+    try tmp.dir.symLink(std.testing.io, "missing-target", "dangling", .{});
+    switch (try pathState(dangling)) {
+        .not_found => return error.TestUnexpectedResult,
+        .present => |stat| try std.testing.expectEqual(std.Io.File.Kind.sym_link, stat.kind),
+    }
+    const resolved = (try realPathIfExistsAlloc(std.testing.allocator, target)) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(try removeFileIfExists(target));
+    try std.testing.expect(!(try removeFileIfExists(target)));
+}
+
+test "strict fs failure wrappers propagate directory deletion and missing realpath" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const directory = try std.fs.path.join(std.testing.allocator, &.{ root, "directory" });
+    defer std.testing.allocator.free(directory);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ root, "missing" });
+    defer std.testing.allocator.free(missing);
+
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    try std.testing.expectError(error.IsDir, removeFileIfExists(directory));
+    try std.testing.expectEqual(@as(?[:0]u8, null), try realPathIfExistsAlloc(std.testing.allocator, missing));
 }
 
 pub fn getenvOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
