@@ -47,6 +47,43 @@ kotoba glossary validate
 kotoba version
 ```
 
+### Side-effect ordering and read-only commands
+
+Every command validates its complete argument shape before the first
+persistent mutation: command and subcommand names, option names, required
+values, argument counts, and known cross-option constraints are checked before
+state is created or changed. Argument-shape validation errors return exit 2
+with `invalid_arguments` and perform no persistent write. The no-selection form
+of `init` intentionally prints model choices before returning this error, and
+JSON error requests may report the error on stdout. `help` and `--help` are not
+implemented in v1; they remain unsupported errors and do not initialize state.
+
+The following commands are read-only inspections. They may still fail when
+state is missing, malformed, inaccessible, or unsafe, and a failed inspection
+does not repair or rewrite that state.
+
+| Command | Missing-state behavior |
+| --- | --- |
+| `models list`, `models info ID`, `models verify [ID]` | A missing `models.toml` is represented by the built-in candidate list in memory only; no registry file or parent directory is created. The requested model may still be reported as unavailable. |
+| `memory status` | A missing database prints `path: PATH` and `rows: 0` without creating the database or parent. An existing empty, malformed, schema-less, inaccessible, or unsafe database returns an error. |
+| `glossary validate` | Reads and validates the glossary; it does not create or rewrite it. |
+| `doctor` | Preserves diagnostics for missing or invalid state, including a missing memory database; it does not repair state. |
+| `config get KEY`, `config list`, `version` | Reads or prints configuration metadata only. A missing config can still produce the existing initialization error for `config get`; `version` does not resolve XDG paths. |
+
+The intentional persistent writers are `init`, `config set`, `models import`,
+`models pull`, `models use`, `models remove`, and `memory clear --yes`.
+Successful `translate` retains its normal writes to translation memory and a
+requested output file. `models pull` is still the only command that can use
+the network, and only when explicitly requested.
+
+Read-only memory and doctor checks preflight databases without concurrent
+writers before opening SQLite. WAL mode and `-wal`/`-shm` sidecars, along with
+rollback journals that could require recovery or cannot be classified safely,
+fail with `sqlite_failed` without opening for recovery or changing any file.
+Empty or zeroed rollback journals remain readable. This preflight is not a
+concurrency guarantee. v1 adds no general transaction, locking, or schema
+migration layer.
+
 For `plain` and `markdown`, successful translate stdout is only translated
 text. TTY detection must not enable extra output. Diagnostics are opt-in through
 `--debug` or `log_level = "debug"` and go to stderr. JSON output remains the

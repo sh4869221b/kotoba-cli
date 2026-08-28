@@ -117,8 +117,45 @@ kotoba models use ID
 kotoba models verify [ID]
 kotoba models remove ID --yes
 kotoba memory status
+kotoba memory clear --yes
 kotoba glossary validate
+kotoba version
 ```
+
+## Command side effects
+
+Kotoba validates each command, subcommand, option, required value, argument
+count, and known cross-option constraint before its first persistent write.
+Argument-shape validation errors exit 2 with `invalid_arguments` and perform no
+persistent write. The no-selection form of `init` intentionally prints its
+model choices before returning the error, and JSON error requests may report
+the error on stdout. `help` and `--help` are currently unsupported; they remain
+errors and are nonmutating.
+
+These commands are read-only: `models list`, `models info`, `models verify`,
+`memory status`, `glossary validate`, `doctor`, `config get`, `config list`,
+and `version`. Read-only means that a failed inspection does not repair,
+initialize, or rewrite state. If `models.toml` is missing, model inspection
+uses the built-in candidate list in memory only; it does not create the file or
+its parent directory. If the memory database is missing, `memory status`
+prints its path and `rows: 0` without creating the database or its parent.
+Existing malformed, schema-less, inaccessible, or unsafe databases report an
+error instead of being treated as empty. `doctor` preserves its diagnostic
+failure for a missing database.
+
+The intentional write commands are `init`, `config set`, `models import`,
+`models pull`, `models use`, `models remove`, and `memory clear --yes`.
+Successful `translate` also keeps its existing behavior: it may update
+translation memory and write the requested output. Network access remains
+limited to an explicit `models pull` operation.
+
+Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
+before opening SQLite when examining a database without concurrent writers.
+Empty or zeroed rollback journals remain readable; journals that could require
+recovery or cannot be classified safely fail with `sqlite_failed` without
+recovery, deletion, or other mutation. This preflight does not promise race
+safety. Kotoba does not add a general transaction, locking, or schema migration
+layer.
 
 ## Build
 

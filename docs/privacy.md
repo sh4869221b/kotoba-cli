@@ -23,6 +23,39 @@ Kotoba CLI is designed for local-first translation.
 - Logs do not persist source or translated bodies by default.
 - SQLite translation memory stores source and translated text when enabled.
 
+## Persistent state and inspection commands
+
+Kotoba validates command names, options, required values, argument counts, and
+known option combinations before a persistent write. Argument-shape validation
+errors return exit 2 (`invalid_arguments`) and perform no persistent write. The
+no-selection form of `init` intentionally prints model choices before its error,
+and JSON error requests may report the error on stdout. `help` and `--help` are
+currently unsupported and remain nonmutating errors.
+
+The read-only inspection set is `models list`, `models info`, `models verify`,
+`memory status`, `glossary validate`, `doctor`, `config get`, `config list`, and
+`version`. These commands can report errors for invalid or unavailable state;
+read-only means that they do not repair, initialize, or rewrite state. A
+missing model registry is parsed from the built-in defaults in memory only. A
+missing memory database is reported by `memory status` as its path with
+`rows: 0`; neither the database nor its parent is created. Existing malformed,
+schema-less, inaccessible, or unsafe memory databases fail instead of being
+reported as empty. `doctor` retains its diagnostic failure for a missing
+database.
+
+The intentional writers are `init`, `config set`, `models import`,
+`models pull`, `models use`, `models remove`, and `memory clear --yes`.
+Successful `translate` may also write translation-memory rows and the
+requested output file. No new network path is introduced: only an explicit
+`models pull` may access a remote model source.
+
+For translation-memory databases without concurrent writers, read-only status
+and doctor checks reject WAL mode and `-wal`/`-shm` sidecars before SQLite opens.
+Empty or zeroed rollback journals remain readable; journals that may require
+recovery or are unsafe to classify fail as `sqlite_failed` without recovery,
+deletion, or other changes. This check does not provide race safety, general
+transactions, locking, or schema migration.
+
 ## Model URL metadata and migration
 
 Remote model URLs containing userinfo, including an empty userinfo, are rejected
