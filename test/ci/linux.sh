@@ -29,6 +29,16 @@ cleanup() {
     kill -TERM -- "-$CHILD_PID" 2>/dev/null
     wait "$CHILD_PID" 2>/dev/null
   fi
+  if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then
+    for family in gcc clang; do
+      local directory="${KOTOBA_CCACHE_GCC_DIR:-}"
+      [[ "$family" == gcc ]] || directory="${KOTOBA_CCACHE_CLANG_DIR:-}"
+      [[ -n "$directory" && -d "$directory" ]] || continue
+      if ! CCACHE_DIR="$directory" ccache --show-stats >"$EVIDENCE/ccache-$family.after" 2>&1; then
+        [[ "$status" != 0 ]] || status=1
+      fi
+    done
+  fi
   rm -rf -- "$OWNED"
   if [[ -e "$OWNED" && "$status" == 0 ]]; then status=1; fi
   if ! snapshot after; then
@@ -80,6 +90,46 @@ assert passed > 0 and skipped == int(sys.argv[3]) and passed + skipped == total,
 print(f'{sys.argv[2]}\t{passed}\n{sys.argv[2]}-skipped\t{skipped}\n{sys.argv[2]}-failed\t0')
 PY
 }
+cache_prepare() {
+  local family="$1" directory="$ROOT/.zig-cache"
+  export CC=gcc CXX=g++ CCACHE_DIR="$KOTOBA_CCACHE_GCC_DIR"
+  if [[ "$family" == clang ]]; then
+    directory="$ROOT/.zig-cache/ci-clang"
+    export CC=clang CXX=clang++ CCACHE_DIR="$KOTOBA_CCACHE_CLANG_DIR"
+  fi
+  run "native-$family-identity" bash test/ci/native-cache.sh identity --compiler "$family" --output "$EVIDENCE/native-$family.json"
+  run "native-$family-validate" bash test/ci/native-cache.sh validate --compiler "$family" --cache-dir "$directory" --identity "$EVIDENCE/native-$family.json"
+}
+cache_stamp() {
+  local family="$1" directory="$ROOT/.zig-cache"
+  [[ "$family" == gcc ]] || directory="$ROOT/.zig-cache/ci-clang"
+  run "native-$family-stamp" bash test/ci/native-cache.sh stamp --compiler "$family" --cache-dir "$directory" --identity "$EVIDENCE/native-$family.json"
+  cp "$directory/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/native-$family-CMakeCache.txt"
+}
+if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then
+  export KOTOBA_CCACHE_GCC_DIR="${KOTOBA_CCACHE_GCC_DIR:-${RUNNER_TEMP:-$ROOT/.zig-cache}/kotoba-ccache/gcc}"
+  export KOTOBA_CCACHE_CLANG_DIR="${KOTOBA_CCACHE_CLANG_DIR:-${RUNNER_TEMP:-$ROOT/.zig-cache}/kotoba-ccache/clang}"
+  for directory in "$KOTOBA_CCACHE_GCC_DIR" "$KOTOBA_CCACHE_CLANG_DIR"; do
+    [[ "$directory" == /* && "$directory" != "$OWNED"/* ]] || { echo 'linux ci cache: invalid compiler cache directory' >&2; exit 2; }
+    mkdir -p "$directory"
+  done
+  gcc_directory="$(realpath "$KOTOBA_CCACHE_GCC_DIR")"
+  clang_directory="$(realpath "$KOTOBA_CCACHE_CLANG_DIR")"
+  if [[ "$gcc_directory" == "$clang_directory" || "$gcc_directory" == "$clang_directory"/* || "$clang_directory" == "$gcc_directory"/* ]]; then
+    echo 'linux ci cache: compiler cache directories overlap' >&2
+    exit 2
+  fi
+  export CCACHE_COMPILERCHECK=content CCACHE_CONFIGPATH=/dev/null CCACHE_SLOPPINESS="" CCACHE_HASHDIR=true
+  CMAKE_C_COMPILER_LAUNCHER="$(command -v ccache)"
+  CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER"
+  export CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+  for family in gcc clang; do
+    directory="$KOTOBA_CCACHE_GCC_DIR"
+    [[ "$family" == gcc ]] || directory="$KOTOBA_CCACHE_CLANG_DIR"
+    CCACHE_DIR="$directory" ccache --show-stats >"$EVIDENCE/ccache-$family.before"
+  done
+  cache_prepare gcc
+fi
 case "$STAGE" in
   format)
     run zig-format zig fmt --check build.zig src
@@ -92,13 +142,22 @@ case "$STAGE" in
     cp "$ROOT/.zig-cache/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/production-CMakeCache.txt"
     run clang-compiler clang++ --version
     run clang-runtime clang++ -### -x c++ /dev/null -o /dev/null
-    run clang-production-build env CC=clang CXX=clang++ zig build --cache-dir "$OWNED/clang-cache" --prefix "$OWNED/clang-prefix"
-    cp "$OWNED/clang-cache/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/clang-CMakeCache.txt"
+    CLANG_CACHE="$OWNED/clang-cache"
+    if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 ]]; then
+      CLANG_CACHE="$ROOT/.zig-cache/ci-clang"
+      cache_prepare clang
+    fi
+    run clang-production-build env CC=clang CXX=clang++ zig build --cache-dir "$CLANG_CACHE" --prefix "$OWNED/clang-prefix"
+    cp "$CLANG_CACHE/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/clang-CMakeCache.txt"
     grep -Eq '^CMAKE_CXX_COMPILER:(FILEPATH|STRING)=.*/clang\+\+(-[0-9]+)?$' "$EVIDENCE/clang-CMakeCache.txt"
     run clang-cli-version "$OWNED/clang-prefix/bin/kotoba" version
     cmp "$EVIDENCE/production-cli-version.stdout" "$EVIDENCE/clang-cli-version.stdout"
     run clang-linkage ldd "$OWNED/clang-prefix/bin/kotoba"
     sha256sum "$ROOT/zig-out/bin/kotoba" "$OWNED/clang-prefix/bin/kotoba" >"$EVIDENCE/binaries.sha256"
+    if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 ]]; then
+      cache_stamp clang
+      export CC=gcc CXX=g++ CCACHE_DIR="$KOTOBA_CCACHE_GCC_DIR"
+    fi
     run build-contract bash test/integration/build_contract.sh --case all --evidence-dir "$EVIDENCE/build-contract"
     python3 - "$EVIDENCE/build-contract/assertions.tsv" >>"$EVIDENCE/counts.tsv" <<'PY'
 import collections, pathlib, sys
@@ -171,3 +230,5 @@ print(f'common\t1\nsmoke\t1\nparallel-children\t{len(statuses)}\nparallel-unit-t
 PY
     ;;
 esac
+
+if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then cache_stamp gcc; fi
