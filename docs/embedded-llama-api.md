@@ -63,6 +63,10 @@ Build contract:
   CUDA library directory.
 - Disable tools, examples, tests, server, app, common, and OpenMP for the embedded build.
 - Link `llama`, `ggml`, `ggml-base`, and `ggml-cpu`.
+- On Linux, use Zig's LLVM backend and bundled LLD for both the CLI and unit-test
+  binaries. Zig 0.16.0's native linker cannot handle `R_X86_64_PC64` relocations
+  in `.sframe` sections emitted by some system CRT objects. Enable LLVM together
+  with LLD; macOS keeps the default backend and linker.
 - Link `ggml-cuda`, `cuda`, `cudart`, `cublas`, and `cublasLt` only for
   CUDA-enabled builds.
 - Include `vendor/llama.cpp/include` and `vendor/llama.cpp/ggml/include`.
