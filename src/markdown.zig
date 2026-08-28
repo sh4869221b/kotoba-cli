@@ -51,7 +51,10 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
         try out.append('\n');
         start = end + 1;
     }
-    return .{ .text = try out.toOwnedSlice(), .protected = try protected.toOwnedSlice() };
+    const owned_text = try out.toOwnedSlice();
+    errdefer allocator.free(owned_text);
+    const owned_protected = try protected.toOwnedSlice();
+    return .{ .text = owned_text, .protected = owned_protected };
 }
 
 fn isTableLine(line: []const u8) bool {
@@ -98,12 +101,23 @@ fn findMarkdownLinkEnd(line: []const u8, start: usize) ?usize {
 
 fn addProtected(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), protected: *std.array_list.Managed(Protected), original: []const u8) !void {
     const token = try std.fmt.allocPrint(allocator, "KOTOBA_PROTECT_{d:0>6}", .{protected.items.len + 1});
-    try protected.append(.{ .token = token, .original = try allocator.dupe(u8, original) });
+    var token_owned = true;
+    errdefer if (token_owned) allocator.free(token);
+    const original_copy = try allocator.dupe(u8, original);
+    var original_owned = true;
+    errdefer if (original_owned) allocator.free(original_copy);
+    try protected.append(.{ .token = token, .original = original_copy });
+    token_owned = false;
+    original_owned = false;
     try out.appendSlice(token);
 }
 
+/// Restores protected bytes into caller-owned output. Warning entries borrow static text.
+/// On error, `warnings` remains valid and deinitializable, and may contain entries appended
+/// before the failing allocation; warning entries are not rolled back.
 pub fn restore(allocator: std.mem.Allocator, text: []const u8, protected: []Protected, warnings: *std.array_list.Managed([]const u8)) ![]u8 {
     var out = try allocator.dupe(u8, text);
+    errdefer allocator.free(out);
     for (protected) |p| {
         if (std.mem.indexOf(u8, out, p.token) == null) {
             try warnings.append("protected token missing from translation");
@@ -217,4 +231,64 @@ test "protect and restore preserves nested markdown" {
 
     try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
     try std.testing.expectEqualStrings(source, restored);
+}
+
+fn checkProtectAllocationFailures(allocator: std.mem.Allocator, source: []const u8) !void {
+    const doc = try protect(allocator, source);
+    doc.deinit(allocator);
+}
+
+fn checkRestoreAllocationFailures(allocator: std.mem.Allocator, source: []const u8, missing: bool) !void {
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
+    defer warnings.deinit();
+    const translation = if (missing) "translated" else doc.text;
+    const restored = try restore(allocator, translation, doc.protected, &warnings);
+    defer allocator.free(restored);
+    if (missing) {
+        try std.testing.expectEqualStrings("translated", restored);
+        try std.testing.expect(warnings.items.len > 0);
+        try std.testing.expectEqualStrings("protected token missing from translation", warnings.items[0]);
+    } else {
+        try std.testing.expectEqualStrings(source, restored);
+        try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+    }
+}
+
+fn checkRepeatedTokenRestoreAllocationFailures(allocator: std.mem.Allocator) !void {
+    var protected = [_]Protected{.{
+        .token = "TOKEN",
+        .original = "expanded protected bytes with enough length to grow output",
+    }};
+    const translated = "TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN";
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
+    defer warnings.deinit();
+    const restored = try restore(allocator, translated, protected[0..], &warnings);
+    defer allocator.free(restored);
+    try std.testing.expect(restored.len > translated.len);
+    try std.testing.expect(std.mem.indexOf(u8, restored, "TOKEN") == null);
+    try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+}
+
+test "ownership/markdown allocation failures clean partial ownership transfers" {
+    inline for (.{
+        "",
+        "---\ntitle: Hello\n---\nbody",
+        "| A | B |\n| - | - |\n| one | two |",
+        "`code` and <kbd>Ctrl</kbd>",
+        "See [site](https://example.test/a?q=1) and ![logo](./logo.png)",
+        "`one` and `two` and https://example.com/path and ![logo](./logo.png) and <kbd>x</kbd>",
+    }) |source| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, checkProtectAllocationFailures, .{source});
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRestoreAllocationFailures, .{
+        "`one` and `two` and https://example.com/path and ![logo](./logo.png)",
+        false,
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRestoreAllocationFailures, .{
+        "`one` `two` `three` `four` `five` `six` `seven` `eight` `nine` `ten` `eleven` `twelve` `thirteen` `fourteen` `fifteen` `sixteen`",
+        true,
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRepeatedTokenRestoreAllocationFailures, .{});
 }
