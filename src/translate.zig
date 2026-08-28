@@ -12,6 +12,7 @@ const prompt = @import("prompt.zig");
 const segment = @import("segment.zig");
 const contract = @import("translation_contract.zig");
 const sys = @import("sys.zig");
+const text_contract = @import("text.zig");
 const xdg = @import("xdg.zig");
 
 pub const Options = struct {
@@ -191,6 +192,7 @@ fn consumeResult(allocator: std.mem.Allocator, result: contract.Result, translat
         .context, .decode => return errors.Error.LlamaDecodeFailed,
         .timeout => return errors.Error.Timeout,
     }
+    try text_contract.validate(result.text);
     if (db_opt) |db| try db.upsert(key, result.text);
     try translated.appendSlice(result.text);
 }
@@ -481,7 +483,7 @@ test "translateSegments sqlite lookup and upsert failures retain prior rows and 
     }
 }
 
-test "result consumer accepts completed and token-limited bytes verbatim" {
+test "result consumer accepts valid completed and token-limited text" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -494,11 +496,12 @@ test "result consumer accepts completed and token-limited bytes verbatim" {
     var translated = std.array_list.Managed(u8).init(allocator);
     defer translated.deinit();
     for ([_]contract.FinishReason{ .eog, .max_tokens }) |reason| {
-        for ([_][]const u8{ "partial", "\xff", "", " \n\t" }, 0..) |bytes, index| {
+        for ([_][]const u8{ "partial", "日本😀e\u{301}\u{feff}\x01\x1f", "", " \n\t" }, 0..) |bytes, index| {
             const source = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ @tagName(reason), index });
             defer allocator.free(source);
             const key = memory.Key{ .source_text = source, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
             var session = backend.TestSession{ .model_id = "test", .fixture = .{ .text = bytes, .finish_reason = reason } };
+            defer session.deinit();
             const result = try session.translate(allocator, .{ .model_id = "test", .source_text = source, .source_lang = .en, .target_lang = .ja, .prompt = "ignored", .timeout_sec = 1 });
             translated.clearRetainingCapacity();
             try consumeResult(allocator, result, &translated, &db, key);
@@ -506,7 +509,67 @@ test "result consumer accepts completed and token-limited bytes verbatim" {
             const hit = (try db.lookup(key)).?;
             defer allocator.free(hit.translated_text);
             try std.testing.expectEqualSlices(u8, bytes, hit.translated_text);
+            const uncached_result = try session.translate(allocator, .{ .model_id = "test", .source_text = source, .source_lang = .en, .target_lang = .ja, .prompt = "ignored", .timeout_sec = 1 });
+            translated.clearRetainingCapacity();
+            try consumeResult(allocator, uncached_result, &translated, null, key);
+            try std.testing.expectEqualSlices(u8, bytes, translated.items);
         }
     }
     try std.testing.expectEqual(@as(usize, 8), try db.count());
+}
+
+test "result consumer rejects invalid accepted text before persistence" {
+    for ([_]contract.FinishReason{ .eog, .max_tokens }) |reason| {
+        try testRejectedResultBytes(reason);
+    }
+}
+
+test "result consumer preserves finish error precedence for malformed bytes" {
+    for ([_]contract.FinishReason{ .timeout, .context, .decode }) |reason| {
+        try testRejectedResultBytes(reason);
+    }
+}
+
+fn testRejectedResultBytes(reason: contract.FinishReason) !void {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_db| {
+        var db = try memory.open(allocator, ":memory:");
+        defer {
+            const c = @cImport({
+                @cInclude("sqlite3.h");
+            });
+            std.testing.expect(c.sqlite3_next_stmt(@ptrCast(db.handle), null) == null) catch @panic("consumer statement leaked");
+            std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(@ptrCast(db.handle))) catch @panic("consumer database did not close");
+        }
+        const key = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+        try db.upsert(key, "saved");
+        const fixed_state = "UPDATE translations SET created_at=123, updated_at=456, hit_count=7";
+        var update = try memory.Stmt.prepare(&db, fixed_state);
+        defer update.deinit();
+        _ = try update.step();
+        var translated = std.array_list.Managed(u8).init(allocator);
+        defer translated.deinit();
+        try translated.appendSlice("prefix");
+        for ([_][]const u8{ "\xff", "A\x00B", "\xe3\x81", "\xf0\x9f\x98" }) |bytes| {
+            var session = backend.TestSession{ .model_id = "test", .fixture = .{ .text = bytes, .finish_reason = reason } };
+            defer session.deinit();
+            const result = try session.translate(allocator, .{ .model_id = "test", .source_text = key.source_text, .source_lang = .en, .target_lang = .ja, .prompt = "ignored", .timeout_sec = 1 });
+            const expected: anyerror = switch (reason) {
+                .timeout => error.Timeout,
+                .context, .decode => error.LlamaDecodeFailed,
+                .eog, .max_tokens => if (std.mem.indexOfScalar(u8, bytes, 0) != null) error.EmbeddedNul else error.InvalidUtf8,
+            };
+            try std.testing.expectError(expected, consumeResult(allocator, result, &translated, if (with_db) &db else null, key));
+            try std.testing.expectEqualStrings("prefix", translated.items);
+            try std.testing.expectEqual(@as(usize, 1), try db.count());
+            var row = try memory.Stmt.prepare(&db, "SELECT source_text, translated_text, created_at, updated_at, hit_count FROM translations");
+            defer row.deinit();
+            _ = try row.step();
+            for ([_][]const u8{ "previous", "saved", "123", "456", "7" }, 0..) |expected_field, index| {
+                const field = try row.columnTextDup(@intCast(index));
+                defer allocator.free(field);
+                try std.testing.expectEqualStrings(expected_field, field);
+            }
+        }
+    }
 }
