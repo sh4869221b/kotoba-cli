@@ -5,6 +5,8 @@ pub const Code = enum {
     not_initialized,
     config_invalid,
     models_invalid,
+    config_schema_unsupported,
+    models_schema_unsupported,
     model_missing,
     model_load_failed,
     llama_init_failed,
@@ -29,6 +31,8 @@ pub const Code = enum {
             .not_initialized => "not_initialized",
             .config_invalid => "config_invalid",
             .models_invalid => "models_invalid",
+            .config_schema_unsupported => "config_schema_unsupported",
+            .models_schema_unsupported => "models_schema_unsupported",
             .model_missing => "model_missing",
             .model_load_failed => "model_load_failed",
             .llama_init_failed => "llama_init_failed",
@@ -55,6 +59,8 @@ pub const Error = error{
     NotInitialized,
     ConfigInvalid,
     ModelsInvalid,
+    ConfigSchemaUnsupported,
+    ModelsSchemaUnsupported,
     ModelMissing,
     ModelLoadFailed,
     LlamaInitFailed,
@@ -90,8 +96,10 @@ pub const AppError = struct {
 pub fn fromError(err: anyerror) AppError {
     return switch (err) {
         Error.NotInitialized => .{ .code = .not_initialized, .message = "Kotoba is not initialized. Run `kotoba init`." },
-        Error.ConfigInvalid => .{ .code = .config_invalid, .message = "config.toml is missing or invalid." },
-        Error.ModelsInvalid => .{ .code = .models_invalid, .message = "models.toml is missing or invalid." },
+        Error.ConfigInvalid => .{ .code = .config_invalid, .message = "config.toml is invalid." },
+        Error.ModelsInvalid => .{ .code = .models_invalid, .message = "models.toml is invalid." },
+        Error.ConfigSchemaUnsupported => .{ .code = .config_schema_unsupported, .message = "config.toml uses an unsupported schema or version." },
+        Error.ModelsSchemaUnsupported => .{ .code = .models_schema_unsupported, .message = "models.toml uses an unsupported schema or version." },
         Error.ModelMissing => .{ .code = .model_missing, .message = "Configured model file does not exist." },
         Error.ModelLoadFailed => .{ .code = .model_load_failed, .message = "Could not load the configured GGUF model." },
         Error.LlamaInitFailed => .{ .code = .llama_init_failed, .message = "Could not initialize embedded llama.cpp runtime." },
@@ -130,4 +138,33 @@ test "secret URL missing source and invalid arguments error mapping" {
     try std.testing.expectEqualStrings("invalid_arguments", invalid.code.asText());
     try std.testing.expectEqual(@as(u8, 2), invalid.exitCode());
     try std.testing.expectEqualStrings("Invalid arguments.", invalid.message);
+}
+
+test "strict persistence error categories have exact safe messages" {
+    const cases = [_]struct { err: anyerror, code: []const u8, message: []const u8 }{
+        .{ .err = error.NotInitialized, .code = "not_initialized", .message = "Kotoba is not initialized. Run `kotoba init`." },
+        .{ .err = error.ConfigInvalid, .code = "config_invalid", .message = "config.toml is invalid." },
+        .{ .err = error.ModelsInvalid, .code = "models_invalid", .message = "models.toml is invalid." },
+        .{ .err = error.ConfigSchemaUnsupported, .code = "config_schema_unsupported", .message = "config.toml uses an unsupported schema or version." },
+        .{ .err = error.ModelsSchemaUnsupported, .code = "models_schema_unsupported", .message = "models.toml uses an unsupported schema or version." },
+        .{ .err = error.AccessDenied, .code = "io_error", .message = "AccessDenied" },
+        .{ .err = error.IsDir, .code = "io_error", .message = "IsDir" },
+        .{ .err = error.StreamTooLong, .code = "io_error", .message = "StreamTooLong" },
+        .{ .err = error.InputOutput, .code = "io_error", .message = "InputOutput" },
+        .{ .err = error.OutOfMemory, .code = "io_error", .message = "OutOfMemory" },
+    };
+    var failures: usize = 0;
+    for (cases) |case| {
+        const actual = fromError(case.err);
+        std.testing.expectEqualStrings(case.code, actual.code.asText()) catch {
+            failures += 1;
+        };
+        std.testing.expectEqualStrings(case.message, actual.message) catch {
+            failures += 1;
+        };
+        std.testing.expectEqual(@as(u8, 1), actual.exitCode()) catch {
+            failures += 1;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }

@@ -49,11 +49,22 @@ pub fn defaultTemplate() []const u8 {
 }
 
 pub fn ensure(path: []const u8) !void {
-    if (!sys.exists(path)) try sys.writeFile(path, defaultTemplate());
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = load(arena.allocator(), path) catch |err| switch (err) {
+        error.NotInitialized => {
+            try sys.writeFile(path, defaultTemplate());
+            return;
+        },
+        else => return err,
+    };
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !List {
-    const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch return errors.Error.ModelsInvalid;
+    const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return errors.Error.NotInitialized,
+        else => return err,
+    };
     defer allocator.free(data);
     return parse(allocator, data);
 }
@@ -61,7 +72,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !List {
 pub fn loadReadOnly(allocator: std.mem.Allocator, path: []const u8) !List {
     const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return parse(allocator, defaultTemplate()),
-        else => return errors.Error.ModelsInvalid,
+        else => return err,
     };
     defer allocator.free(data);
     return parse(allocator, data);
@@ -307,7 +318,109 @@ test "load read only uses the default template only for missing registries" {
 
     const directory_path = try std.fs.path.join(allocator, &.{ root, "directory" });
     try sys.makePath(directory_path);
-    try std.testing.expectError(errors.Error.ModelsInvalid, loadReadOnly(allocator, directory_path));
+    try std.testing.expectError(error.IsDir, loadReadOnly(allocator, directory_path));
+}
+
+test "strict registry loaders distinguish missing files and ensure creates defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "missing", "models.toml" });
+    try std.testing.expectError(error.NotInitialized, load(allocator, path));
+    try std.testing.expectEqual(@as(usize, 2), (try loadReadOnly(allocator, path)).models.len);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+    try std.testing.expectError(error.FileNotFound, ensure(path));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+    try tmp.dir.createDir(std.testing.io, "missing", .default_dir);
+    try ensure(path);
+    try std.testing.expectEqualStrings(defaultTemplate(), try sys.readFileAlloc(allocator, path, 4096));
+}
+
+test "strict registry loaders and ensure preserve directories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const marker = try std.fs.path.join(allocator, &.{ root, "keep" });
+    try sys.writeFile(marker, "untouched");
+    try std.testing.expectError(error.IsDir, ensure(root));
+    try std.testing.expectError(error.IsDir, load(allocator, root));
+    try std.testing.expectError(error.IsDir, loadReadOnly(allocator, root));
+    try std.testing.expectEqualStrings("untouched", try sys.readFileAlloc(allocator, marker, 32));
+    try expectOnlyEntry(tmp.dir, "keep");
+}
+
+test "strict registry loaders and ensure preserve oversized files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    const data = try allocator.alloc(u8, 2097153);
+    @memset(data, ' ');
+    try sys.writeFile(path, data);
+    try std.testing.expectError(error.StreamTooLong, ensure(path));
+    try std.testing.expectError(error.StreamTooLong, load(allocator, path));
+    try std.testing.expectError(error.StreamTooLong, loadReadOnly(allocator, path));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, data.len + 1));
+    try expectOnlyEntry(tmp.dir, "models.toml");
+}
+
+test "strict registry ensure preserves existing bytes and loaders preserve allocation failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    const data = "# keep formatting\n[[models]]\nid = \"existing\"\n";
+    try sys.writeFile(path, data);
+    try ensure(path);
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
+    try std.testing.expectEqualStrings("existing", (try load(allocator, path)).models[0].id);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), path));
+    try std.testing.expectError(error.OutOfMemory, loadReadOnly(failing.allocator(), path));
+    try expectOnlyEntry(tmp.dir, "models.toml");
+}
+
+test "strict registry loaders and ensure preserve native access denied" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    const data = "[[models]]\nid = \"private\"\n";
+    try sys.writeFile(path, data);
+    const file = try tmp.dir.openFile(std.testing.io, "models.toml", .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0));
+    defer file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
+    try std.testing.expectError(error.AccessDenied, ensure(path));
+    try std.testing.expectError(error.AccessDenied, load(allocator, path));
+    try std.testing.expectError(error.AccessDenied, loadReadOnly(allocator, path));
+    try file.setPermissions(std.testing.io, .fromMode(0o600));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
+    try expectOnlyEntry(tmp.dir, "models.toml");
+}
+
+fn expectOnlyEntry(dir: std.Io.Dir, name: []const u8) !void {
+    var entries = dir.iterate();
+    const entry = (try entries.next(std.testing.io)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(name, entry.name);
+    try std.testing.expect((try entries.next(std.testing.io)) == null);
 }
 
 test "registry upsert and remove round trip" {
@@ -374,7 +487,7 @@ test "registry upsert preserves missing registry errors" {
     defer std.testing.allocator.free(path);
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "toy.gguf" });
     defer std.testing.allocator.free(model_path);
-    try std.testing.expectError(errors.Error.ModelsInvalid, upsert(std.heap.page_allocator, path, .{
+    try std.testing.expectError(errors.Error.NotInitialized, upsert(std.heap.page_allocator, path, .{
         .id = "toy",
         .name = "Toy",
         .profile = "local",

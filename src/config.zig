@@ -87,9 +87,92 @@ pub fn default() Config {
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch return errors.Error.NotInitialized;
+    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return errors.Error.NotInitialized,
+        else => return err,
+    };
     defer allocator.free(data);
     return parse(allocator, data);
+}
+
+test "strict config loader distinguishes missing files without creating paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "missing", "config.toml" });
+    try std.testing.expectError(error.NotInitialized, load(allocator, path));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+}
+
+test "strict config loader preserves size failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    const data = try allocator.alloc(u8, 1048577);
+    @memset(data, ' ');
+    try sys.writeFile(path, data);
+    try std.testing.expectError(error.StreamTooLong, load(allocator, path));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, data.len + 1));
+}
+
+test "strict config loader preserves directory failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expectError(error.IsDir, load(std.testing.allocator, root));
+}
+
+test "strict config loader preserves parse schema and allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    for ([_]struct { data: []const u8, expected: anyerror }{
+        .{ .data = "gpu_layers = 'auto'\n", .expected = error.ConfigInvalid },
+        .{ .data = "version = 2\n", .expected = error.ConfigSchemaUnsupported },
+    }) |case| {
+        try sys.writeFile(path, case.data);
+        try std.testing.expectError(case.expected, load(allocator, path));
+        try std.testing.expectEqualStrings(case.data, try sys.readFileAlloc(allocator, path, 1024));
+    }
+    const valid = "model_id = 'local'\n";
+    try sys.writeFile(path, valid);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), path));
+    try std.testing.expectEqualStrings("local", (try load(allocator, path)).model_id);
+    try std.testing.expectEqualStrings(valid, try sys.readFileAlloc(allocator, path, 1024));
+}
+
+test "strict config loader preserves native access denied" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    const data = "model_id = 'private'\n";
+    try sys.writeFile(path, data);
+    const file = try tmp.dir.openFile(std.testing.io, "config.toml", .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0));
+    defer file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
+    try std.testing.expectError(error.AccessDenied, load(allocator, path));
+    try file.setPermissions(std.testing.io, .fromMode(0o600));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
 }
 
 /// String fields present in the input are caller-owned; omitted fields borrow defaults.
