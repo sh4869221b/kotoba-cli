@@ -247,8 +247,8 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The matrix currently has 155 measured CLI cases: translate 39, commands 65,
-memory 17, files 34. Setup calls are captured separately, not counted as cases.
+The matrix currently has 195 measured CLI cases: translate 46, commands 82,
+memory 22, files 45. Setup calls are captured separately, not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
 unfinished cases, failed assertions and harness timeouts fail the suite.
 The per-command limit is 120 seconds and the suite limit is 20 minutes. A
@@ -314,6 +314,11 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `files-{overwrite,alias-overwrite}-{enabled,disabled}` | 0; empty streams | Destination replaced, including source alias; TM +1 enabled / unchanged disabled |
 | `files-{output-exists,alias-exists,directory-exists,missing-parent,directory-open}-{enabled,disabled}` | 1; empty stdout, exact `output_exists` or Linux `io_error` (`FileNotFound` / `IsDir`) | Destination bytes/entries and siblings preserved, but fresh source already cached (+1 row) when enabled; no-memory unchanged |
 | `files-{empty-direct,empty-stdin,empty-file,conflicting-input,missing-input}-{enabled,disabled}` | 2 `invalid_arguments` or 1 `io_error: FileNotFound`; empty stdout | Fail before translation; destination and TM unchanged |
+| `files-atomic-native-prefix{,-absent}` | 1; exact `io_error: FileTooBig`, empty stdout | A real 1024-byte child file-size limit stops the CLI stage before publication; existing destination is byte-for-byte unchanged, absent destination remains absent, and no stage remains |
+| `files-atomic-{mode-600,mode-640}` | 0; empty streams | Existing regular destination mode is retained after replacement |
+| `files-atomic-{symlink,dangling,hardlink}-{reject,replace}` | Reject: 1 `output_exists`; replace: 0 | No-overwrite treats link entries as existing; overwrite replaces only the named link entry and preserves the symlink/hardlink referent bytes |
+| `files-atomic-parent-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Destination and entry set remain unchanged; fixture permission is restored during cleanup |
+| `commands-models-remove-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Managed-model deletion failure is not reported as `removed`; registry partial-state rules remain separate |
 
 Finalized initialization regression #9 remains in `smoke.sh` and
 `commands-init-remote-rejected`: URL-only init exits 1 with pull/model-path
@@ -344,11 +349,15 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 | `fault fs failure injected write preserves data and entry set`; `fault fs failure rename preserves existing and absent destinations` (`fs`) | Pre-operation injected failure preserves bytes/entries; not mid-write atomicity |
 | `fault io failure prefix and broken pipe cause`; `fault io failure deferred flush independent counters disarm and rearm`; `fault io failure full caller owned sink is bounded` (`sys`) | `WriteFailed`, partial/pending bytes and recorded `BrokenPipe`/`NoSpaceLeft` causes; not real CLI stdout failure |
 | `fault io failure read limit prefix independent instances and rearm` (`sys`) | Reader failure/limit, consumed prefix, independent counters and recovery |
+| `checked close {happy,failure,reuse}` (`file_close`) | A real owned descriptor is consumed once; injected late errno is recorded only after the real close; repeated cleanup cannot close a descriptor reused by an unrelated sentinel |
+| `staged output {happy,failure,gate,race,path,cleanup}` (`staged_output`) | Same-parent exclusive stage, exact finished bytes, captured modes, caller gate, collision/no-replace/path/link behavior, and cleanup ownership. Native prefix writes use real stage bytes; injected flush/sync/close/rename labels remain component evidence. |
+| `writeOutput failure boundaries propagate native errors without publication` (`translate`) | Existing and absent output targets retain the expected state across the staged write boundary; no CLI stream/status is inferred from this component test |
+| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Missing managed file remains benign; realpath/reload/deletion failures propagate and do not print `removed`; no transaction or rollback is added |
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |
 | gap | Broken stdout is not fully CLI covered; valid control-byte JSON coverage does not prove stdout-failure handling | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
-| gap | Mid-write regular-file atomicity/rollback; pre-open failures and injected pre-call preservation cannot establish it | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
+| bounded | Issue #25 covers normal write/flush/sync/checked-close/rename failures through a same-parent stage. Native RLIMIT CLI failure and real component prefix bytes are distinct from injected late boundaries. It does not promise TM rollback, directory fsync/power-loss durability, process-kill cleanup, or adversarial same-UID stage-tampering protection. | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
 | gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
 | gap | Validation before mutation and truly read-only commands; unknown option as initial text is currently accepted | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
 | gap | Content/structure and empty-result policy, including missing protected-token rejection; encoding-valid empty text is accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |

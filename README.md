@@ -96,6 +96,31 @@ Use `--format json` when callers need metadata such as cache status, warnings,
 runtime, or elapsed time. Use `--debug` only when diagnosing runtime behavior;
 debug output may be written to stderr and never changes translated stdout.
 
+### File output publication (Issue #25)
+
+File output is written to an
+exclusive staged sibling in the destination's directory, then published as a
+single directory-entry replacement. The destination stays intact until
+publication, including when `--overwrite` is used. Before a caller validates
+the finished artifact, the stage is flushed, synced, and closed with checked
+errors; validation reads those exact finished bytes and does not rewrite them.
+
+The contract preserves an existing regular file's permission mode and
+uses the platform default creation mode (`0666 & ~umask`) when the destination
+is absent. Replacing a named entry replaces a symlink itself, never its target;
+other hardlinks continue to reference the old inode. A no-overwrite publish
+counts any existing entry, including a dangling symlink, and uses a race-free
+no-replace rename; it fails closed when that operation is unsupported.
+The parent directory is pinned for the stage and publish operations. Primary
+write, flush, sync, close, validation, or publish failures are nonzero errors;
+best-effort stage cleanup can leave a uniquely named orphan after cleanup
+failure or process termination.
+
+The documented evidence covers normal write, flush, sync, checked-close, and
+rename failures, including native resource-limit CLI failure. It does not
+promise a Translation Memory transaction or rollback, directory durability
+after a crash or power loss, process-kill cleanup, or protection against a
+hostile same-UID process modifying a named stage.
 ### Text encoding
 
 Translation input (direct text, stdin, `.txt`, and Markdown), glossary text,
@@ -300,10 +325,14 @@ bash test/integration/parallel.sh --rounds 2 --evidence-dir "$PWD/.omo/evidence/
 The matrix records actual command streams, status, filesystem and translation
 memory state using private test/CPU snapshots. It supports `--group translate`,
 `commands`, `memory`, or `files`. The parallel driver runs two full matrices per
-round alongside existing smoke, benchmark and unit children. See the
+round alongside existing smoke, benchmark and unit children. File output is
+staged in the destination directory and published only after a checked finish;
+the matrix separately records native resource-limit write failure, links,
+permission modes, and destination state. See the
 [coverage and gaps](docs/test-harness.md#cli-contract-matrix) for the separate
-CLI/component evidence and deferred output, mutation and result-validation
-guarantees; these tests do not claim real-model quality or atomic file writes.
+CLI/component evidence and deferred stdout, validation, transaction, directory
+durability, and result-validation guarantees. These tests do not claim
+real-model quality.
 
 Real CUDA QA is guarded so non-CUDA machines can run it safely:
 

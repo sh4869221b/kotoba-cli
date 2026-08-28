@@ -159,12 +159,68 @@ Issues are authoritative when they differ from this current-state description.
 8. Restore protected Markdown tokens.
 9. Save cacheable results and write plain, Markdown, or JSON output.
 
-The roadmap target for file/MOD output is intentionally stricter: generated
-candidates must pass finish/detokenization/text/structure/content validation,
-accepted TM rows are staged in memory, the staged artifact receives final
-validation, accepted rows are committed in a short SQLite write transaction,
-and only then is the artifact atomically published. Do not infer the target
-commit protocol from the simplified current flow above.
+The broader roadmap target for file/MOD output is intentionally stricter:
+generated candidates must pass the complete finish/detokenization/text/structure/content
+validation pipeline (UTF-8/no-NUL text checks are already enforced), accepted
+Translation Memory rows are staged in memory, the staged
+artifact receives final validation, accepted rows are committed in a short
+SQLite write transaction, and only then is the artifact atomically published.
+Roadmap #46 and the referenced implementation Issues govern that future
+pipeline. The current Issue #25 file-output implementation supplies only the
+stage/finish/publish boundary, so do not infer that full validation and commit
+protocol from the simplified current flow above.
+
+### File publication contract (Issue #25)
+
+Translation file output uses this filesystem contract. It does not describe a
+Translation Memory transaction or the future validation pipeline.
+
+The output primitive creates a named sibling stage exclusively in the
+destination's parent directory. It opens and pins that parent for the stage,
+validation, publish, and abort operations, so a replacement parent path cannot
+redirect the operation. The stage is written to completion, then its actual
+writer is flushed, synced, and closed through a checked close boundary. Only a
+successful finish produces a read-only finished artifact. The caller validates
+the exact finished bytes from that artifact; it must not rewrite the stage
+between validation and publication.
+
+Publication replaces the destination directory entry only after all caller
+validation and any optional external commit gate succeeds. With overwrite,
+the original entry remains until the atomic same-parent rename. Replacing a
+symlink replaces the symlink entry and never follows or changes its target;
+other hardlinks retain the old inode and its bytes. An existing regular
+destination's permission mode is captured and preserved; an absent
+destination uses the default creation mode `0666 & ~umask`. A no-overwrite
+publish counts any existing entry, including a dangling symlink, and uses the
+race-free `renamePreserve` no-replace operation. If that operation is
+unsupported, publication fails closed and does not fall back to a check
+followed by rename.
+
+Write, flush, sync, checked-close, read-only validation, and publish failures
+are primary errors and return a nonzero result. Failure cleanup is
+best-effort and limited to the owned stage; a process kill or cleanup failure
+can leave its uniquely named orphan. This contract does not promise directory
+fsync, power-loss durability or recovery, ACL/xattr preservation, or owner
+copying.
+
+The primitive does not perform Translation Memory operations. A caller may
+commit accepted rows after exact staged-byte validation and before publish. If
+publish then fails, an already successful external commit cannot be undone by
+this module; no compensating transaction or rollback is attempted here.
+
+### Critical deletion failure contract (Issue #25)
+
+Important model removal steps distinguish a missing path from an access or
+other filesystem failure. A missing path can be an intentional no-op, but
+realpath, reload, or deletion failures propagate as errors. Such a failure
+returns nonzero and must not print the `removed` success line. If the registry
+was already changed before a later reload or file operation fails, the
+registry may remain changed while the model or config is unchanged; Issue #25
+does not add a compensating registry transaction or #27 rollback.
+
+The loader, defaults, and preflight rules remain the separate responsibility
+of Issue #61. This output and deletion primitive does not broaden that
+boundary or introduce a general transaction layer.
 
 ## Model Management
 

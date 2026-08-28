@@ -157,3 +157,25 @@ test "secret URL missing source and invalid arguments error mapping" {
     try std.testing.expectEqual(@as(u8, 2), invalid.exitCode());
     try std.testing.expectEqualStrings("Invalid arguments.", invalid.message);
 }
+
+test "filesystem errors map to io error with native names" {
+    const filesystem_errors = [_]anyerror{
+        error.AccessDenied,
+        error.InputOutput,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.FileTooBig,
+        error.InvalidFileDescriptor,
+        error.OperationUnsupported,
+        error.StageNameCollision,
+    };
+    for (filesystem_errors) |err| {
+        const app_err = fromError(err);
+        try std.testing.expectEqual(Code.io_error, app_err.code);
+        try std.testing.expectEqual(@as(u8, 1), app_err.exitCode());
+        try std.testing.expectEqualStrings(@errorName(err), app_err.message);
+    }
+    const output_exists = fromError(Error.OutputExists);
+    try std.testing.expectEqual(Code.output_exists, output_exists.code);
+    try std.testing.expectEqualStrings("Output file already exists. Use --overwrite to replace it.", output_exists.message);
+}
