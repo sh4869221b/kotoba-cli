@@ -101,6 +101,32 @@ Kotoba follows XDG directories:
 - cache: `~/.cache/kotoba/`
 - state/logs: `~/.local/state/kotoba/`
 
+## Text encoding contract
+
+Translation text is valid UTF-8 and must not contain a NUL byte. This applies
+to plain and Markdown input, glossary text, generated text, and accepted
+translation-memory text. The contract preserves bytes: it does not normalize,
+transcode, trim, repair, or replace accepted text. Empty and whitespace-only
+text remain encoding-valid, as do a UTF-8 BOM, combining marks, supplementary
+characters, and valid control characters U+0001 through U+001F.
+
+Validation checks UTF-8 before NUL. A byte sequence containing both defects is
+reported as `invalid_utf8`; otherwise an embedded NUL is reported as
+`embedded_nul`. Both errors exit 1 and use the fixed messages `Text must be
+valid UTF-8.` and `Text must not contain NUL bytes.` without including rejected
+text in the diagnostic.
+
+Generation validates the complete accepted byte sequence only after its finish
+reason is accepted and before it is stored or accumulated. A timeout remains a
+`timeout` error and context/decode failures remain `llama_decode_failed`, even
+if their partial bytes are malformed. A selected legacy translation-memory row
+that violates this contract is rejected without repairing, deleting, or
+updating the row.
+
+Future MOD support treats a binary container as raw bytes and separately
+extracts translation text for this validation. This document defines that
+responsibility only; it does not add a MOD adapter or container format.
+
 ## Translation Flow
 
 This section describes the **current v1 implementation flow**, not the target
