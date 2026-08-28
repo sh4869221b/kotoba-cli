@@ -96,6 +96,30 @@ Use `--format json` when callers need metadata such as cache status, warnings,
 runtime, or elapsed time. Use `--debug` only when diagnosing runtime behavior;
 debug output may be written to stderr and never changes translated stdout.
 
+### File output publication target (Issue #25)
+
+The implementation target for this branch is to write file output to an
+exclusive staged sibling in the destination's directory, then publish it as a
+single directory-entry replacement. The destination stays intact until
+publication, including when `--overwrite` is used. Before a caller validates
+the finished artifact, the stage is flushed, synced, and closed with checked
+errors; validation reads those exact finished bytes and does not rewrite them.
+
+The target contract preserves an existing regular file's permission mode and
+uses the platform default creation mode (`0666 & ~umask`) when the destination
+is absent. Replacing a named entry replaces a symlink itself, never its target;
+other hardlinks continue to reference the old inode. A no-overwrite publish
+counts any existing entry, including a dangling symlink, and uses a race-free
+no-replace rename; it fails closed when that operation is unsupported.
+The parent directory is pinned for the stage and publish operations. Primary
+write, flush, sync, close, validation, or publish failures are nonzero errors;
+best-effort stage cleanup can leave a uniquely named orphan after cleanup
+failure or process termination.
+
+This is the branch's target contract until the staged lifecycle and CLI wiring
+land in the later Issue #25 tasks. The current integration coverage retains
+its separate warning that it does not prove atomic file writes.
+
 ## Commands
 
 ```bash
