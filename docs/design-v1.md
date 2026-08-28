@@ -76,6 +76,18 @@ Successful `translate` retains its normal writes to translation memory and a
 requested output file. `models pull` is still the only command that can use
 the network, and only when explicitly requested.
 
+This branch specifies configuration and model registry persistence through the
+strict, intentionally small TOML subset documented in
+[strict-toml.md](strict-toml.md). The implementation target preserves
+supported values semantically while rejecting malformed, unknown, duplicate,
+and unsupported schema data. Missing state remains distinct from parse,
+schema, native I/O, and allocation failures. The document also records the
+existing canonical URL exception and the preflight boundary for state-changing
+commands. It does not promise full TOML conformance, atomic writes, locking,
+rollback, or crash durability.
+The supported-subset behavior remains a branch implementation target until
+implementation and final CLI verification are complete.
+
 Read-only memory and doctor checks preflight databases without concurrent
 writers before opening SQLite. WAL mode and `-wal`/`-shm` sidecars, along with
 rollback journals that could require recovery or cannot be classified safely,

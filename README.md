@@ -149,6 +149,18 @@ Successful `translate` also keeps its existing behavior: it may update
 translation memory and write the requested output. Network access remains
 limited to an explicit `models pull` operation.
 
+This branch specifies a strict supported TOML subset for persisted
+`config.toml` and `models.toml`. The implementation target round-trips
+supported values semantically and returns an explicit error for malformed,
+unknown, duplicate, and future schema data instead of ignoring it or replacing
+it with defaults. Missing files remain distinct from parse, schema, native I/O,
+and allocation failures. See the complete
+[strict persistence TOML contract](docs/strict-toml.md) for the field tables,
+accepted syntax, manual repair guidance, canonical URL behavior, and mutation
+preflight boundary. The contract does not promise full TOML support, atomic
+writes, rollback, locking, or crash durability; final behavior remains subject
+to the implementation and Todo 7 CLI checks.
+
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
 before opening SQLite when examining a database without concurrent writers.
 Empty or zeroed rollback journals remain readable; journals that could require
