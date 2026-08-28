@@ -187,6 +187,11 @@ mise exec -- zig build test
 mise exec -- bash test/integration/smoke.sh
 ```
 
+Commands in the remaining sections and linked guides assume Zig 0.16.0 is
+already on PATH. For local use without mise shell activation, apply the
+`mise exec --` prefix shown above. CI installs its pinned Zig directly and
+does not require mise.
+
 ZLS is managed separately from mise. Install ZLS **0.16.0** globally and ensure
 `zls --version` reports that version on PATH. In Codex, use the OMO built-in ZLS
 for Zig symbols, navigation, and diagnostics; it is enabled in
