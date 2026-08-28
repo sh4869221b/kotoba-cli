@@ -15,6 +15,7 @@ pub const url = @import("url.zig");
 pub const defaultTemplate = registry.defaultTemplate;
 pub const ensure = registry.ensure;
 pub const load = registry.load;
+pub const loadReadOnly = registry.loadReadOnly;
 pub const parse = registry.parse;
 pub const find = registry.find;
 pub const installedPath = registry.installedPath;

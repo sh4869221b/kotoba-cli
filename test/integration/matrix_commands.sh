@@ -37,8 +37,11 @@ commands_error() {
   case "$code" in
     invalid_arguments) status=2 ;;
     not_initialized) message='Kotoba is not initialized. Run `kotoba init`.' ;;
+    config_invalid) message='config.toml is missing or invalid.' ;;
     model_missing) message='Configured model file does not exist.' ;;
+    models_invalid) message='models.toml is missing or invalid.' ;;
     model_not_selected) message='No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`.' ;;
+    sqlite_failed) message='SQLite translation memory operation failed.' ;;
     unsupported_language_pair) message='Only en -> ja and ja -> en are supported.' ;;
     glossary_invalid) message='glossary.toml is invalid.' ;;
     *) return 2 ;;
@@ -143,6 +146,12 @@ if sys.argv[1] == 'init':
 PY
 }
 
+commands_default_info() {
+  printf '%s\n' 'id: custom' 'name: Custom local GGUF model' 'profile: custom' 'format: gguf' \
+    'quantization: ' 'context_length: 4096' 'path: ' 'download_url: ' 'source_url: ' \
+    'checksum: ' 'license: ' 'recommended: false' 'notes: Set model_path during init or config.' >"$CASE_DIR/expected.stdout"
+}
+
 commands_doctor_expectation() {
   python3 - "$1" "$2" <<'PY'
 import json, os, sys
@@ -176,12 +185,24 @@ matrix_commands() {
   local id variant format expected status base_dirs commands_umask
   commands_umask="$(umask)"
   base_dirs='config/kotoba,data/kotoba,data/kotoba/models,cache/kotoba,state/kotoba'
-  for id in version version-extra-characterization; do
-    matrix_case "commands-$id"
-    if [[ "$id" == version ]]; then matrix_run version; else matrix_run version extra; fi
-    commands_streams 0 $'kotoba 0.0.1\n'
-    commands_unchanged
-  done
+  matrix_case commands-version
+  matrix_run version
+  commands_streams 0 $'kotoba 0.0.1\n'
+  commands_unchanged
+  matrix_case commands-version-extra
+  matrix_run version extra
+  commands_error
+  commands_unchanged
+  matrix_case commands-init-noargs
+  matrix_run init
+  commands_streams 2 $'Model choices:\n- custom: provide --model-path PATH\n- later: use --yes to configure model_path later\n' \
+    $'kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\nkotoba: invalid_arguments: Invalid arguments.\n'
+  commands_unchanged
+  matrix_case commands-init-invalid-model-id
+  printf 'fixture model\n' >fixture.gguf
+  matrix_run init --model-id ../bad --model-path fixture.gguf
+  commands_error
+  commands_unchanged
   for id in top-missing top-invalid init-invalid init-missing-value models-missing-subcommand memory-missing-subcommand; do
     matrix_case "commands-$id"
     case "$id" in
@@ -241,6 +262,12 @@ TOML
   matrix_run config get gpu_layers
   commands_error not_initialized
   commands_unchanged
+  matrix_case commands-config-get-corrupt
+  mkdir -p "$XDG_CONFIG_HOME/kotoba"
+  printf 'gpu_layers = "bogus"\n' >"$XDG_CONFIG_HOME/kotoba/config.toml"
+  matrix_run config get gpu_layers
+  commands_error config_invalid
+  commands_unchanged
 
   for id in config-invalid config-get-arity config-set-arity config-list-arity models-info-arity models-import-arity models-pull-arity models-use-arity models-verify-arity models-remove-arity glossary-invalid glossary-arity doctor-invalid doctor-arity; do
     matrix_case "commands-$id"
@@ -272,8 +299,27 @@ TOML
       models-invalid-absent) matrix_run models bogus; commands_error ;;
       models-list-arity-absent) matrix_run models list extra; commands_error ;;
     esac
-    commands_state "$base_dirs,config/kotoba/models.toml" '' ''
+    commands_unchanged
   done
+  matrix_case commands-models-info-absent
+  commands_default_expectations
+  commands_default_info
+  matrix_run models info custom
+  matrix_assert status 0
+  matrix_assert stdout "$CASE_DIR/expected.stdout"
+  matrix_assert stderr "$CASE_STDIN"
+  commands_unchanged
+  matrix_case commands-models-verify-absent
+  commands_default_expectations
+  matrix_run models verify custom
+  commands_error model_missing
+  commands_unchanged
+  matrix_case commands-models-list-corrupt
+  mkdir -p "$XDG_CONFIG_HOME/kotoba"
+  mkdir "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_run models list
+  commands_error models_invalid
+  commands_unchanged
   matrix_case commands-models-list
   commands_fixture
   matrix_run models list
@@ -395,22 +441,33 @@ PY
         matrix_run memory clear --yes
         commands_streams 0 ''
         commands_state '' data/kotoba/memory.sqlite3 '' clear ;;
-      *)
-        if [[ "$variant" == status ]]; then matrix_run memory status; else matrix_run memory status extra; fi
+      status)
+        matrix_run memory status
         commands_streams 0 "path: $CASE_DB"$'\nrows: 1\n'
+        commands_unchanged ;;
+      status-extra)
+        matrix_run memory status extra
+        commands_error
         commands_unchanged ;;
     esac
   done
-  for variant in status invalid clear-arity; do
+  for variant in status status-extra invalid clear-arity; do
     matrix_case "commands-memory-$variant-absent-db"
     mkdir -p "$XDG_DATA_HOME/kotoba"
     case "$variant" in
       status) matrix_run memory status; commands_streams 0 "path: $CASE_DB"$'\nrows: 0\n' ;;
+      status-extra) matrix_run memory status extra; commands_error ;;
       invalid) matrix_run memory bogus; commands_error ;;
       clear-arity) matrix_run memory clear; commands_error ;;
     esac
-    commands_state data/kotoba/memory.sqlite3 '' '' create
+    commands_unchanged
   done
+  matrix_case commands-memory-status-corrupt
+  mkdir -p "$XDG_DATA_HOME/kotoba"
+  printf 'not a SQLite database\n' >"$CASE_DB"
+  matrix_run memory status
+  commands_error sqlite_failed
+  commands_unchanged
   for variant in invalid-human conflicting-inputs unsupported-pair absent-config no-selection unknown-token cpu-model-missing; do
     id="commands-translate-$variant"
     if [[ "$variant" == cpu-model-missing ]]; then matrix_case "$id" cpu; else matrix_case "$id"; fi
@@ -428,9 +485,7 @@ PY
         matrix_setup config set model_path ''
         matrix_run translate Hello --to ja --no-memory
         commands_error model_not_selected ;;
-      unknown-token)
-        matrix_run translate --bogus --from en --to ja --no-memory
-        commands_streams 0 $'JA:--bogus\n' ;;
+      unknown-token) matrix_run translate --bogus --from en --to ja --no-memory; commands_error ;;
       cpu-model-missing)
         matrix_setup config set model_path "$CASE_ROOT/work/missing.gguf"
         matrix_run translate Hello --to ja --no-memory

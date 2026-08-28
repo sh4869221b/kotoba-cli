@@ -8,13 +8,11 @@ const args = @import("args.zig");
 
 pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len < 1) return errors.Error.InvalidArguments;
-    try xdg.ensureDirs(paths);
-    try models.ensure(paths.models_file);
-    const cfg = config.load(allocator, paths.config_file) catch config.default();
     const sub = cmd_args[0];
     if (std.mem.eql(u8, sub, "list")) {
         if (cmd_args.len != 1) return errors.Error.InvalidArguments;
-        const list = try models.load(allocator, paths.models_file);
+        const cfg = config.load(allocator, paths.config_file) catch config.default();
+        const list = try models.loadReadOnly(allocator, paths.models_file);
         for (list.models) |m| {
             sys.stdoutPrint("{s}\t{s}\t{s}{s}{s}\n", .{ m.id, m.name, m.profile, if (m.recommended) "\trecommended" else "", if (std.mem.eql(u8, m.id, cfg.model_id)) "\tcurrent" else "" });
         }
@@ -31,7 +29,8 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
 
 fn runInfo(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 1) return errors.Error.InvalidArguments;
-    const list = try models.load(allocator, paths.models_file);
+    try validateCommandId(cmd_args[0]);
+    const list = try models.loadReadOnly(allocator, paths.models_file);
     const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
     try printModelInfo(allocator, m);
     return 0;
@@ -85,13 +84,15 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
             use_model = true;
         } else return errors.Error.InvalidArguments;
     }
-    try models.validateId(id);
+    try validateCommandId(id);
     try models.validateGgufPath(source_path);
     if (!sys.exists(source_path)) return errors.Error.ModelMissing;
+    if (checksum.len > 0) try models.verifySha256(allocator, source_path, checksum);
     const dest_path = try models.installedPath(allocator, paths.models_dir, id);
-    if (std.mem.eql(u8, source_path, dest_path)) {
-        if (checksum.len > 0) try models.verifySha256(allocator, dest_path, checksum);
-    } else {
+    _ = try models.loadReadOnly(allocator, paths.models_file);
+    try xdg.ensureDirs(paths);
+    try models.ensure(paths.models_file);
+    if (!std.mem.eql(u8, source_path, dest_path)) {
         try models.installLocalFile(allocator, source_path, dest_path, checksum);
     }
     const display_name = if (name.len > 0) name else id;
@@ -162,7 +163,7 @@ fn runPullWithAcquirer(
         if (model_url.len > 0 or positional_id.len > 0) return errors.Error.InvalidArguments;
         const hf = try models.parseHfRepo(hf_repo);
         if (id.len == 0) id = try models.defaultIdFromHf(allocator, hf);
-        try models.validateId(id);
+        try validateCommandId(id);
         const file = try models.resolveHfFile(allocator, hf, hf_file);
         const url = try models.hfDownloadUrl(allocator, hf.repo, file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
@@ -177,6 +178,7 @@ fn runPullWithAcquirer(
         m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .path = output_path, .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
     } else {
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
+        try validateCommandId(positional_id);
         const list = try models.load(allocator, paths.models_file);
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
         if (models.url.isRemote(m.download_url)) {
@@ -196,6 +198,8 @@ fn runPullWithAcquirer(
         m.source_url = try models.url.sourceIdentity(allocator, m.download_url);
     }
     m.download_url = models.url.reusableUrl(m.download_url);
+    try xdg.ensureDirs(paths);
+    try models.ensure(paths.models_file);
     try acquirer(allocator, request_model, output_path, false);
     m.path = output_path;
     try models.verifyModel(allocator, m);
@@ -207,9 +211,11 @@ fn runPullWithAcquirer(
 
 fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 1) return errors.Error.InvalidArguments;
+    try validateCommandId(cmd_args[0]);
     const list = try models.load(allocator, paths.models_file);
     const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
     try models.verifyModel(allocator, m);
+    try xdg.ensureDirs(paths);
     try selectModel(allocator, paths, m.id, m.path);
     sys.stdoutPrint("using {s}\n", .{m.id});
     return 0;
@@ -220,7 +226,8 @@ fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     const cfg = config.load(allocator, paths.config_file) catch config.default();
     const id = if (cmd_args.len == 1) cmd_args[0] else cfg.model_id;
     if (id.len == 0) return errors.Error.ModelNotSelected;
-    const list = try models.load(allocator, paths.models_file);
+    try validateCommandId(id);
+    const list = try models.loadReadOnly(allocator, paths.models_file);
     var m = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
     if (cmd_args.len == 0) {
         if (cfg.model_path.len == 0) return errors.Error.ModelNotSelected;
@@ -234,6 +241,10 @@ fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
 fn runRemove(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
+    try validateCommandId(id);
+    const list = try models.load(allocator, paths.models_file);
+    _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
+    try xdg.ensureDirs(paths);
     const removed = try models.removeById(allocator, paths.models_file, id);
     if (models.load(allocator, paths.models_file)) |remaining| {
         if (canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining)) sys.deleteFile(removed.path);
@@ -246,6 +257,11 @@ fn runRemove(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     }
     sys.stdoutPrint("removed {s}\n", .{id});
     return 0;
+}
+
+fn validateCommandId(id: []const u8) !void {
+    if (std.mem.startsWith(u8, id, "-")) return errors.Error.InvalidArguments;
+    try models.validateId(id);
 }
 
 fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u8, path: []const u8, remaining: models.List) bool {
@@ -305,6 +321,47 @@ fn testPullPaths(allocator: std.mem.Allocator, root: []const u8) !xdg.Paths {
         .glossary_file = try std.fs.path.join(allocator, &.{ root, "glossary.toml" }),
         .memory_file = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" }),
     };
+}
+
+fn testFreshPaths(allocator: std.mem.Allocator, root: []const u8) !xdg.Paths {
+    const config_dir = try std.fs.path.join(allocator, &.{ root, "config", "kotoba" });
+    const data_dir = try std.fs.path.join(allocator, &.{ root, "data", "kotoba" });
+    return .{
+        .config_dir = config_dir,
+        .data_dir = data_dir,
+        .cache_dir = try std.fs.path.join(allocator, &.{ root, "cache", "kotoba" }),
+        .state_dir = try std.fs.path.join(allocator, &.{ root, "state", "kotoba" }),
+        .models_dir = try std.fs.path.join(allocator, &.{ data_dir, "models" }),
+        .config_file = try std.fs.path.join(allocator, &.{ config_dir, "config.toml" }),
+        .models_file = try std.fs.path.join(allocator, &.{ config_dir, "models.toml" }),
+        .glossary_file = try std.fs.path.join(allocator, &.{ config_dir, "glossary.toml" }),
+        .memory_file = try std.fs.path.join(allocator, &.{ data_dir, "memory.sqlite3" }),
+    };
+}
+
+test "models list preserves a fresh XDG fixture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testFreshPaths(allocator, root);
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    try std.testing.expect(!sys.exists(paths.config_dir));
+    try std.testing.expect(!sys.exists(paths.data_dir));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(allocator, paths, &.{ "info", "--bogus" }));
+    try std.testing.expect(!sys.exists(paths.config_dir));
+    try std.testing.expect(!sys.exists(paths.data_dir));
+    try std.testing.expectEqual(@as(u8, 0), try run(allocator, paths, &.{"list"}));
+    capture.restore();
+    try std.testing.expectEqualStrings("custom\tCustom local GGUF model\tcustom\nexample-light\tExample Light Model Placeholder\tdefault\trecommended\n", try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 1024));
+    try std.testing.expect(!sys.exists(paths.config_dir));
+    try std.testing.expect(!sys.exists(paths.data_dir));
 }
 
 test "secret URL pull pipeline keeps request transient" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 const config = @import("config.zig");
+const sys = @import("sys.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -229,9 +230,39 @@ pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) !Db {
 }
 
 pub fn openReadOnlyWithFaults(allocator: std.mem.Allocator, path: []const u8, faults: ?*Faults) !Db {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = sys.realPathAlloc(allocator, path) catch return errors.Error.SqliteFailed;
     defer allocator.free(path_z);
+    try checkReadOnlyFiles(allocator, path_z);
     return .{ .handle = try openHandle(path_z, c.SQLITE_OPEN_READONLY, faults), .allocator = allocator, .faults = faults };
+}
+
+fn checkReadOnlyFiles(allocator: std.mem.Allocator, path: []const u8) !void {
+    var header: [28]u8 = undefined;
+    const length = try readHeader(path, &header);
+    // READONLY can still create WAL shared memory or recover a hot journal.
+    // This preflight protects stopped databases, not races with external writers.
+    if (length >= 20 and std.mem.eql(u8, header[0..16], "SQLite format 3\x00") and
+        (header[18] == 2 or header[19] == 2)) return errors.Error.SqliteFailed;
+    for ([_][]const u8{ "-wal", "-shm", "-journal" }) |suffix| {
+        const sidecar = try std.fmt.allocPrint(allocator, "{s}{s}", .{ path, suffix });
+        defer allocator.free(sidecar);
+        sys.cwd().access(sys.io(), sidecar, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return errors.Error.SqliteFailed,
+        };
+        if (!std.mem.eql(u8, suffix, "-journal")) return errors.Error.SqliteFailed;
+        const journal_length = try readHeader(sidecar, &header);
+        if (journal_length != 0 and
+            (journal_length != header.len or !std.mem.allEqual(u8, &header, 0))) return errors.Error.SqliteFailed;
+    }
+}
+
+fn readHeader(path: []const u8, header: []u8) !usize {
+    const stat = sys.cwd().statFile(sys.io(), path, .{}) catch return errors.Error.SqliteFailed;
+    if (stat.kind != .file) return errors.Error.SqliteFailed;
+    const file = sys.cwd().openFile(sys.io(), path, .{}) catch return errors.Error.SqliteFailed;
+    defer file.close(sys.io());
+    return file.readPositionalAll(sys.io(), header, 0) catch errors.Error.SqliteFailed;
 }
 
 fn openHandle(path: [:0]const u8, flags: c_int, faults: ?*Faults) !*c.sqlite3 {
@@ -653,4 +684,58 @@ test "fault sqlite failure real local corrupt readonly prepare rejects unchanged
     const bytes = try file.tmp.dir.readFileAlloc(std.testing.io, "memory.sqlite3", std.testing.allocator, .limited(corrupt.len + 1));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings(corrupt, bytes);
+}
+
+test "readonly memory rejects WAL headers and sidecars before SQLite opens" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    {
+        var db = try open(std.testing.allocator, file.path);
+        defer testClose(&db);
+        try db.upsert(test_key, "stored");
+    }
+    for ([_][]const u8{ "memory.sqlite3-wal", "memory.sqlite3-shm" }) |sidecar| {
+        try file.tmp.dir.writeFile(std.testing.io, .{ .sub_path = sidecar, .data = "" });
+        var faults = Faults{};
+        const result = openReadOnlyWithFaults(std.testing.allocator, file.path, &faults);
+        if (result) |value| {
+            var unexpected = value;
+            testClose(&unexpected);
+        } else |_| {}
+        try std.testing.expectError(errors.Error.SqliteFailed, result);
+        try std.testing.expectEqual(@as(usize, 0), faults.count(.open));
+        try file.tmp.dir.deleteFile(std.testing.io, sidecar);
+    }
+    const db_file = try file.tmp.dir.openFile(std.testing.io, "memory.sqlite3", .{ .mode = .read_write });
+    defer db_file.close(std.testing.io);
+    try db_file.writePositionalAll(std.testing.io, &.{ 2, 2 }, 18);
+    try std.testing.expectError(errors.Error.SqliteFailed, openReadOnly(std.testing.allocator, file.path));
+}
+
+test "readonly memory accepts harmless journals and rejects unsafe headers before open" {
+    var file = try TestDatabaseFile.init();
+    defer file.deinit();
+    {
+        var db = try open(std.testing.allocator, file.path);
+        defer testClose(&db);
+        try db.upsert(test_key, "stored");
+    }
+    const harmless = [_][]const u8{ "", &([_]u8{0} ** 28 ++ [_]u8{'x'} ** 600) };
+    for (harmless) |bytes| {
+        try file.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "memory.sqlite3-journal", .data = bytes });
+        var db = try openReadOnly(std.testing.allocator, file.path);
+        defer testClose(&db);
+        try std.testing.expectEqual(@as(usize, 1), try db.count());
+    }
+    for ([_][]const u8{ "x", "\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" ++ "x" ** 600 }) |bytes| {
+        try file.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "memory.sqlite3-journal", .data = bytes });
+        var faults = Faults{};
+        const result = openReadOnlyWithFaults(std.testing.allocator, file.path, &faults);
+        if (result) |value| {
+            var unexpected = value;
+            testClose(&unexpected);
+        } else |_| {}
+        try std.testing.expectError(errors.Error.SqliteFailed, result);
+        try std.testing.expectEqual(@as(usize, 0), faults.count(.open));
+    }
 }

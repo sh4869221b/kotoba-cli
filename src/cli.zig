@@ -16,10 +16,18 @@ pub fn run(allocator: std.mem.Allocator, args_slice: []const []const u8) !u8 {
     if (args_slice.len < 2) return errors.Error.InvalidArguments;
     const cmd = args_slice[1];
     if (std.mem.eql(u8, cmd, "version")) {
+        if (args_slice.len != 2) return errors.Error.InvalidArguments;
         const sys = @import("sys.zig");
         sys.stdoutPrint("kotoba {s}\n", .{version});
         return 0;
     }
+    if (!std.mem.eql(u8, cmd, "init") and
+        !std.mem.eql(u8, cmd, "translate") and
+        !std.mem.eql(u8, cmd, "doctor") and
+        !std.mem.eql(u8, cmd, "config") and
+        !std.mem.eql(u8, cmd, "models") and
+        !std.mem.eql(u8, cmd, "memory") and
+        !std.mem.eql(u8, cmd, "glossary")) return errors.Error.InvalidArguments;
     const paths = try xdg.paths(allocator);
     if (std.mem.eql(u8, cmd, "init")) return init_cmd.run(allocator, paths, args_slice[2..]);
     if (std.mem.eql(u8, cmd, "translate")) return translate_cmd.run(allocator, paths, args_slice[2..]);
@@ -60,6 +68,11 @@ test "version command" {
     const output = try tmp.dir.readFileAlloc(std.testing.io, "stdout", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("kotoba " ++ version ++ "\n", output);
+}
+
+test "version and unknown commands reject invalid arguments" {
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, &.{ "kotoba", "version", "extra" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, &.{ "kotoba", "unknown" }));
 }
 
 test "json error preference" {

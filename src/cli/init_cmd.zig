@@ -28,16 +28,15 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
             yes = true;
         } else return errors.Error.InvalidArguments;
     }
-    try xdg.ensureDirs(paths);
-    try models.ensure(paths.models_file);
-    try glossary.ensure(paths.glossary_file);
-    const list = try models.load(allocator, paths.models_file);
+    if (model_path.len > 0 and model_id.len == 0) model_id = "custom";
+    if (model_id.len > 0) try models.validateId(model_id);
+    if (explicit_model_path) try models.validateGgufPath(model_path);
+    const list = try models.loadReadOnly(allocator, paths.models_file);
     if (!yes and model_id.len == 0 and model_path.len == 0) {
         printInitChoices(list);
         sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});
         return errors.Error.InvalidArguments;
     }
-    if (model_path.len > 0 and model_id.len == 0) model_id = "custom";
     var selected_registry_model: ?models.Model = null;
     if (model_path.len == 0 and model_id.len > 0) {
         if (models.find(list, model_id)) |m| {
@@ -51,8 +50,6 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         } else return errors.Error.InvalidArguments;
     }
     if (explicit_model_path) {
-        try models.validateId(model_id);
-        try models.validateGgufPath(model_path);
         var registry_model = selected_registry_model orelse models.find(list, model_id) orelse models.Model{
             .id = model_id,
             .name = model_id,
@@ -64,16 +61,39 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         };
         registry_model.path = model_path;
         if (registry_model.checksum.len > 0) try models.verifySha256(allocator, model_path, registry_model.checksum);
-        try models.upsert(allocator, paths.models_file, registry_model);
+        selected_registry_model = registry_model;
     }
     var cfg = config.load(allocator, paths.config_file) catch config.default();
     cfg.model_id = model_id;
     cfg.model_path = model_path;
+    try xdg.ensureDirs(paths);
+    try models.ensure(paths.models_file);
+    try glossary.ensure(paths.glossary_file);
+    if (selected_registry_model) |registry_model| {
+        if (explicit_model_path) try models.upsert(allocator, paths.models_file, registry_model);
+    }
     try config.save(paths.config_file, cfg);
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
     sys.stdoutPrint("initialized\n", .{});
     return 0;
+}
+
+test "init validates selections before creating XDG state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var paths: xdg.Paths = undefined;
+    paths.config_dir = try std.fs.path.join(allocator, &.{ root, "kotoba" });
+    paths.models_file = try std.fs.path.join(allocator, &.{ paths.config_dir, "models.toml" });
+
+    try std.testing.expectError(errors.Error.InvalidArguments, run(allocator, paths, &.{ "--model-id", "../bad", "--model-path", "fixture.gguf" }));
+    paths.models_file = root;
+    try std.testing.expectError(errors.Error.InvalidArguments, run(allocator, paths, &.{ "--model-path", "invalid.txt" }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "kotoba", .{}));
 }
 
 fn printInitChoices(list: models.List) void {

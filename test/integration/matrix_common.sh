@@ -96,6 +96,7 @@ def digest(path: Path) -> str:
 
 def snapshot(root: Path, database: Path, destination: Path, phase: str) -> None:
     entries = []
+    metadata = []
     for path in sorted(root.rglob("*")):
         mode = path.lstat().st_mode
         entry = {"path": str(path.relative_to(root)), "mode": stat.S_IMODE(mode)}
@@ -108,16 +109,44 @@ def snapshot(root: Path, database: Path, destination: Path, phase: str) -> None:
         else:
             entry.update(type="special")
         entries.append(entry)
+        metadata.append({"path": entry["path"], "mtime_ns": path.lstat().st_mtime_ns})
     dump(destination / f"fs-{phase}.json", entries)
+    dump(destination / f"fs-metadata-{phase}.json", metadata)
     state = {"status": "absent"}
     if database.exists() or database.is_symlink():
+        sidecars = [Path(str(database) + suffix) for suffix in ("-wal", "-shm")]
+        journal = Path(str(database) + "-journal")
         try:
-            with closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True)) as db:
-                columns = [row[1] for row in db.execute("PRAGMA table_info(translations)")]
-                rows = list(db.execute("SELECT * FROM translations ORDER BY " + ",".join(str(i + 1) for i in range(len(columns)))))
-                state = {"status": "readable", "columns": columns, "rows": rows, "row_count": len(rows)}
-        except sqlite3.Error as error:
+            with database.open("rb") as stream:
+                header = stream.read(28)
+        except OSError as error:
             state = {"status": "unreadable", "error": str(error)}
+        else:
+            unsafe = []
+            if database.is_symlink():
+                unsafe.append("database_symlink")
+            if len(header) >= 20 and header[:16] == b"SQLite format 3\x00" and (header[18] == 2 or header[19] == 2):
+                unsafe.append("wal_header")
+            unsafe.extend(path.name[len(database.name):] for path in sidecars if path.exists() or path.is_symlink())
+            if journal.exists() or journal.is_symlink():
+                try:
+                    with journal.open("rb") as stream:
+                        journal_header = stream.read(28)
+                except OSError:
+                    unsafe.append("-journal")
+                else:
+                    if journal_header and any(journal_header):
+                        unsafe.append("-journal")
+            if unsafe:
+                state = {"status": "skipped_unsafe", "reason": unsafe, "sqlite_opened": False}
+            else:
+                try:
+                    with closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True)) as db:
+                        columns = [row[1] for row in db.execute("PRAGMA table_info(translations)")]
+                        rows = list(db.execute("SELECT * FROM translations ORDER BY " + ",".join(str(i + 1) for i in range(len(columns)))))
+                        state = {"status": "readable", "columns": columns, "rows": rows, "row_count": len(rows)}
+                except sqlite3.Error as error:
+                    state = {"status": "unreadable", "error": str(error)}
     dump(destination / f"db-{phase}.json", state)
 
 
@@ -206,6 +235,8 @@ def check(directory: Path, args: list[str]) -> None:
         case [kind] if kind in {"fs-equal", "db-equal"}:
             prefix = kind.split("-")[0]
             assert (directory / f"{prefix}-before.json").read_bytes() == (directory / f"{prefix}-after.json").read_bytes(), f"{prefix} state mismatch"
+            if kind == "fs-equal":
+                assert (directory / "fs-metadata-before.json").read_bytes() == (directory / "fs-metadata-after.json").read_bytes(), "filesystem mtime mismatch"
         case ["json", kind]:
             schema(json.loads((directory / "stdout").read_bytes()), kind)
         case ["json-values", expected]:
