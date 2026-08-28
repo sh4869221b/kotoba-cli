@@ -21,13 +21,15 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
     var ok = true;
 
     var have_config = true;
-    const cfg = config.load(allocator, paths.config_file) catch |err| blk: {
+    var owned_config: ?config.OwnedConfig = config.load(allocator, paths.config_file) catch |err| blk: {
         const app_err = errors.fromError(err);
         try checks.append(.{ .name = "config", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         have_config = false;
-        break :blk config.default();
+        break :blk null;
     };
+    defer if (owned_config) |*owner| owner.deinit();
+    const cfg = if (owned_config) |*owner| owner.view() else config.default();
     if (have_config) try checks.append(.{ .name = "config", .status = .ok, .message = "config.toml is readable" });
 
     if (have_config) try checks.append(.{ .name = "llama_cpp", .status = .ok, .message = "embedded llama.cpp runtime is linked" });

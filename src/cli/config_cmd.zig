@@ -14,16 +14,18 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     if (std.mem.eql(u8, cmd_args[0], "get")) {
         if (cmd_args.len != 2) return errors.Error.InvalidArguments;
         try validateConfigKey(cmd_args[1]);
-        const cfg = try config.load(allocator, paths.config_file);
-        try printConfigValue(cfg, cmd_args[1]);
+        var cfg = try config.load(allocator, paths.config_file);
+        defer cfg.deinit();
+        try printConfigValue(cfg.view(), cmd_args[1]);
         return 0;
     }
     if (std.mem.eql(u8, cmd_args[0], "set")) {
         if (cmd_args.len != 3) return errors.Error.InvalidArguments;
         try validateConfigSet(allocator, cmd_args[1], cmd_args[2]);
         var cfg = try config.load(allocator, paths.config_file);
-        try config.setValue(allocator, &cfg, cmd_args[1], cmd_args[2]);
-        try config.save(paths.config_file, cfg);
+        defer cfg.deinit();
+        try cfg.setValue(cmd_args[1], cmd_args[2]);
+        try config.save(paths.config_file, cfg.view());
         return 0;
     }
     return errors.Error.InvalidArguments;
@@ -38,10 +40,9 @@ fn validateConfigKey(key: []const u8) !void {
 
 fn validateConfigSet(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     try validateConfigKey(key);
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var cfg = config.default();
-    try config.setValue(arena.allocator(), &cfg, key, value);
+    var cfg = try config.OwnedConfig.clone(allocator, config.default());
+    defer cfg.deinit();
+    try cfg.setValue(key, value);
 }
 
 fn printConfigValue(cfg: config.Config, key: []const u8) !void {

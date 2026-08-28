@@ -53,7 +53,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         }
     }
     if (opts.text != null and opts.file_path != null) return errors.Error.InvalidArguments;
-    const cfg = try config.load(allocator, paths.config_file);
+    var owned_config = try config.load(allocator, paths.config_file);
+    defer owned_config.deinit();
+    const cfg = owned_config.view();
     if (translate.diagnosticsEnabled(cfg, opts)) {
         sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
     }

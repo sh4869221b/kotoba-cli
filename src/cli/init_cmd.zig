@@ -64,18 +64,19 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
         selected_registry_model = registry_model;
     }
     var cfg = config.load(allocator, paths.config_file) catch |err| switch (err) {
-        error.NotInitialized => config.default(),
+        error.NotInitialized => try config.OwnedConfig.clone(allocator, config.default()),
         else => return err,
     };
-    cfg.model_id = model_id;
-    cfg.model_path = model_path;
+    defer cfg.deinit();
+    try cfg.setValue("model_id", model_id);
+    try cfg.setValue("model_path", model_path);
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
     try glossary.ensure(paths.glossary_file);
     if (selected_registry_model) |registry_model| {
         if (explicit_model_path) try models.upsert(allocator, paths.models_file, registry_model);
     }
-    try config.save(paths.config_file, cfg);
+    try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
     sys.stdoutPrint("initialized\n", .{});
