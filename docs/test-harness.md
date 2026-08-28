@@ -16,8 +16,8 @@ application error.
 
 | `FinishReason` | Producer condition | Consumer behavior |
 | --- | --- | --- |
-| `eog` | End-of-generation token. | Success; append text and upsert the segment. |
-| `max_tokens` | Generation limit reached. | Success; append text and upsert the segment. |
+| `eog` | End-of-generation token. | Validate complete UTF-8/no-NUL text, then append and upsert the segment. |
+| `max_tokens` | Generation limit reached. | Validate complete UTF-8/no-NUL text, then append and upsert the segment. |
 | `context` | Context/KV capacity was unavailable. | Return existing `LlamaDecodeFailed`; do not append or upsert this segment. |
 | `timeout` | Request deadline elapsed. | Return existing `Timeout`; do not append or upsert this segment. |
 | `decode` | Tokenization, token-piece conversion, or another decode failure. | Return existing `LlamaDecodeFailed`; do not append or upsert this segment. |
@@ -25,7 +25,9 @@ application error.
 Timeout takes precedence when a decode status arrives after the deadline.
 The embedded adapter maps status `1` to `context` and other nonzero decode
 statuses to `decode`. The configured token limit remains a successful
-`max_tokens` result. The consumer frees each returned buffer on every path;
+`max_tokens` result when its complete text is encoding-valid. Empty, whitespace,
+and valid partial results remain accepted. Finish-reason errors take precedence
+even when the partial payload is malformed. The consumer frees each returned buffer on every path;
 successful cache writes from earlier segments are not rolled back when a
 later segment fails.
 
@@ -34,8 +36,10 @@ explicit fixture copies arbitrary bytes exactly, including empty, whitespace,
 invalid UTF-8, and truncated bytes. Without a fixture it returns
 `JA:<source_text>` or `EN:<source_text>` according to `target_lang`. It uses
 the structured source and target fields and never parses prompt markers.
-Malformed bytes are payloads, not a new validation feature; #37 validation is
-outside this harness.
+The arbitrary-byte fixture remains a component seam: consumer tests reject
+malformed accepted results before storage/append without adding a runtime
+fixture flag. Structural/content validation from #37 remains outside this
+encoding contract; no malformed real-model generation CLI coverage is claimed.
 
 ## Private state and cleanup
 
@@ -289,6 +293,11 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | --- | --- | --- |
 | `translate-{en-ja,ja-en}-{direct,stdin,txt,md}-{plain,markdown,json}` (24) | 0; exact text or parsed JSON, empty stderr; file routing has empty stdout | Input unchanged; only designated sibling created; no TM changes |
 | `translate-{multiline-plain,multiline-json,include-source-json,technical-json}` | 0; quotes, backslash, tab, newline and UTF-8 preserved; include-source and technical fields checked | FS/TM unchanged |
+| `translate-text-contract-valid-json` | 0; standard JSON parser recovers every U+0001–U+001F, Japanese, emoji and combining mark; exact source and `JA:` translation bytes | FS/TM unchanged |
+| `translate-text-contract-{invalid-stdin-human,nul-stdin-json,truncated-file,nul-file}` | 1; exact human `invalid_utf8` or parsed `embedded_nul` envelope; NUL supplied through stdin/file | Input and TM unchanged; rejected output absent |
+| `translate-text-contract-{invalid-glossary,nul-glossary}`; `commands-glossary-text-contract-{utf8,nul}` | 1; exact encoding error, no success line or rejected body | FS/TM unchanged |
+| `tm-text-contract-legacy-{source,output}-{utf8,nul}` | 1; parsed encoding error only; copied CLI selects normally seeded then raw-corrupted row | Read-only SQL captures full hex/BLOB lengths, all keys, counts/timestamps and DB hash before/after; exact equality and no sidecars |
+| `tm-text-contract-unicode-hit` | 0; full cache hit, exact Unicode translation | Same row/text/keys/created timestamp, hit count +1; existing updated timestamp behavior |
 | `translate-debug-{flag,config,json}` | 0; exact debug diagnostic on stderr, no source/translated bodies there | FS/TM unchanged |
 | `translate-markdown-{fenced,inline,table,link-url,all-protected}` | 0; protected bytes preserved; tables untranslated; no quality claim | FS/TM unchanged |
 | `translate-empty-{direct,stdin,file}` | 2; empty stdout, exact human `invalid_arguments` | FS/TM unchanged |
@@ -326,7 +335,10 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 | --- | --- |
 | `result consumer frees failed partial payloads without appending or caching them` (`translate`) | Timeout maps to `Timeout` / `timeout`; context/decode to `LlamaDecodeFailed` / `llama_decode_failed`; failed payload not appended/cached, previous row retained, allocator cleanup checked |
 | `translateSegments sqlite lookup and upsert failures retain prior rows and fresh fixtures recover` (`translate`) | Borrowed faults at relative step 3/4 return `SqliteFailed`; exact counters and independent read-only observer prove first row retained, second absent; fresh fixtures recover |
-| `result consumer accepts completed and token-limited bytes verbatim` (`translate`) | `eog` and `max_tokens` append/cache partial, invalid UTF-8, empty and whitespace bytes verbatim (8 rows); #31/#37 characterization |
+| `result consumer accepts valid completed and token-limited text` (`translate`) | `eog` and `max_tokens` append/cache full Unicode, valid partial, empty and whitespace bytes unchanged |
+| `result consumer rejects invalid accepted text before persistence`; `result consumer preserves finish error precedence for malformed bytes` (`translate`) | FF/NUL/truncated sequences reject before append/cache with/without DB; timeout/context/decode retain original errors; prior output/rows and allocator cleanup checked |
+| `sqlite column text copies exact byte lengths`; `memory rejects invalid legacy text before bump` (`memory`) | Low-level transport copies legacy NUL without truncation; core lookup rejects malformed rows before mutation |
+| `JSON text contract round trips every emitted variable field`; `JSON text contract rejects invalid emitted fields` (`output`) | Standard-parser exact controls/Unicode for each emitted string; malformed UTF-8/NUL reject; omitted source stays omitted; allocation failures clean up |
 | `restore appends warning when token missing` (`markdown`) | Warning-only success; returned text stays `translation without protected tokens`; #37 |
 | `writeOutput rejects existing destination without overwrite` (`translate`) | `OutputExists`, existing `old` bytes unchanged |
 | `fault fs failure injected write preserves data and entry set`; `fault fs failure rename preserves existing and absent destinations` (`fs`) | Pre-operation injected failure preserves bytes/entries; not mid-write atomicity |
@@ -335,11 +347,11 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |
-| gap | Broken stdout and control-byte serializer paths are not fully CLI covered; ordinary valid JSON is not proof for these paths | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
+| gap | Broken stdout is not fully CLI covered; valid control-byte JSON coverage does not prove stdout-failure handling | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
 | gap | Mid-write regular-file atomicity/rollback; pre-open failures and injected pre-call preservation cannot establish it | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
 | gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
 | gap | Validation before mutation and truly read-only commands; unknown option as initial text is currently accepted | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
-| gap | Invalid/empty result validation and missing protected-token rejection; bytes are accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
+| gap | Content/structure and empty-result policy, including missing protected-token rejection; encoding-valid empty text is accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
 
 Characterizations record today's behavior, not endorsements or permanent
 guarantees. Component failures do not invent corresponding CLI streams/status.

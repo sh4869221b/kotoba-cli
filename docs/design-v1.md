@@ -123,6 +123,20 @@ if their partial bytes are malformed. A selected legacy translation-memory row
 that violates this contract is rejected without repairing, deleting, or
 updating the row.
 
+Direct, file, and stdin text is validated before language detection, including
+when both language options are explicit. The complete glossary document is
+validated before parsing, and borrowed segment/glossary text is checked before
+segment work. Empty input still has its separate argument error; valid empty,
+whitespace, partial, and token-limited generated results remain accepted.
+
+SQLite transport copies text using its full byte length, not a NUL terminator.
+Both selected legacy source and translation are validated before any hit-count
+or timestamp update; rejection does not change rows or their bytes. This is a
+selected-row check, not a scan, migration, or transaction/repair mechanism.
+Success JSON validates every emitted variable string and escapes all controls
+U+0001 through U+001F. Standard JSON decoding preserves the original text;
+source remains omitted unless requested with `--include-source`.
+
 Future MOD support treats a binary container as raw bytes and separately
 extracts translation text for this validation. This document defines that
 responsibility only; it does not add a MOD adapter or container format.

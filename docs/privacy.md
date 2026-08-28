@@ -23,6 +23,29 @@ Kotoba CLI is designed for local-first translation.
 - Logs do not persist source or translated bodies by default.
 - SQLite translation memory stores source and translated text when enabled.
 
+## Translation text and rejected data
+
+Input, glossary, accepted generation, and selected cached source/translation
+must be valid UTF-8 without NUL. Errors exit 1 as `invalid_utf8` (`Text must be
+valid UTF-8.`) or `embedded_nul` (`Text must not contain NUL bytes.`), checking
+UTF-8 first. Diagnostics do not echo rejected bodies. JSON escapes valid
+controls without changing the decoded text, and still omits source unless
+`--include-source` is requested.
+
+Malformed ingress or glossary text fails before translation-memory work.
+Accepted generation is checked after finish-reason errors and before that
+segment is stored or appended; earlier successful segments are not rolled
+back. Encoding-valid empty, partial, whitespace, and `max_tokens` results
+remain accepted. SQLite reads preserve complete byte lengths, so a selected
+legacy row containing malformed UTF-8 or NUL fails without changing its text,
+hit count, or timestamps. There is no automatic repair, deletion, or hidden
+cache miss. `--no-memory` bypasses memory; `memory clear --yes` explicitly
+deletes all stored translations. Existing external backups are unaffected.
+
+Future MOD containers remain raw binary data, with extracted translation text
+validated separately. This distinction is documentation only; no MOD adapter
+or container processing is introduced.
+
 ## Persistent state and inspection commands
 
 Kotoba validates command names, options, required values, argument counts, and
