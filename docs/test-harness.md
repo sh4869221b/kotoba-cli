@@ -247,8 +247,10 @@ bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evid
 bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The matrix currently has 195 measured CLI cases: translate 46, commands 82,
-memory 22, files 45. Setup calls are captured separately, not counted as cases.
+The matrix currently records 332 measured CLI cases: translate 46, commands
+219, memory 22, files 45. Counts come from each run's `summary.json`; never
+infer a pass from a historical total. Setup calls are captured separately,
+not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
 unfinished cases, failed assertions and harness timeouts fail the suite.
 The per-command limit is 120 seconds and the suite limit is 20 minutes. A
@@ -270,6 +272,28 @@ state includes column names, ordered row values and hit counts. The observer
 does not initialize or repair a database. `summary.json` lists every case and
 group count; `cleanup.json` records removed TMP and released lock ownership.
 Evidence contains synthetic source/translation fixtures; no user state is read.
+
+
+The commands group includes `strict61-` persistence cases: exact config
+set/get and registry string round trips checked by independent `tomllib`,
+malformed/unknown/duplicate/schema state, native directory/size/permission
+errors, and human/JSON doctor reports. Each rejected-operation case seeds an
+actual SQLite row and requires exact exit/stdout/stderr plus equal filesystem bytes, modes,
+entries, mtimes, and logical database state. The operation matrix includes
+init, use, remove, import with `--use`, registered/direct-URL/Hugging Face
+pulls with `--use` (including HF metadata discovery), config set and model
+list. Failed preflight must return before acquisition; these cases require no
+model or remote service.
+
+For native permission cases the observer runs as an ordinary non-root UID.
+It snapshots readable state, changes only the target file to mode `000` for
+the actual child, and restores its original mode in `finally` before the
+second snapshot. `receipt.json.permission` distinguishes snapshot and execution
+modes and records UID/EUID and restoration. A root-run suite fails explicitly
+instead of silently skipping this proof. The helper self-test exercises both
+normal child completion and a signal-terminated child; it is observer coverage,
+not product coverage. These are pre-read permission faults, not mid-write
+atomicity or crash-durability tests.
 
 JSON assertions parse the real stdout. Success has exactly `source_lang`,
 `target_lang`, `mode`, `model_id`, `runtime`, `cached`, `cache_status`,
@@ -305,7 +329,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-{top-missing,top-invalid,init-invalid,config-invalid,config-get-arity,models-info-arity,glossary-arity,doctor-arity,memory-clear-arity-absent-db}` and other family arity cases | 2; exact `invalid_arguments`; JSON variants `commands-{invalid-json,doctor-invalid-json}` have parsed error stdout and empty stderr | Initialized failures unchanged; absent-state mutations characterized separately |
 | `commands-doctor-{ready,absent,missing-db}-{human,json}` | 0 ready / 1 absent or missing DB; exact human or typed JSON, empty stderr | Does not create missing state |
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
-| `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity 2; unknown token succeeds as `JA:--bogus` | Model commands eagerly create registry/directories; memory commands create DB when parent exists; #32 characterization |
+| `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
 | `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
 | `tm-disabled-{flag,config}`; `tm-{directory-open-failure,corrupt-open-failure,statement-failure}` | Disabled/open failure 0 uncached, empty warnings; incompatible table 1 with parsed `sqlite_failed`; empty stderr | Disabled sentinel unchanged; invalid DB/directory unchanged, no replacement or new translation |
 | `glossary-{prefer,protect,hash-change,disabled-flag,disabled-config,empty-key-reuse,empty-key-reuse-config}` | 0; parsed JSON; no deterministic glossary substitution claim | Hash change/disable uses distinct key; disabled empty-glossary key reuse hits |
@@ -352,14 +376,14 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 | `checked close {happy,failure,reuse}` (`file_close`) | A real owned descriptor is consumed once; injected late errno is recorded only after the real close; repeated cleanup cannot close a descriptor reused by an unrelated sentinel |
 | `staged output {happy,failure,gate,race,path,cleanup}` (`staged_output`) | Same-parent exclusive stage, exact finished bytes, captured modes, caller gate, collision/no-replace/path/link behavior, and cleanup ownership. Native prefix writes use real stage bytes; injected flush/sync/close/rename labels remain component evidence. |
 | `writeOutput failure boundaries propagate native errors without publication` (`translate`) | Existing and absent output targets retain the expected state across the staged write boundary; no CLI stream/status is inferred from this component test |
-| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Missing managed file remains benign; realpath/reload/deletion failures propagate and do not print `removed`; no transaction or rollback is added |
+| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Config preflight fails before mutation; missing managed file remains benign. Native registry-directory reload is `IsDir`, injected reload stays `ModelsInvalid`; realpath/reload/deletion failures propagate without `removed`. Registry removal may already be saved, with config/model retained; no transaction or rollback is added |
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |
 | gap | Broken stdout is not fully CLI covered; valid control-byte JSON coverage does not prove stdout-failure handling | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
 | bounded | Issue #25 covers normal write/flush/sync/checked-close/rename failures through a same-parent stage. Native RLIMIT CLI failure and real component prefix bytes are distinct from injected late boundaries. It does not promise TM rollback, directory fsync/power-loss durability, process-kill cleanup, or adversarial same-UID stage-tampering protection. | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
 | gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
-| gap | Validation before mutation and truly read-only commands; unknown option as initial text is currently accepted | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
+| covered | Rejected argv and read-only commands preserve absent state; unknown initial options are rejected. This does not establish concurrent-writer safety. | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
 | gap | Content/structure and empty-result policy, including missing protected-token rejection; encoding-valid empty text is accepted and missing tokens only warn | [#37](https://github.com/sh4869221b/kotoba-cli/issues/37) |
 
 Characterizations record today's behavior, not endorsements or permanent

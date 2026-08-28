@@ -19,6 +19,7 @@ matrix_case() {
   CASE_DIR="${MATRIX_CAPTURE}/cases/${id}"
   CASE_STDIN="${CASE_DIR}/stdin"
   CASE_SETUP_COUNT=0
+  export CASE_DENY_READ=""
   export CASE_FILE_SIZE_LIMIT=""
   export HOME="${CASE_ROOT}/home" XDG_CONFIG_HOME="${CASE_ROOT}/config" XDG_DATA_HOME="${CASE_ROOT}/data"
   export XDG_CACHE_HOME="${CASE_ROOT}/cache" XDG_STATE_HOME="${CASE_ROOT}/state"
@@ -219,15 +220,34 @@ def capture(args: list[str]) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    with (directory / "stdin").open("rb") as stdin, (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
-        process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True,
-                                   preexec_fn=limit_child if file_size_limit is not None else None)
-        try:
-            process.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            receipt["harness_timeout"] = True
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+    denied = Path(os.environ["CASE_DENY_READ"]) if os.environ.get("CASE_DENY_READ") else None
+    original_mode = None
+    try:
+        if denied is not None:
+            assert os.geteuid() != 0, "permission cases require an ordinary unprivileged UID"
+            assert denied.is_relative_to(root) and not denied.is_symlink() and denied.is_file()
+            assert denied.stat().st_uid == os.geteuid()
+            original_mode = stat.S_IMODE(denied.stat().st_mode)
+            denied.chmod(0)
+            receipt["permission"] = {"path": str(denied.relative_to(root)), "uid": os.getuid(),
+                                     "euid": os.geteuid(), "snapshot_mode": original_mode,
+                                     "execution_mode": stat.S_IMODE(denied.stat().st_mode), "restored": False}
+            assert receipt["permission"]["execution_mode"] == 0 and not os.access(denied, os.R_OK)
+            dump(directory / "receipt.json", receipt)
+        with (directory / "stdin").open("rb") as stdin, (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
+            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True,
+                                       preexec_fn=limit_child if file_size_limit is not None else None)
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                receipt["harness_timeout"] = True
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    finally:
+        if original_mode is not None:
+            denied.chmod(original_mode)
+            receipt["permission"]["restored"] = stat.S_IMODE(denied.stat().st_mode) == original_mode
+            dump(directory / "receipt.json", receipt)
     receipt["status"] = process.returncode if process.returncode >= 0 else 128 - process.returncode
     receipt["signal"] = interrupted
     (directory / "status").write_text(str(receipt["status"]) + "\n")

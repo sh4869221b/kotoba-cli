@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import subprocess
 import sys
@@ -156,7 +157,7 @@ def doctor(json_format: bool, missing: bool = False, unsafe: bool = True, label:
             assert any(check["name"] == "model_checksum" and check["status"] == "ok" for check in document["checks"])
     else:
         assert raw.decode().count("warn: model_source_credentials: " + warning + "\n") == int(unsafe)
-        assert (b"error: config: config.toml is missing or invalid\n" in raw) == missing
+        assert (b"error: config: Kotoba is not initialized. Run `kotoba init`.\n" in raw) == missing
     unchanged(before, label)
 
 
@@ -329,10 +330,12 @@ result = subprocess.run([str(unit)], cwd=root, capture_output=True, timeout=120)
 assert result.returncode == 0, "component unit runner failed"
 assert b"secret URL pull pipeline keeps request transient...OK" in result.stderr
 assert b"secret URL redirects reject credentials before next request...OK" in result.stderr
+component_summary = re.findall(rb"^All ([1-9][0-9]*) tests passed\.$", result.stderr, re.M)
+assert len(component_summary) == 1, "missing or ambiguous successful component test summary"
 manifest = {**binding,
             "binarySHA256": digest(binary), "unitBinarySHA256": digest(unit), "groups": groups,
             "real_cli_cases": len(cases), "setup_cases": sum(c.endswith("setup-init") for c in cases),
-            "component_tests": result.stderr.count(b"...OK"), "component_exit": result.returncode,
+            "component_tests": int(component_summary[0]), "component_exit": result.returncode,
             "component_command": [str(unit)], "group_case_counts": {g: sum(c.startswith(g + "-") for c in cases) for g in groups},
             "signed_success_surface": "component-injected-downloader", "owned_listener_joined": True,
             "no_model_temp_files": True, "timestamp": datetime.now(timezone.utc).isoformat()}

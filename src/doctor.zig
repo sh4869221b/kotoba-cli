@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const errors = @import("errors.zig");
 const glossary = @import("glossary.zig");
 const memory = @import("memory.zig");
 const models = @import("models.zig");
@@ -20,8 +21,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
     var ok = true;
 
     var have_config = true;
-    const cfg = config.load(allocator, paths.config_file) catch blk: {
-        try checks.append(.{ .name = "config", .status = .@"error", .code = "not_initialized", .message = "config.toml is missing or invalid" });
+    const cfg = config.load(allocator, paths.config_file) catch |err| blk: {
+        const app_err = errors.fromError(err);
+        try checks.append(.{ .name = "config", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         have_config = false;
         break :blk config.default();
@@ -30,8 +32,9 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
 
     if (have_config) try checks.append(.{ .name = "llama_cpp", .status = .ok, .message = "embedded llama.cpp runtime is linked" });
 
-    const list = models.load(allocator, paths.models_file) catch {
-        try checks.append(.{ .name = "models", .status = .@"error", .code = "models_invalid", .message = "models.toml is missing or invalid" });
+    const list = models.load(allocator, paths.models_file) catch |err| {
+        const app_err = errors.fromError(err);
+        try checks.append(.{ .name = "models", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         if (!have_config) return print(allocator, checks.items, ok, json);
         try appendModelChecks(allocator, null, cfg, &checks, &ok);
@@ -174,6 +177,83 @@ fn countText(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
+fn testLoadErrorCategories(config_failure: bool) !void {
+    const cases = [_]struct {
+        text: ?[]const u8 = null,
+        directory: bool = false,
+        code: []const u8,
+        message: []const u8,
+    }{
+        .{ .text = if (config_failure) "gpu_layers = \"auto\"\n" else "[[models]]\nid = \"fixture61\"\nrecommended = \"true\"\n", .code = if (config_failure) "config_invalid" else "models_invalid", .message = if (config_failure) "config.toml is invalid." else "models.toml is invalid." },
+        .{ .code = "not_initialized", .message = "Kotoba is not initialized. Run `kotoba init`." },
+        .{ .text = "unknown = \"KOTOBA_BODY_SECRET_61\"\n", .code = if (config_failure) "config_invalid" else "models_invalid", .message = if (config_failure) "config.toml is invalid." else "models.toml is invalid." },
+        .{ .text = "schema_version = 2\n", .code = if (config_failure) "config_schema_unsupported" else "models_schema_unsupported", .message = if (config_failure) "config.toml uses an unsupported schema or version." else "models.toml uses an unsupported schema or version." },
+        .{ .directory = true, .code = "io_error", .message = "IsDir" },
+    };
+    for (cases) |case| {
+        for ([_]bool{ true, false }) |json| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var tmp = std.testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+            const paths = try testDoctorPaths(allocator, root);
+            const failed_path = if (config_failure) paths.config_file else paths.models_file;
+            const valid_path = if (config_failure) paths.models_file else paths.config_file;
+            try sys.writeFile(valid_path, "# valid untouched state\n");
+            if (case.text) |text| try sys.writeFile(failed_path, text);
+            if (case.directory) try tmp.dir.createDir(std.testing.io, if (config_failure) "config.toml" else "models.toml", .default_dir);
+            const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+            defer output.close(sys.io());
+            var capture = try TestStdoutCapture.start(output);
+            defer capture.restore();
+            const exit_code = try run(allocator, paths, json);
+            capture.restore();
+            const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
+            try std.testing.expectEqual(@as(u8, 1), exit_code);
+            const name = if (config_failure) "config" else "models";
+            if (json) {
+                const report = try std.json.parseFromSlice(struct { ok: bool, checks: []Check }, allocator, rendered, .{});
+                defer report.deinit();
+                try std.testing.expect(!report.value.ok);
+                const check = report.value.checks[if (config_failure) 0 else 2];
+                try std.testing.expectEqualStrings(name, check.name);
+                try std.testing.expectEqual(Status.@"error", check.status);
+                try std.testing.expectEqualStrings(case.code, check.code);
+                try std.testing.expectEqualStrings(case.message, check.message);
+                if (config_failure) try std.testing.expectEqual(@as(usize, 2), report.value.checks.len);
+            } else {
+                const expected = try std.fmt.allocPrint(allocator, "error: {s}: {s}\n", .{ name, case.message });
+                try std.testing.expect(std.mem.startsWith(u8, rendered, if (config_failure) expected else "ok: config: config.toml is readable\nok: llama_cpp: embedded llama.cpp runtime is linked\n"));
+                try std.testing.expectEqual(@as(usize, 1), countText(rendered, expected));
+                if (config_failure) try std.testing.expectEqual(@as(usize, 2), countText(rendered, "\n"));
+            }
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_BODY_SECRET_61") == null);
+            try std.testing.expectEqualStrings("# valid untouched state\n", try sys.readFileAlloc(allocator, valid_path, 8192));
+            if (case.text) |text| {
+                try std.testing.expectEqualStrings(text, try sys.readFileAlloc(allocator, failed_path, 8192));
+            } else if (case.directory) {
+                try std.testing.expectError(error.IsDir, sys.readFileAlloc(allocator, failed_path, 8192));
+            } else {
+                try std.testing.expect(!sys.exists(failed_path));
+            }
+            var entries = tmp.dir.iterate();
+            var entry_count: usize = 0;
+            while (try entries.next(std.testing.io)) |_| entry_count += 1;
+            try std.testing.expectEqual(@as(usize, if (case.text != null or case.directory) 3 else 2), entry_count);
+        }
+    }
+}
+
+test "strict doctor config load error categories" {
+    try testLoadErrorCategories(true);
+}
+
+test "strict doctor registry load error categories" {
+    try testLoadErrorCategories(false);
+}
+
 test "secret URL doctor ignores sanitized source and local metadata" {
     var checks = std.array_list.Managed(Check).init(std.testing.allocator);
     defer checks.deinit();
@@ -218,6 +298,8 @@ test "secret URL doctor scans all legacy entries" {
     capture.restore();
     const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
     try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings(config_text, try sys.readFileAlloc(allocator, paths.config_file, 8192));
+    try std.testing.expectEqualStrings(registry_text, try sys.readFileAlloc(allocator, paths.models_file, 8192));
     try std.testing.expectEqual(@as(usize, 1), countText(rendered, "warn: model_source_credentials: "));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_QUERY_SECRET_36") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_USER_36") == null);

@@ -3,6 +3,7 @@ const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
+const strict = @import("strict_toml.zig");
 
 pub const Mode = enum {
     default,
@@ -86,97 +87,206 @@ pub fn default() Config {
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch return errors.Error.NotInitialized;
+    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return errors.Error.NotInitialized,
+        else => return err,
+    };
     defer allocator.free(data);
     return parse(allocator, data);
 }
 
+test "strict config loader distinguishes missing files without creating paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "missing", "config.toml" });
+    try std.testing.expectError(error.NotInitialized, load(allocator, path));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+}
+
+test "strict config loader preserves size failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    const data = try allocator.alloc(u8, 1048577);
+    @memset(data, ' ');
+    try sys.writeFile(path, data);
+    try std.testing.expectError(error.StreamTooLong, load(allocator, path));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, data.len + 1));
+}
+
+test "strict config loader preserves directory failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expectError(error.IsDir, load(std.testing.allocator, root));
+}
+
+test "strict config loader preserves parse schema and allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    for ([_]struct { data: []const u8, expected: anyerror }{
+        .{ .data = "gpu_layers = 'auto'\n", .expected = error.ConfigInvalid },
+        .{ .data = "version = 2\n", .expected = error.ConfigSchemaUnsupported },
+    }) |case| {
+        try sys.writeFile(path, case.data);
+        try std.testing.expectError(case.expected, load(allocator, path));
+        try std.testing.expectEqualStrings(case.data, try sys.readFileAlloc(allocator, path, 1024));
+    }
+    const valid = "model_id = 'local'\n";
+    try sys.writeFile(path, valid);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), path));
+    try std.testing.expectEqualStrings("local", (try load(allocator, path)).model_id);
+    try std.testing.expectEqualStrings(valid, try sys.readFileAlloc(allocator, path, 1024));
+}
+
+test "strict config loader preserves native access denied" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    const data = "model_id = 'private'\n";
+    try sys.writeFile(path, data);
+    const file = try tmp.dir.openFile(std.testing.io, "config.toml", .{});
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0));
+    defer file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
+    try std.testing.expectError(error.AccessDenied, load(allocator, path));
+    try file.setPermissions(std.testing.io, .fromMode(0o600));
+    try std.testing.expectEqualStrings(data, try sys.readFileAlloc(allocator, path, 1024));
+}
+
+/// String fields present in the input are caller-owned; omitted fields borrow defaults.
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Config {
+    return parseStrict(allocator, data) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ConfigSchemaUnsupported => error.ConfigSchemaUnsupported,
+        else => error.ConfigInvalid,
+    };
+}
+
+fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !Config {
     var cfg = default();
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        const p = toml.pair(line) orelse continue;
-        const val = toml.unquote(p.value);
-        if (std.mem.eql(u8, p.key, "default_source_lang")) {
-            cfg.default_source_lang = if (val.len == 0) null else try lang.Language.parse(val);
-        } else if (std.mem.eql(u8, p.key, "default_target_lang")) {
-            cfg.default_target_lang = try lang.Language.parse(val);
-        } else if (std.mem.eql(u8, p.key, "default_mode")) {
-            cfg.default_mode = try Mode.parse(val);
-        } else if (std.mem.eql(u8, p.key, "default_output")) {
-            cfg.default_output = try OutputFormat.parse(val);
-        } else if (std.mem.eql(u8, p.key, "model_id")) {
-            cfg.model_id = try allocator.dupe(u8, val);
-        } else if (std.mem.eql(u8, p.key, "model_path")) {
-            cfg.model_path = try allocator.dupe(u8, val);
-        } else if (std.mem.eql(u8, p.key, "gpu_layers")) {
-            cfg.gpu_layers = toml.signedIntValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "context_length")) {
-            cfg.context_length = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "threads")) {
-            cfg.threads = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "max_tokens")) {
-            cfg.max_tokens = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "temperature")) {
-            cfg.temperature = std.fmt.parseFloat(f32, val) catch return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "timeout_sec")) {
-            cfg.timeout_sec = toml.intValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "memory_enabled")) {
-            cfg.memory_enabled = toml.boolValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "glossary_enabled")) {
-            cfg.glossary_enabled = toml.boolValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "privacy_mode")) {
-            cfg.privacy_mode = toml.boolValue(p.value) orelse return errors.Error.ConfigInvalid;
-        } else if (std.mem.eql(u8, p.key, "log_level")) {
-            cfg.log_level = try allocator.dupe(u8, val);
+    var seen = [_]bool{false} ** settable_keys.len;
+    var owned = [_]bool{false} ** settable_keys.len;
+    errdefer inline for (settable_keys, 0..) |key, index| {
+        if (@TypeOf(@field(cfg, key)) == []const u8 and owned[index]) allocator.free(@field(cfg, key));
+    };
+    var reader: strict.Reader = .{ .data = data };
+    while (try reader.next()) |line| {
+        const pair = switch (line) {
+            .header => |header| {
+                if (strict.isSchemaMarker(header.name)) return error.ConfigSchemaUnsupported;
+                return error.Invalid;
+            },
+            .pair => |pair| pair,
+        };
+        if (strict.isSchemaMarker(pair.key)) return error.ConfigSchemaUnsupported;
+        var matched = false;
+        inline for (settable_keys, 0..) |key, index| {
+            if (std.mem.eql(u8, key, pair.key)) {
+                if (seen[index]) return error.Invalid;
+                seen[index] = true;
+                matched = true;
+                const T = @TypeOf(@field(cfg, key));
+                if (T == []const u8) {
+                    @field(cfg, key) = try strict.parseString(allocator, pair.value);
+                    owned[index] = true;
+                } else switch (@typeInfo(T)) {
+                    .optional, .@"enum" => {
+                        const value = try strict.parseString(allocator, pair.value);
+                        defer allocator.free(value);
+                        @field(cfg, key) = if (T == ?lang.Language)
+                            (if (value.len == 0) null else try lang.Language.parse(value))
+                        else
+                            try T.parse(value);
+                    },
+                    .int => @field(cfg, key) = try strict.parseInt(T, pair.value),
+                    .float => @field(cfg, key) = try strict.parseFloat(pair.value),
+                    .bool => @field(cfg, key) = try strict.parseBool(pair.value),
+                    else => unreachable,
+                }
+            }
         }
+        if (!matched) return error.Invalid;
     }
     return cfg;
 }
 
 pub fn save(path: []const u8, cfg: Config) !void {
-    const data = try std.fmt.allocPrint(std.heap.page_allocator,
-        \\default_source_lang = "{s}"
-        \\default_target_lang = "{s}"
-        \\default_mode = "{s}"
-        \\default_output = "{s}"
-        \\model_id = "{s}"
-        \\model_path = "{s}"
-        \\gpu_layers = {d}
-        \\context_length = {d}
-        \\threads = {d}
-        \\max_tokens = {d}
-        \\temperature = {d}
-        \\timeout_sec = {d}
-        \\memory_enabled = {}
-        \\glossary_enabled = {}
-        \\privacy_mode = {}
-        \\log_level = "{s}"
-        \\
-    , .{
-        if (cfg.default_source_lang) |l| l.asText() else "",
-        cfg.default_target_lang.asText(),
-        cfg.default_mode.asText(),
-        cfg.default_output.asText(),
-        cfg.model_id,
-        cfg.model_path,
-        cfg.gpu_layers,
-        cfg.context_length,
-        cfg.threads,
-        cfg.max_tokens,
-        cfg.temperature,
-        cfg.timeout_sec,
-        cfg.memory_enabled,
-        cfg.glossary_enabled,
-        cfg.privacy_mode,
-        cfg.log_level,
-    });
-    defer std.heap.page_allocator.free(data);
-    try sys.writeFile(path, data);
+    var out = strict.Buffer.init(std.heap.page_allocator);
+    defer out.deinit();
+    appendConfig(&out, cfg) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ConfigInvalid,
+    };
+    try sys.writeFile(path, out.items);
+}
+
+fn appendConfig(out: *strict.Buffer, cfg: Config) !void {
+    inline for (settable_keys) |key| {
+        try out.appendSlice(key ++ " = ");
+        const value = @field(cfg, key);
+        const T = @TypeOf(value);
+        if (T == []const u8) {
+            try strict.appendString(out, value);
+        } else switch (@typeInfo(T)) {
+            .optional => try strict.appendString(out, if (value) |language| language.asText() else ""),
+            .@"enum" => try strict.appendString(out, value.asText()),
+            .int => try out.print("{d}", .{value}),
+            .float => try strict.appendFloat(out, value),
+            .bool => try out.print("{}", .{value}),
+            else => unreachable,
+        }
+        try out.append('\n');
+    }
 }
 
 pub fn setValue(allocator: std.mem.Allocator, cfg: *Config, key: []const u8, value: []const u8) !void {
-    if (std.mem.eql(u8, key, "model_id")) cfg.model_id = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "model_path")) cfg.model_path = try allocator.dupe(u8, value) else if (std.mem.eql(u8, key, "gpu_layers")) cfg.gpu_layers = toml.signedIntValue(value) orelse return errors.Error.InvalidArguments else if (std.mem.eql(u8, key, "context_length")) cfg.context_length = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "threads")) cfg.threads = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "max_tokens")) cfg.max_tokens = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "temperature")) cfg.temperature = try std.fmt.parseFloat(f32, value) else if (std.mem.eql(u8, key, "memory_enabled")) cfg.memory_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "glossary_enabled")) cfg.glossary_enabled = try parseBool(value) else if (std.mem.eql(u8, key, "default_source_lang")) cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_target_lang")) cfg.default_target_lang = try lang.Language.parse(value) else if (std.mem.eql(u8, key, "default_mode")) cfg.default_mode = try Mode.parse(value) else if (std.mem.eql(u8, key, "default_output")) cfg.default_output = try OutputFormat.parse(value) else if (std.mem.eql(u8, key, "timeout_sec")) cfg.timeout_sec = try std.fmt.parseInt(u32, value, 10) else if (std.mem.eql(u8, key, "privacy_mode")) cfg.privacy_mode = try parseBool(value) else if (std.mem.eql(u8, key, "log_level")) cfg.log_level = try allocator.dupe(u8, value) else return errors.Error.InvalidArguments;
+    inline for (settable_keys) |candidate| {
+        if (std.mem.eql(u8, key, candidate)) {
+            const T = @TypeOf(@field(cfg, candidate));
+            if (T == []const u8) {
+                strict.validateString(value) catch return error.InvalidArguments;
+                @field(cfg, candidate) = try allocator.dupe(u8, value);
+            } else switch (@typeInfo(T)) {
+                .optional => cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value),
+                .@"enum" => @field(cfg, candidate) = try T.parse(value),
+                .int => @field(cfg, candidate) = if (T == i32)
+                    toml.signedIntValue(value) orelse return error.InvalidArguments
+                else
+                    std.fmt.parseInt(T, value, 10) catch return error.InvalidArguments,
+                .float => {
+                    const parsed = std.fmt.parseFloat(f32, value) catch return error.InvalidArguments;
+                    if (!std.math.isFinite(parsed)) return error.InvalidArguments;
+                    @field(cfg, candidate) = parsed;
+                },
+                .bool => @field(cfg, candidate) = try parseBool(value),
+                else => unreachable,
+            }
+            return;
+        }
+    }
+    return error.InvalidArguments;
 }
 
 pub fn getValue(allocator: std.mem.Allocator, cfg: *const Config, key: []const u8) ![]const u8 {

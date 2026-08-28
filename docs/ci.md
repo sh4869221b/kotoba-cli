@@ -77,15 +77,15 @@ outputs. Clang is a build-only dependency, not a new application dependency.
 The GitHub step summary contains identity/status/counts; these jobs do not
 publish downloadable release binaries or promise uploaded evidence artifacts.
 
-CPU currently executes 205 passing tests and skips the one deterministic-only
+CPU currently executes 253 passing tests and skips the one deterministic-only
 `translateSegments sqlite lookup and upsert failures retain prior rows and fresh
-fixtures recover` test. The deterministic profile executes all 206. Counts are
+fixtures recover` test. The deterministic profile executes all 254. Counts are
 parsed from actual runner output, not hard-coded totals; skips are separate from
 executed tests. The build contract compares CPU/deterministic build counts with
 installed, copied, stdin-closed `kotoba-tests` runs and checks the exact skip name.
 
 The full CLI matrix is unconditional and rejects absent/empty groups or missing
-passing receipts. It currently records 195 cases: translate 46, commands 82,
+passing receipts. It currently records 332 cases: translate 46, commands 219,
 memory 22, files 45. Its standalone command is:
 
 ```bash
@@ -96,7 +96,7 @@ bash test/integration/parallel.sh --rounds 3 --evidence-dir "$PWD/.omo/evidence/
 Each parallel round has nine children: four unit, two smoke, one benchmark,
 and two full matrices. Two CI rounds therefore have 18 children and eight unit
 logs. See [test-harness.md](test-harness.md#cli-contract-matrix) for separate CLI
-and component observations and explicit #13/#31/#32/#37 gaps. The checks cover
+and component observations and explicit #13/#31/#37 gaps. The checks cover
 the bounded Issue #25 staged-publication contract; they do not establish
 real-model quality, content/structure or empty-result policy, TM rollback, directory durability, or
 protection against a hostile same-UID stage writer.

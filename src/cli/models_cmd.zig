@@ -12,7 +12,7 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     const sub = cmd_args[0];
     if (std.mem.eql(u8, sub, "list")) {
         if (cmd_args.len != 1) return errors.Error.InvalidArguments;
-        const cfg = config.load(allocator, paths.config_file) catch config.default();
+        const cfg = try loadConfigOrDefault(allocator, paths.config_file);
         const list = try models.loadReadOnly(allocator, paths.models_file);
         for (list.models) |m| {
             sys.stdoutPrint("{s}\t{s}\t{s}{s}{s}\n", .{ m.id, m.name, m.profile, if (m.recommended) "\trecommended" else "", if (std.mem.eql(u8, m.id, cfg.model_id)) "\tcurrent" else "" });
@@ -91,6 +91,7 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     if (checksum.len > 0) try models.verifySha256(allocator, source_path, checksum);
     const dest_path = try models.installedPath(allocator, paths.models_dir, id);
     _ = try models.loadReadOnly(allocator, paths.models_file);
+    if (use_model) _ = try loadConfigOrDefault(allocator, paths.config_file);
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
     if (!std.mem.eql(u8, source_path, dest_path)) {
@@ -166,6 +167,9 @@ fn runPullWithAcquirer(
         const hf = try models.parseHfRepo(hf_repo);
         if (id.len == 0) id = try models.defaultIdFromHf(allocator, hf);
         try validateCommandId(id);
+        if (hf_file.len > 0) try models.validateSingleHfGgufFilename(hf_file);
+        _ = try models.loadReadOnly(allocator, paths.models_file);
+        if (use_model) _ = try loadConfigOrDefault(allocator, paths.config_file);
         const file = try models.resolveHfFile(allocator, hf, hf_file);
         const url = try models.hfDownloadUrl(allocator, hf.repo, file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
@@ -176,11 +180,14 @@ fn runPullWithAcquirer(
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
         if (checksum.len == 0) return errors.Error.InvalidArguments;
         try models.validateId(id);
+        _ = try models.loadReadOnly(allocator, paths.models_file);
+        if (use_model) _ = try loadConfigOrDefault(allocator, paths.config_file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
         m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .path = output_path, .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
     } else {
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
         try validateCommandId(positional_id);
+        if (use_model) _ = try loadConfigOrDefault(allocator, paths.config_file);
         const list = try models.load(allocator, paths.models_file);
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
         if (models.url.isRemote(m.download_url)) {
@@ -214,6 +221,7 @@ fn runPullWithAcquirer(
 fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 1) return errors.Error.InvalidArguments;
     try validateCommandId(cmd_args[0]);
+    _ = try loadConfigOrDefault(allocator, paths.config_file);
     const list = try models.load(allocator, paths.models_file);
     const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
     try models.verifyModel(allocator, m);
@@ -225,7 +233,8 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
 
 fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len > 1) return errors.Error.InvalidArguments;
-    const cfg = config.load(allocator, paths.config_file) catch config.default();
+    if (cmd_args.len == 1) try validateCommandId(cmd_args[0]);
+    const cfg = try loadConfigOrDefault(allocator, paths.config_file);
     const id = if (cmd_args.len == 1) cmd_args[0] else cfg.model_id;
     if (id.len == 0) return errors.Error.ModelNotSelected;
     try validateCommandId(id);
@@ -250,6 +259,7 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
     try validateCommandId(id);
+    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
     const list = try models.load(allocator, paths.models_file);
     _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
     try xdg.ensureDirs(paths);
@@ -258,7 +268,6 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, filesystem)) {
         _ = try filesystem.removeFileIfExists(removed.path);
     }
-    var cfg = config.load(allocator, paths.config_file) catch config.default();
     if (std.mem.eql(u8, cfg.model_id, id)) {
         cfg.model_id = "";
         cfg.model_path = "";
@@ -290,8 +299,15 @@ fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u
     return true;
 }
 
+fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !config.Config {
+    return config.load(allocator, path) catch |err| switch (err) {
+        error.NotInitialized => config.default(),
+        else => return err,
+    };
+}
+
 pub fn selectModel(allocator: std.mem.Allocator, paths: xdg.Paths, id: []const u8, model_path: []const u8) !void {
-    var cfg = config.load(allocator, paths.config_file) catch config.default();
+    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
     cfg.model_id = try allocator.dupe(u8, id);
     cfg.model_path = try allocator.dupe(u8, model_path);
     try config.save(paths.config_file, cfg);
@@ -551,6 +567,198 @@ test "secret URL model info renders remote identities only" {
     }
 }
 
+const PreflightCommand = enum { init, use, remove, import_use, pull_use, list, verify, select, pull_hf };
+
+fn testStateSnapshot(allocator: std.mem.Allocator, dir: std.Io.Dir) ![]const u8 {
+    var entries = std.array_list.Managed([]const u8).init(allocator);
+    var iterator = dir.iterate();
+    while (try iterator.next(sys.io())) |entry| {
+        if (std.mem.eql(u8, entry.name, "stdout")) continue;
+        const contents = if (entry.kind == .file) try dir.readFileAlloc(sys.io(), entry.name, allocator, .limited(3 * 1024 * 1024)) else "";
+        try entries.append(try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ entry.name, @tagName(entry.kind), try sys.hexSha256(allocator, contents) }));
+    }
+    std.mem.sort([]const u8, entries.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    return std.mem.join(allocator, "\n", entries.items);
+}
+
+fn testPreflight(command: PreflightCommand, registry_failure: bool) !void {
+    for ([_]enum { malformed, schema, directory, oversize }{ .malformed, .schema, .directory, .oversize }) |failure| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(sys.io(), ".", allocator);
+        var paths = try testPullPaths(allocator, root);
+        paths.cache_dir = try std.fs.path.join(allocator, &.{ root, "uncached" });
+        paths.state_dir = try std.fs.path.join(allocator, &.{ root, "unstated" });
+        const dest = try models.installedPath(allocator, root, "fixture");
+        try sys.writeFile(dest, "preserve installed model bytes");
+        var registry_models = [_]models.Model{.{ .id = "fixture", .path = dest, .download_url = "https://models.example.invalid/fixture.gguf" }};
+        try models.save(paths.models_file, .{ .models = &registry_models });
+        try config.save(paths.config_file, .{ .model_id = "fixture", .model_path = dest, .threads = 7 });
+        try sys.writeFile(paths.glossary_file, "preserve glossary bytes");
+        var db = try @import("../memory.zig").open(allocator, paths.memory_file);
+        db.close();
+        const failed_path = if (registry_failure) paths.models_file else paths.config_file;
+        const expected: anyerror = switch (failure) {
+            .malformed => if (registry_failure) error.ModelsInvalid else error.ConfigInvalid,
+            .schema => if (registry_failure) error.ModelsSchemaUnsupported else error.ConfigSchemaUnsupported,
+            .directory => error.IsDir,
+            .oversize => error.StreamTooLong,
+        };
+        switch (failure) {
+            .malformed => try sys.writeFile(failed_path, if (registry_failure) "[[models]]\nid = \"fixture\"\nid = \"duplicate\"\n" else "gpu_layers = \"auto\"\n"),
+            .schema => try sys.writeFile(failed_path, "schema_version = 2\n"),
+            .directory => {
+                try std.Io.Dir.cwd().deleteFile(sys.io(), failed_path);
+                try std.Io.Dir.cwd().createDir(sys.io(), failed_path, .default_dir);
+            },
+            .oversize => {
+                const bytes = try allocator.alloc(u8, (if (registry_failure) @as(usize, 2) else 1) * 1024 * 1024 + 1);
+                @memset(bytes, ' ');
+                try sys.writeFile(failed_path, bytes);
+            },
+        }
+        const before = try testStateSnapshot(allocator, tmp.dir);
+        const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+        defer output.close(sys.io());
+        var capture = try TestStdoutCapture.start(output);
+        defer capture.restore();
+        const Fixture = struct {
+            var calls: usize = 0;
+            fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: bool) !void {
+                calls += 1;
+                return error.UnexpectedAcquirerCall;
+            }
+        };
+        Fixture.calls = 0;
+        const result = switch (command) {
+            .init => @import("init_cmd.zig").run(allocator, paths, &.{"--yes"}),
+            .use => run(allocator, paths, &.{ "use", "fixture" }),
+            .remove => run(allocator, paths, &.{ "remove", "fixture", "--yes" }),
+            .import_use => run(allocator, paths, &.{ "import", "--id", "new", "--path", dest, "--use" }),
+            .pull_use => runPullWithAcquirer(allocator, paths, &.{ "--model-url", "https://models.example.invalid/x.gguf", "--id", "new", "--checksum", "0000000000000000000000000000000000000000000000000000000000000000", "--use" }, Fixture.acquire),
+            .pull_hf => runPullWithAcquirer(allocator, paths, &.{ "--hf-repo", "example/repo", "--hf-file", "model.gguf", "--id", "new", "--use" }, Fixture.acquire),
+            .list => run(allocator, paths, &.{"list"}),
+            .verify => run(allocator, paths, &.{"verify"}),
+            .select => blk: {
+                selectModel(allocator, paths, "fixture", dest) catch |err| break :blk err;
+                break :blk @as(u8, 0);
+            },
+        };
+        try std.testing.expectError(expected, result);
+        try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
+        capture.restore();
+        try std.testing.expectEqualStrings("", try tmp.dir.readFileAlloc(sys.io(), "stdout", allocator, .limited(1024)));
+        try std.testing.expectEqualStrings(before, try testStateSnapshot(allocator, tmp.dir));
+    }
+}
+
+test "init preserves state on config load failures" {
+    try testPreflight(.init, false);
+}
+
+test "models use preserves state on config load failures" {
+    try testPreflight(.use, false);
+}
+
+test "models remove preserves state on config load failures" {
+    try testPreflight(.remove, false);
+}
+
+test "models import use preserves state on config load failures" {
+    try testPreflight(.import_use, false);
+}
+
+test "models direct pull use refuses config failures before acquisition" {
+    try testPreflight(.pull_use, false);
+}
+
+test "models HF pull use refuses config failures before acquisition" {
+    try testPreflight(.pull_hf, false);
+}
+
+test "models list verify and selection preserve config load failures" {
+    try testPreflight(.list, false);
+    try testPreflight(.verify, false);
+    try testPreflight(.select, false);
+}
+
+test "models acquisition and mutations refuse registry load failures" {
+    for ([_]PreflightCommand{ .init, .use, .remove, .import_use, .pull_use, .pull_hf, .list, .verify }) |command| try testPreflight(command, true);
+}
+
+test "model mutations retain valid and absent config semantics" {
+    for ([_]bool{ false, true }) |existing_config| {
+        for ([_]PreflightCommand{ .init, .use, .remove, .import_use, .pull_use, .pull_hf }) |command| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try tmp.dir.realPathFileAlloc(sys.io(), ".", allocator);
+            const paths = try testPullPaths(allocator, root);
+            const dest = try models.installedPath(allocator, root, "fixture");
+            try sys.writeFile(dest, "existing model");
+            var registry_models = [_]models.Model{.{ .id = "fixture", .path = dest }};
+            try models.save(paths.models_file, .{ .models = &registry_models });
+            if (existing_config) try config.save(paths.config_file, .{ .model_id = "fixture", .model_path = dest, .threads = 7 });
+            const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+            defer output.close(sys.io());
+            var capture = try TestStdoutCapture.start(output);
+            defer capture.restore();
+            const Fixture = struct {
+                var calls: usize = 0;
+                fn acquire(_: std.mem.Allocator, _: models.Model, path: []const u8, _: bool) !void {
+                    calls += 1;
+                    try sys.writeFile(path, "downloaded fixture");
+                }
+            };
+            Fixture.calls = 0;
+            const checksum = try sys.hexSha256(allocator, "downloaded fixture");
+            const result = switch (command) {
+                .init => @import("init_cmd.zig").run(allocator, paths, &.{"--yes"}),
+                .use => run(allocator, paths, &.{ "use", "fixture" }),
+                .remove => run(allocator, paths, &.{ "remove", "fixture", "--yes" }),
+                .import_use => run(allocator, paths, &.{ "import", "--id", "new", "--path", dest, "--use" }),
+                .pull_use => runPullWithAcquirer(allocator, paths, &.{ "--model-url", "https://models.example.invalid/x.gguf", "--id", "new", "--checksum", checksum, "--use" }, Fixture.acquire),
+                .pull_hf => runPullWithAcquirer(allocator, paths, &.{ "--hf-repo", "example/repo", "--hf-file", "model.gguf", "--id", "new", "--checksum", checksum, "--use" }, Fixture.acquire),
+                else => unreachable,
+            };
+            try std.testing.expectEqual(@as(u8, 0), try result);
+            capture.restore();
+            const is_pull = command == .pull_use or command == .pull_hf;
+            try std.testing.expectEqual(@as(usize, if (is_pull) 1 else 0), Fixture.calls);
+            const expected_output: []const u8 = switch (command) {
+                .init => "initialized\n",
+                .use => "using fixture\n",
+                .remove => "removed fixture\n",
+                .import_use => "imported new\n",
+                .pull_use, .pull_hf => "pulled new\n",
+                else => unreachable,
+            };
+            try std.testing.expectEqualStrings(expected_output, try tmp.dir.readFileAlloc(sys.io(), "stdout", allocator, .limited(1024)));
+            if (command == .remove) {
+                try std.testing.expect(!sys.exists(dest));
+                try std.testing.expect(models.find(try models.load(allocator, paths.models_file), "fixture") == null);
+                if (!existing_config) {
+                    try std.testing.expect(!sys.exists(paths.config_file));
+                    continue;
+                }
+            }
+            const cfg = try config.load(allocator, paths.config_file);
+            try std.testing.expectEqual(@as(u32, if (existing_config) 7 else 0), cfg.threads);
+            try std.testing.expectEqualStrings(if (command == .init or command == .remove) "" else if (command == .use) "fixture" else "new", cfg.model_id);
+            if (command == .import_use or is_pull) try std.testing.expectEqualStrings(if (is_pull) "downloaded fixture" else "existing model", try sys.readFileAlloc(allocator, cfg.model_path, 1024));
+        }
+    }
+}
+
 const RemoveCase = enum { normal, missing, shared, external, directory };
 
 fn testRemoveNative(case: RemoveCase) !void {
@@ -667,7 +875,8 @@ fn testRemoveFailure(failure: RemoveFailure) !void {
     });
     capture.restore();
     const expected_error = switch (failure) {
-        .reload_injected, .reload_directory => errors.Error.ModelsInvalid,
+        .reload_injected => errors.Error.ModelsInvalid,
+        .reload_directory => error.IsDir,
         .delete => error.AccessDenied,
         else => error.InputOutput,
     };
@@ -679,7 +888,7 @@ fn testRemoveFailure(failure: RemoveFailure) !void {
     const remaining = try models.load(allocator, registry_path);
     try std.testing.expect(models.find(remaining, "fixture") == null);
     try std.testing.expectEqual(@as(usize, 2), remaining.models.len);
-    if (failure == .reload_directory) try std.testing.expectError(errors.Error.ModelsInvalid, models.load(allocator, paths.models_file));
+    if (failure == .reload_directory) try std.testing.expectError(error.IsDir, models.load(allocator, paths.models_file));
     try std.testing.expectEqualStrings(config_before, try sys.readFileAlloc(allocator, paths.config_file, 8192));
     try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
     try std.testing.expectEqualStrings("other bytes", try sys.readFileAlloc(allocator, other_path, 1024));

@@ -201,6 +201,18 @@ Successful `translate` also keeps its existing behavior: it may update
 translation memory and write the requested output. Network access remains
 limited to an explicit `models pull` operation.
 
+Kotoba uses a strict supported TOML subset for persisted
+`config.toml` and `models.toml`. It round-trips
+supported values semantically and returns an explicit error for malformed,
+unknown, duplicate, and future schema data instead of ignoring it or replacing
+it with defaults. Missing files remain distinct from parse, schema, native I/O,
+and allocation failures. See the complete
+[strict persistence TOML contract](docs/strict-toml.md) for the field tables,
+accepted syntax, manual repair guidance, canonical URL behavior, and mutation
+preflight boundary. The persistence contract does not promise full TOML support,
+atomic config/registry writes, rollback, locking, or crash durability. Translation
+output files use the separate staged-publication contract described above.
+
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
 before opening SQLite when examining a database without concurrent writers.
 Empty or zeroed rollback journals remain readable; journals that could require
