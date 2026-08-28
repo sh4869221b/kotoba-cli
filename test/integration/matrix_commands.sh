@@ -44,6 +44,8 @@ commands_error() {
     sqlite_failed) message='SQLite translation memory operation failed.' ;;
     unsupported_language_pair) message='Only en -> ja and ja -> en are supported.' ;;
     glossary_invalid) message='glossary.toml is invalid.' ;;
+    invalid_utf8) message='Text must be valid UTF-8.' ;;
+    embedded_nul) message='Text must not contain NUL bytes.' ;;
     *) return 2 ;;
   esac
   commands_streams "$status" '' "kotoba: $code: $message"$'\n'
@@ -188,6 +190,10 @@ matrix_commands() {
   matrix_case commands-version
   matrix_run version
   commands_streams 0 $'kotoba 0.0.1\n'
+  commands_unchanged
+  matrix_case commands-help
+  matrix_run --help
+  commands_error
   commands_unchanged
   matrix_case commands-version-extra
   matrix_run version extra
@@ -426,6 +432,17 @@ PY
     commands_unchanged
   done
 
+  for variant in text-contract-utf8 text-contract-nul; do
+    matrix_case "commands-glossary-$variant"
+    commands_fixture
+    printf '[[terms]]\nsource = "Hello"\ntarget = "A' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    if [[ "$variant" == text-contract-utf8 ]]; then printf '\377'; else printf '\000'; fi >>"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    printf 'B"\n' >>"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+    matrix_run glossary validate
+    if [[ "$variant" == text-contract-utf8 ]]; then commands_error invalid_utf8
+    else commands_error embedded_nul; fi
+    commands_unchanged
+  done
   for variant in ready absent invalid-data; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi
