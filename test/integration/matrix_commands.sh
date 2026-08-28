@@ -379,6 +379,16 @@ PY
         commands_state '' config/kotoba/config.toml,config/kotoba/models.toml data/kotoba/models/fixture.gguf ;;
     esac
   done
+  for variant in fresh corrupt; do
+    matrix_case "commands-models-pull-output-invalid-$variant"
+    if [[ "$variant" == corrupt ]]; then
+      mkdir -p "$XDG_CONFIG_HOME/kotoba"
+      mkdir "$XDG_CONFIG_HOME/kotoba/models.toml"
+    fi
+    matrix_run models pull fixture --output "$CASE_ROOT/work/invalid.txt"
+    commands_error
+    commands_unchanged
+  done
   for variant in explicit selected; do
     matrix_case "commands-models-verify-$variant"
     commands_fixture

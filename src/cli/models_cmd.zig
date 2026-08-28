@@ -158,6 +158,7 @@ fn runPullWithAcquirer(
             _ = cursor.nextValue();
         } else return errors.Error.InvalidArguments;
     }
+    if (output_path.len > 0) try models.validateGgufPath(output_path);
     var m: models.Model = .{};
     if (hf_repo.len > 0) {
         if (model_url.len > 0 or positional_id.len > 0) return errors.Error.InvalidArguments;
