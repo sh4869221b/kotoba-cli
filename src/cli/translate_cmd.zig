@@ -46,11 +46,13 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
             _ = cursor.nextValue();
             opts.debug = true;
         } else {
+            if (a.len > 0 and a[0] == '-') return errors.Error.InvalidArguments;
             if (opts.text != null) return errors.Error.InvalidArguments;
             opts.text = a;
             _ = cursor.nextValue();
         }
     }
+    if (opts.text != null and opts.file_path != null) return errors.Error.InvalidArguments;
     const cfg = try config.load(allocator, paths.config_file);
     if (translate.diagnosticsEnabled(cfg, opts)) {
         sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
@@ -61,4 +63,11 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []c
     const fmt = opts.format orelse if (kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
     try output.write(fmt, res, opts.include_source);
     return 0;
+}
+
+test "translate rejects invalid argv before configuration or memory access" {
+    var paths: xdg.Paths = undefined;
+    paths.config_file = "missing/config.toml";
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--bogus", "--from", "en", "--to", "ja" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "Hello", "--file", "input.txt" }));
 }

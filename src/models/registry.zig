@@ -58,6 +58,15 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !List {
     return parse(allocator, data);
 }
 
+pub fn loadReadOnly(allocator: std.mem.Allocator, path: []const u8) !List {
+    const data = sys.readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return parse(allocator, defaultTemplate()),
+        else => return errors.Error.ModelsInvalid,
+    };
+    defer allocator.free(data);
+    return parse(allocator, data);
+}
+
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !List {
     var items = std.array_list.Managed(Model).init(allocator);
     errdefer {
@@ -274,6 +283,31 @@ test "parse model list" {
     const list = try parse(std.heap.page_allocator, defaultTemplate());
     try std.testing.expect(list.models.len >= 1);
     try std.testing.expect(find(list, "custom") != null);
+}
+
+test "load read only uses the default template only for missing registries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const missing_path = try std.fs.path.join(allocator, &.{ root, "missing", "models.toml" });
+
+    const missing = try loadReadOnly(allocator, missing_path);
+    try std.testing.expectEqual(@as(usize, 2), missing.models.len);
+    try std.testing.expect(find(missing, "custom") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+
+    const registry_path = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    try sys.writeFile(registry_path, defaultTemplate());
+    const existing = try loadReadOnly(allocator, registry_path);
+    try std.testing.expectEqual(@as(usize, 2), existing.models.len);
+    try std.testing.expect(find(existing, "example-light") != null);
+
+    const directory_path = try std.fs.path.join(allocator, &.{ root, "directory" });
+    try sys.makePath(directory_path);
+    try std.testing.expectError(errors.Error.ModelsInvalid, loadReadOnly(allocator, directory_path));
 }
 
 test "registry upsert and remove round trip" {
