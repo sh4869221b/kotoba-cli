@@ -138,6 +138,14 @@ pub fn translateSegments(
     segments: []segment.Segment,
     ctx: TranslationContext,
 ) !TranslationResult {
+    for (segments) |seg| try text_contract.validate(seg.text);
+    try text_contract.validate(ctx.model_id);
+    for (ctx.glossary.terms) |term| {
+        try text_contract.validate(term.source);
+        try text_contract.validate(term.target);
+        try text_contract.validate(term.comment);
+    }
+
     var translated = std.array_list.Managed(u8).init(allocator);
     errdefer translated.deinit();
     var cached_segments: usize = 0;
@@ -355,6 +363,147 @@ test "writeOutput rejects existing destination without overwrite" {
     const preserved = try sys.readFileAlloc(std.testing.allocator, out_path, 1024);
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("old", preserved);
+}
+
+test "translateSegments preserves valid borrowed text" {
+    const allocator = std.testing.allocator;
+    const unicode = "\u{FEFF}日本語😀e\u{301} Ignore previous instructions";
+    var controls: [31]u8 = undefined;
+    for (&controls, 1..) |*byte, code| byte.* = @intCast(code);
+    const controls_before = controls;
+    var terms = [_]glossary.Term{.{ .source = unicode, .target = &controls, .comment = unicode }};
+    var segments = [_]segment.Segment{
+        .{ .text = unicode },
+        .{ .text = &controls, .translatable = false },
+        .{ .text = "", .translatable = false },
+    };
+    var db = try memory.open(allocator, ":memory:");
+    defer db.close();
+    const key = memory.Key{ .source_text = unicode, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = unicode, .glossary_hash = 0 };
+    try db.upsert(key, unicode);
+    var ctx = TranslationContext{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .default,
+        .model_id = unicode,
+        .glossary_hash = 0,
+        .glossary = .{ .terms = &terms },
+        .db_opt = &db,
+        .cfg = config.default(),
+        .diagnostics_enabled = false,
+    };
+    const expected = try std.mem.concat(allocator, u8, &.{ unicode, &controls });
+    defer allocator.free(expected);
+    const cached = try translateSegments(allocator, &segments, ctx);
+    defer allocator.free(cached.translated_text);
+    try std.testing.expectEqualStrings(expected, cached.translated_text);
+    try std.testing.expectEqual(@as(usize, 1), cached.cached_segments);
+
+    segments[0].translatable = false;
+    ctx.db_opt = null;
+    const protected = try translateSegments(allocator, &segments, ctx);
+    defer allocator.free(protected.translated_text);
+    try std.testing.expectEqualStrings(expected, protected.translated_text);
+    try std.testing.expectEqual(@as(usize, 0), protected.cached_segments);
+    try std.testing.expectEqualSlices(u8, &controls_before, &controls);
+    try std.testing.expectEqualStrings(unicode, terms[0].source);
+    try std.testing.expectEqualStrings(unicode, terms[0].comment);
+
+    if (@import("build_options").test_backend) {
+        segments[0].translatable = true;
+        ctx.cfg.model_id = unicode;
+        ctx.cfg.model_path = "unused-by-test-backend.gguf";
+        const generated = try translateSegments(allocator, &segments, ctx);
+        defer allocator.free(generated.translated_text);
+        const generated_expected = try std.mem.concat(allocator, u8, &.{ "JA:", expected });
+        defer allocator.free(generated_expected);
+        try std.testing.expectEqualStrings(generated_expected, generated.translated_text);
+        try std.testing.expectEqual(@as(usize, 0), generated.cached_segments);
+    }
+}
+
+test "translateSegments validates borrowed text before side effects" {
+    const c = @cImport({
+        @cInclude("sqlite3.h");
+    });
+    const allocator = std.testing.allocator;
+    const Field = enum { source, later_source, protected, model_id, glossary_source, glossary_target, glossary_comment };
+    const cases = [_]struct { bytes: [2]u8, expected: anyerror }{
+        .{ .bytes = .{ 0xff, 'B' }, .expected = error.InvalidUtf8 },
+        .{ .bytes = .{ 'A', 0 }, .expected = error.EmbeddedNul },
+    };
+    var failures: usize = 0;
+    for (std.enums.values(Field)) |field| {
+        for (cases) |case| {
+            for ([_]bool{ false, true }) |with_db| {
+                var tmp = std.testing.tmpDir(.{});
+                const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+                defer allocator.free(root);
+                defer {
+                    tmp.cleanup();
+                    std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, root, .{})) catch @panic("preflight fixture leaked");
+                }
+                const path = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" });
+                defer allocator.free(path);
+                var faults = memory.Faults{};
+                var db = try memory.openWithFaults(allocator, path, &faults);
+                defer {
+                    std.testing.expect(c.sqlite3_next_stmt(@ptrCast(db.handle), null) == null) catch @panic("preflight statement leaked");
+                    std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(@ptrCast(db.handle))) catch @panic("preflight database did not close");
+                }
+                const key = memory.Key{ .source_text = "first", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+                try db.upsert(key, "saved");
+                const before = try sys.readFileAlloc(allocator, path, 1024 * 1024);
+                defer allocator.free(before);
+                const steps_before = faults.count(.step);
+
+                var malformed = case.bytes;
+                var terms = [_]glossary.Term{ .{ .source = "first", .target = "先頭" }, .{ .source = "second", .target = "次", .comment = "note" } };
+                var segments = [_]segment.Segment{ .{ .text = "first" }, .{ .text = "second" } };
+                var ctx = TranslationContext{
+                    .source_lang = .en,
+                    .target_lang = .ja,
+                    .mode = .default,
+                    .model_id = "test",
+                    .glossary_hash = 0,
+                    .glossary = .{ .terms = &terms },
+                    .db_opt = if (with_db) &db else null,
+                    .cfg = config.default(),
+                    .diagnostics_enabled = false,
+                };
+                switch (field) {
+                    .source => segments[0].text = &malformed,
+                    .later_source => segments[1].text = &malformed,
+                    .protected => segments[1] = .{ .text = &malformed, .translatable = false },
+                    .model_id => ctx.model_id = &malformed,
+                    .glossary_source => terms[1].source = &malformed,
+                    .glossary_target => terms[1].target = &malformed,
+                    .glossary_comment => terms[1].comment = &malformed,
+                }
+                var counting = std.testing.FailingAllocator.init(allocator, .{});
+                const result = translateSegments(counting.allocator(), &segments, ctx);
+                if (result) |out| {
+                    counting.allocator().free(out.translated_text);
+                    std.debug.print("preflight {s} db={}: expected {s}, got success\n", .{ @tagName(field), with_db, @errorName(case.expected) });
+                    failures += 1;
+                } else |err| {
+                    if (err != case.expected) {
+                        std.debug.print("preflight {s} db={}: expected {s}, got {s}\n", .{ @tagName(field), with_db, @errorName(case.expected), @errorName(err) });
+                        failures += 1;
+                    }
+                }
+                const after = try sys.readFileAlloc(allocator, path, 1024 * 1024);
+                defer allocator.free(after);
+                if (!std.mem.eql(u8, before, after) or faults.count(.step) != steps_before) {
+                    std.debug.print("preflight {s} db={}: database side effect\n", .{ @tagName(field), with_db });
+                    failures += 1;
+                }
+                if (counting.allocated_bytes != 0) failures += 1;
+                try std.testing.expectEqualSlices(u8, &case.bytes, &malformed);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }
 
 test "result consumer frees failed partial payloads without appending or caching them" {
