@@ -213,10 +213,10 @@ The CI driver is separate from that local default: `integration --suite` accepts
 parallel rounds. Its workflow runs smoke, matrix, and parallel as three child
 jobs, then accepts the required aggregate only when every child is `success`.
 Pull requests configure one parallel round; `master` pushes and manual dispatch
-configure two. Current exact-SHA local receipts observed 334 matrix cases
-(46 translate, 221 commands, 22 memory, 45 files); a two-round parallel receipt
+configure two. Current exact-SHA local receipts observed 364 matrix cases
+(46 translate, 251 commands, 22 memory, 45 files); a two-round parallel receipt
 observed 18 children, eight unit logs, two benchmarks, 30 benchmark measurements,
-2,256 unit-test executions, and four matrix receipts. These observations do not
+2,408 unit-test executions, and four 364-case matrix receipts. These observations do not
 prove a hosted schedule or run.
 
 Run it with an absolute evidence directory:
@@ -258,8 +258,8 @@ mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$
 mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The final Issue #63 matrix run records 362 measured CLI cases: translate 46,
-commands 249, memory 22, files 45. Counts come from each run's `summary.json`; never
+The final Issue #63 matrix run records 364 measured CLI cases: translate 46,
+commands 251, memory 22, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
@@ -284,14 +284,15 @@ does not initialize or repair a database. `summary.json` lists every case and
 group count; `cleanup.json` records removed TMP and released lock ownership.
 Evidence contains synthetic source/translation fixtures; no user state is read.
 
-Issue #63 adds 28 strict-XDG command cases with redacted environment classes
+Issue #63 adds 30 strict-XDG command cases with redacted environment classes
 (`unset`, `empty`, `absolute`, or `relative`) rather than raw values. The exact
 new IDs are `commands-xdg-all-absolute-home-{unset,empty,relative}`;
 `commands-xdg-{config,data,cache,state}-{unset,empty,relative}`;
 `commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`;
 `commands-doctor-xdg-fallback-{human,json}`;
 `commands-doctor-xdg-unresolved-{human,json}`;
-`commands-doctor-xdg-special-json`; `commands-doctor-xdg-non-utf8-json`;
+`commands-doctor-xdg-special-json`; `commands-doctor-xdg-c1-{human,json}`;
+`commands-doctor-xdg-non-utf8-json`;
 `commands-home-unresolved-{readonly,init}`;
 and `commands-xdg-relative-init`. Each receipt records the executable SHA-256,
 argv, cwd, streams, status, environment classes, and independent expected-path
@@ -372,7 +373,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-{version,init-yes,config-list-ready,config-get-default,config-set,models-list,models-info,models-import,models-pull,models-use,models-verify-explicit,models-remove,glossary-ready,memory-status,memory-clear}` | 0; exact command-specific streams; local `file://` pull | Exact creation/update/removal sets; clear removes seed row; status preserves it |
 | `commands-{top-missing,top-invalid,init-invalid,config-invalid,config-get-arity,models-info-arity,glossary-arity,doctor-arity,memory-clear-arity-absent-db}` and other family arity cases | 2; exact `invalid_arguments`; JSON variants `commands-{invalid-json,doctor-invalid-json}` have parsed error stdout and empty stderr | Initialized failures unchanged; absent-state mutations characterized separately |
 | `commands-doctor-{ready,absent,missing-db}-{human,json}` | 0 ready / 1 absent or missing DB; exact human or typed JSON, empty stderr | Does not create missing state |
-| `commands-xdg-all-absolute-home-{unset,empty,relative}`; `commands-xdg-{config,data,cache,state}-{unset,empty,relative}`; `commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`; `commands-doctor-xdg-{fallback,unresolved}-{human,json}`; `commands-doctor-xdg-special-json`; `commands-doctor-xdg-non-utf8-json`; `commands-home-unresolved-{readonly,init}`; `commands-xdg-relative-init` (28) | Parsed doctor checks are ordered `config_path`, `data_path`, `cache_path`, `state_path`; direct/unset is `ok`, empty/relative fallback is `warn`/`xdg_path_invalid`, unresolved is `error`/`path_resolution_failed` | Diagnostic and unresolved ordinary-command receipts preserve FS/TM; relative-XDG init creates only HOME fallback state |
+| `commands-xdg-all-absolute-home-{unset,empty,relative}`; `commands-xdg-{config,data,cache,state}-{unset,empty,relative}`; `commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`; `commands-doctor-xdg-{fallback,unresolved,c1}-{human,json}`; `commands-doctor-xdg-special-json`; `commands-doctor-xdg-non-utf8-json`; `commands-home-unresolved-{readonly,init}`; `commands-xdg-relative-init` (30) | Parsed doctor checks are ordered `config_path`, `data_path`, `cache_path`, `state_path`; direct/unset is `ok`, empty/relative fallback is `warn`/`xdg_path_invalid`, unresolved is `error`/`path_resolution_failed`; accepted C1 controls are deterministic textual escapes in human and JSON output | Diagnostic and unresolved ordinary-command receipts preserve FS/TM; relative-XDG init creates only HOME fallback state |
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
 | `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
 | `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
