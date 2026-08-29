@@ -808,7 +808,7 @@ PY
     done
   done
 
-  local home_mode variable mode lower expected_config expected_data expected_cache expected_state special_config
+  local home_mode variable mode lower expected_config expected_data expected_cache expected_state special_config c1_config
   local config_reason data_reason cache_reason state_reason
   for home_mode in unset empty relative; do
     commands_env_case "commands-xdg-all-absolute-home-$home_mode"
@@ -899,6 +899,46 @@ PY
   expected_data="$XDG_DATA_HOME/kotoba"
   commands_env_finalize "$expected_data"
   commands_xdg_doctor_run json "$expected_config" direct "$expected_data" direct "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
+
+  for format in human json; do
+    commands_env_case "commands-doctor-xdg-c1-$format"
+    commands_env_set HOME relative rejected-c1-home
+    c1_config="$CASE_ROOT/c1-"$'\u009b''2J'$'\u009d''TERM'
+    commands_env_set CONFIG absolute "$c1_config"
+    expected_config="$CASE_ROOT/c1-\\u009b2J\\u009dTERM/kotoba"
+    expected_data="$XDG_DATA_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    commands_xdg_doctor_expectation "$format" "$expected_config" direct "$expected_data" direct \
+      "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
+    if [[ "$format" == json ]]; then matrix_run doctor --format json; else matrix_run doctor; fi
+    matrix_assert status 1
+    matrix_assert stdout "$CASE_DIR/expected.stdout"
+    matrix_assert stderr "$CASE_STDIN"
+    if [[ "$format" == json ]]; then
+      matrix_assert json doctor
+      matrix_assert json-values "$(cat "$CASE_DIR/expected-doctor.json")"
+    fi
+    matrix_assert custom c1-controls python3 - "$CASE_DIR/stdout" "$format" <<'PY'
+import json, sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+output = sys.argv[2]
+assert bytes((0xc2, 0x9b)) not in raw, 'raw UTF-8 U+009B must not reach terminal output'
+assert bytes((0xc2, 0x9d)) not in raw, 'raw UTF-8 U+009D must not reach terminal output'
+assert not [byte for byte in raw if byte < 0x20 and byte != 0x0a], 'only structural LF bytes are allowed'
+assert raw.count(b'\\u009b') == 1 and raw.count(b'\\u009d') == 1, 'C1 escapes must be deterministic'
+if output == 'json':
+    report = json.loads(raw)
+    assert all(type(check['message']) is str for check in report['checks'])
+    assert report['checks'][0]['message'].endswith('/c1-\\u009b2J\\u009dTERM/kotoba')
+    assert raw.count(bytes((10,))) == 1 and raw.endswith(bytes((10,)))
+else:
+    lines = raw.decode('utf-8').splitlines()
+    assert len(lines) == 6 and all(lines), 'each human check must occupy exactly one line'
+PY
+    if [[ "$format" == json ]]; then commands_env_assert doctor --format json; else commands_env_assert doctor; fi
+    commands_unchanged
+  done
 
   commands_env_case commands-doctor-xdg-non-utf8-json
   commands_env_set HOME relative rejected-non-utf8-home

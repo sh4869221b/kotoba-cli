@@ -197,13 +197,46 @@ fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u
 }
 
 fn diagnosticText(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(value)) return value;
     const hex = "0123456789abcdef";
     var escaped = std.array_list.Managed(u8).init(allocator);
-    for (value) |byte| switch (byte) {
-        0x20...0x7e => try escaped.append(byte),
-        else => try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] }),
-    };
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (byte < 0x80) {
+            switch (byte) {
+                '\n' => try escaped.appendSlice("\\n"),
+                '\r' => try escaped.appendSlice("\\r"),
+                '\t' => try escaped.appendSlice("\\t"),
+                0...8, 11...12, 14...31, 127 => try escaped.appendSlice(&.{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 0x0f] }),
+                else => try escaped.append(byte),
+            }
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        };
+        if (index + sequence_len > value.len) {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        }
+        const sequence = value[index .. index + sequence_len];
+        const codepoint = std.unicode.utf8Decode(sequence) catch {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        };
+        if (codepoint >= 0x80 and codepoint <= 0x9f) {
+            const control: u8 = @intCast(codepoint);
+            try escaped.appendSlice(&.{ '\\', 'u', '0', '0', hex[control >> 4], hex[control & 0x0f] });
+        } else {
+            try escaped.appendSlice(sequence);
+        }
+        index += sequence_len;
+    }
     return escaped.toOwnedSlice();
 }
 
@@ -576,6 +609,20 @@ test "doctor JSON keeps non-UTF-8 path diagnostics as strings" {
     }
 }
 
+test "doctor diagnostic text escapes Unicode C0 and C1 controls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const actual = try diagnosticText(arena.allocator(), "quote\" back\\slash 日本語\n\t\x01\u{009b}\u{009d}");
+    try std.testing.expectEqualStrings("quote\" back\\slash 日本語\\n\\t\\u0001\\u009b\\u009d", actual);
+}
+
+test "doctor diagnostic text preserves valid UTF-8 around invalid bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const actual = try diagnosticText(arena.allocator(), "日本語\xff quote\" back\\slash");
+    try std.testing.expectEqualStrings("日本語\\xff quote\" back\\slash", actual);
+}
+
 test "doctor JSON decodes special paths and human output stays one line per check" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -590,7 +637,7 @@ test "doctor JSON decodes special paths and human output stays one line per chec
         .cache = special,
         .state = special,
     });
-    const expected = try std.fs.path.join(allocator, &.{ special, "kotoba" });
+    const expected_diagnostic = try std.mem.concat(allocator, u8, &.{ root, "/quote\" back\\slash\\nline\\ttab\\u0001/kotoba" });
 
     const json_output = try tmp.dir.createFile(sys.io(), "json", .{ .read = true });
     defer json_output.close(sys.io());
@@ -603,7 +650,8 @@ test "doctor JSON decodes special paths and human output stays one line per chec
     try std.testing.expectEqual(@as(u8, 1), json_exit);
     const json_checks = report.value.object.get("checks").?.array.items;
     try std.testing.expect(json_checks.len > 4);
-    for (json_checks[0..4]) |check| try std.testing.expectEqualStrings(expected, check.object.get("message").?.string);
+    for (json_checks[0..4]) |check| try std.testing.expectEqualStrings(expected_diagnostic, check.object.get("message").?.string);
+    for (rendered_json[0 .. rendered_json.len - 1]) |byte| try std.testing.expect(byte >= 0x20);
 
     const human_output = try tmp.dir.createFile(sys.io(), "human", .{ .read = true });
     defer human_output.close(sys.io());
