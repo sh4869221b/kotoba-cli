@@ -900,6 +900,31 @@ PY
   commands_env_finalize "$expected_data"
   commands_xdg_doctor_run json "$expected_config" direct "$expected_data" direct "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
 
+  commands_env_case commands-doctor-xdg-non-utf8-json
+  commands_env_set HOME relative rejected-non-utf8-home
+  non_utf8_config="$CASE_ROOT/non-utf8-"$'\xff'
+  commands_env_set CONFIG absolute "$non_utf8_config"
+  expected_data="$XDG_DATA_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  matrix_run doctor --format json
+  matrix_assert status 1
+  matrix_assert stderr "$CASE_STDIN"
+  matrix_assert json doctor
+  matrix_assert custom non-utf8-message python3 - "$CASE_DIR/stdout" <<'PY'
+import json, sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+report = json.loads(raw)
+messages = [check['message'] for check in report['checks']]
+assert all(type(message) is str for message in messages), 'doctor message JSON type must be string'
+assert messages[0].endswith('/non-utf8-\\xff/kotoba'), 'invalid byte must be escaped deterministically'
+assert bytes([255]) not in raw, 'JSON must not expose a raw invalid byte'
+assert raw.count(bytes([10])) == 1 and raw.endswith(bytes([10])), 'JSON output must stay one line'
+assert report['ok'] is False and report['checks'][0]['status'] == 'ok' and report['checks'][0]['code'] == ''
+PY
+  commands_env_assert doctor --format json
+  commands_unchanged
+
   commands_env_case commands-home-unresolved-readonly
   commands_env_set HOME unset
   commands_env_set CONFIG relative rejected-readonly-config

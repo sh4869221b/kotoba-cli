@@ -172,20 +172,39 @@ fn continueAfterModelCheck(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: 
 
 fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u8 {
     if (json) {
+        var rendered_checks = std.array_list.Managed(Check).init(allocator);
+        defer rendered_checks.deinit();
+        for (checks) |check| try rendered_checks.append(.{
+            .name = check.name,
+            .status = check.status,
+            .code = check.code,
+            .message = try diagnosticText(allocator, check.message),
+        });
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         var stringify: std.json.Stringify = .{ .writer = &out.writer };
-        try stringify.write(.{ .ok = ok, .checks = checks });
+        try stringify.write(.{ .ok = ok, .checks = rendered_checks.items });
         try out.writer.writeByte('\n');
         sys.stdoutWrite(out.written());
     } else {
         for (checks) |check| {
             sys.stdoutPrint("{s}: {s}: ", .{ @tagName(check.status), check.name });
-            writeHumanOneLine(check.message);
+            writeHumanOneLine(try diagnosticText(allocator, check.message));
             sys.stdoutWrite("\n");
         }
     }
     return if (ok) 0 else 1;
+}
+
+fn diagnosticText(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(value)) return value;
+    const hex = "0123456789abcdef";
+    var escaped = std.array_list.Managed(u8).init(allocator);
+    for (value) |byte| switch (byte) {
+        0x20...0x7e => try escaped.append(byte),
+        else => try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] }),
+    };
+    return escaped.toOwnedSlice();
 }
 
 fn writeHumanOneLine(value: []const u8) void {
@@ -517,6 +536,44 @@ test "doctor unresolved resolution returns exactly four path checks" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "rejected-config") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"config\"") == null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "state", .{}));
+}
+
+test "doctor JSON keeps non-UTF-8 path diagnostics as strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const invalid_base = try std.mem.concat(allocator, u8, &.{ root, "/non-utf8-", &.{0xff} });
+    const resolution = try xdg.resolve(allocator, .{
+        .config = invalid_base,
+        .data = invalid_base,
+        .cache = invalid_base,
+        .state = invalid_base,
+    });
+    const output = try tmp.dir.createFile(sys.io(), "json", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    const exit_code = try runResolution(allocator, resolution, true);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "json" }), 8192);
+    const report = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    const checks = report.value.object.get("checks").?.array.items;
+    try std.testing.expect(checks.len > 4);
+    for (checks) |check| {
+        const message = check.object.get("message").?;
+        try std.testing.expect(message == .string);
+    }
+    for (checks[0..4]) |check| {
+        const message = check.object.get("message").?;
+        switch (message) {
+            .string => |text| try std.testing.expect(std.mem.indexOf(u8, text, "\\xff") != null),
+            else => unreachable,
+        }
+    }
 }
 
 test "doctor JSON decodes special paths and human output stays one line per check" {
