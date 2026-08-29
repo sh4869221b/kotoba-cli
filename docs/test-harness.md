@@ -258,8 +258,8 @@ mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$
 mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The final Issue #63 matrix run records 361 measured CLI cases: translate 46,
-commands 248, memory 22, files 45. Counts come from each run's `summary.json`; never
+The final Issue #63 matrix run records 362 measured CLI cases: translate 46,
+commands 249, memory 22, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
