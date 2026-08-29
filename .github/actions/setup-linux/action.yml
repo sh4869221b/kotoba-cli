@@ -1,9 +1,33 @@
 name: Set up Linux CPU toolchain
 description: Install Ubuntu packages and checksum-verified official Zig 0.16.0
+inputs:
+  profile:
+    description: Toolchain profile (native or format)
+    required: false
+    default: native
 runs:
   using: composite
   steps:
+    - name: Validate setup profile
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+        case "$PROFILE" in
+          native|format) ;;
+          *) echo 'linux setup: invalid profile' >&2; exit 2 ;;
+        esac
+    - name: Verify format runner tools
+      if: inputs.profile == 'format'
+      shell: bash
+      run: |
+        set -euo pipefail
+        for tool in git python3 curl xz sha256sum; do
+          command -v "$tool"
+        done
     - name: Install distribution build dependencies
+      if: inputs.profile == 'native'
       shell: bash
       run: |
         set -euo pipefail
@@ -13,6 +37,7 @@ runs:
         # Ubuntu maintains these packages; record the actual resolution on every run.
         dpkg-query -W -f='${Package}\t${Version}\n' "${packages[@]}"
     - name: Configure isolated compiler caches
+      if: inputs.profile == 'native'
       shell: bash
       run: |
         set -euo pipefail

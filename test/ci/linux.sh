@@ -58,8 +58,12 @@ EVIDENCE="$KOTOBA_CI_EVIDENCE_DIR"
 OWNED="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/kotoba-ci-${STAGE}.XXXXXX")"
 CHILD_PID=""
 snapshot() {
-  git status --porcelain=v1 --untracked-files=all --ignore-submodules=none >"$EVIDENCE/source.$1" &&
+  git status --porcelain=v1 --untracked-files=all --ignore-submodules=none >"$EVIDENCE/source.$1" || return
+  if [[ "$STAGE" == format ]]; then
+    printf 'not-required\n' >"$EVIDENCE/vendor.$1"
+  else
     git -C vendor/llama.cpp status --porcelain=v1 --untracked-files=all >"$EVIDENCE/vendor.$1"
+  fi
 }
 cleanup() {
   local status=$?
@@ -108,8 +112,19 @@ export XDG_CACHE_HOME="$OWNED/cache" XDG_STATE_HOME="$OWNED/state" TMPDIR="$OWNE
 export ZIG_GLOBAL_CACHE_DIR="$ROOT/.zig-cache/global"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR"
 : >"$EVIDENCE/counts.tsv"
+if [[ "$STAGE" != format ]]; then
+  vendor_root="$(git -C vendor/llama.cpp rev-parse --show-toplevel 2>/dev/null || :)"
+  if [[ "$vendor_root" != "$ROOT/vendor/llama.cpp" ]]; then
+    echo 'llama.cpp submodule is not initialized; run git submodule update --init --recursive' >&2
+    exit 1
+  fi
+fi
 if ! snapshot before; then echo 'linux ci: cannot read source status' >&2; exit 1; fi
-{ git rev-parse HEAD; git ls-tree HEAD vendor/llama.cpp; git -C vendor/llama.cpp rev-parse HEAD; zig version; cc --version; cmake --version; } >"$EVIDENCE/identity.txt"
+if [[ "$STAGE" == format ]]; then
+  { git rev-parse HEAD; printf 'vendor=not-required\n'; zig version; } >"$EVIDENCE/identity.txt"
+else
+  { git rev-parse HEAD; git ls-tree HEAD vendor/llama.cpp; git -C vendor/llama.cpp rev-parse HEAD; zig version; cc --version; cmake --version; } >"$EVIDENCE/identity.txt"
+fi
 cat "$EVIDENCE/identity.txt"
 run() {
   local label="$1" status; shift

@@ -109,7 +109,7 @@ fixture() {
   git -C "$FIXTURE/vendor/llama.cpp" checkout --quiet --detach "$PIN"
   cp "$ROOT/build.zig" "$FIXTURE/build.zig"
   cp "$ROOT/src/llama_api_probe.c" "$FIXTURE/src/llama_api_probe.c"
-  cp "$ROOT/test/ci/native-cache.sh" "$ROOT/test/ci/native-cache.py" "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/"
+  cp "$ROOT/test/ci/native-cache.sh" "$ROOT/test/ci/native-cache.py" "$ROOT/test/ci/integration-evidence.py" "$ROOT/test/ci/integration-aggregate.sh" "$FIXTURE/test/ci/"
   cp "$ROOT/.github/actions/setup-linux/action.yml" "$FIXTURE/.github/actions/setup-linux/action.yml"
 }
 recorder() {
@@ -577,6 +577,67 @@ WRAPPER
     printf '%s\tbaseline=0\tmutation=nonzero\trestored=0\tsource_restored=yes\n' "$stage" >>"$TMP/counts.tsv"
     cd "$ROOT"
   done
+  fixture stage-format-minimal
+  mkdir -p "$FIXTURE/test/ci" "$TMP/native-unavailable"
+  cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+  for tool in cc c++ gcc g++ clang clang++ cmake ccache; do
+    printf '#!/usr/bin/env bash\necho native-tool-unavailable >&2\nexit 127\n' >"$TMP/native-unavailable/$tool"
+    chmod +x "$TMP/native-unavailable/$tool"
+  done
+  mv "$FIXTURE/vendor/llama.cpp" "$TMP/stage-format-minimal-vendor"
+  cd "$FIXTURE"
+  name='stage-format-minimal'
+  capture "$name" env PATH="$TMP/native-unavailable:$ORIGINAL_PATH" KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh format
+  assert 'format passes without initialized vendor or native tools' test "$STATUS" -eq 0
+  assert 'format records vendor as not required' grep -qx 'vendor=not-required' "$EVIDENCE/$name/identity.txt"
+  assert 'format identity omits native tools' sh -c '! grep -Eqi "(cc|cmake).*version" "$1"' sh "$EVIDENCE/$name/identity.txt"
+  name='stage-native-minimal'
+  capture "$name" env PATH="$TMP/native-unavailable:$ORIGINAL_PATH" KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh build
+  assert 'native stage rejects uninitialized vendor' test "$STATUS" -ne 0
+  assert 'native stage names initialization requirement' grep -Fq 'llama.cpp submodule is not initialized' "$TMP/$name.stderr"
+  printf 'format-minimal\tformat=0\tnative=nonzero\tvendor=not-required\n' >>"$TMP/counts.tsv"
+  cd "$ROOT"
+
+  ACTIVE_CASE=stages
+  capture aggregate-self-test bash "$ROOT/test/ci/integration-aggregate.sh" --self-test
+  assert 'aggregate self-test covers 64 combinations' test "$STATUS" -eq 0
+  assert 'aggregate self-test admits exactly one' grep -Fq '64 combinations, admitted=1, rejected=63' "$TMP/aggregate-self-test.stdout"
+  capture aggregate-success bash "$ROOT/test/ci/integration-aggregate.sh" success success success
+  assert 'aggregate accepts three successes' test "$STATUS" -eq 0
+  for result in failure skipped cancelled missing unknown; do
+    capture "aggregate-$result" bash "$ROOT/test/ci/integration-aggregate.sh" success "$result" success
+    assert "aggregate rejects $result" test "$STATUS" -ne 0
+    assert "aggregate names $result lane failure" grep -Fq 'linux ci: integration lane did not succeed' "$TMP/aggregate-$result.stderr"
+  done
+  capture aggregate-arity bash "$ROOT/test/ci/integration-aggregate.sh" success success
+  assert 'aggregate rejects bad arity with usage status' test "$STATUS" -eq 2
+
+  local workflow="$ROOT/.github/workflows/linux-cpu.yml"
+  assert 'workflow keeps format required name' test "$(grep -c '^    name: Linux CPU / format$' "$workflow")" -eq 1
+  assert 'workflow keeps build required name' test "$(grep -c '^    name: Linux CPU / build$' "$workflow")" -eq 1
+  assert 'workflow keeps unit required name' test "$(grep -c '^    name: Linux CPU / unit$' "$workflow")" -eq 1
+  assert 'workflow keeps integration aggregate required name' test "$(grep -c '^    name: Linux CPU / integration$' "$workflow")" -eq 1
+  assert 'workflow has smoke lane' grep -Fq '  integration-smoke:' "$workflow"
+  assert 'workflow has matrix lane' grep -Fq '  integration-matrix:' "$workflow"
+  assert 'workflow has parallel lane' grep -Fq '  integration-parallel:' "$workflow"
+  assert 'aggregate needs exactly three lanes' grep -Fqx '    needs: [integration-smoke, integration-matrix, integration-parallel]' "$workflow"
+  assert 'aggregate evaluates always' grep -Fqx '    if: ${{ always() }}' "$workflow"
+  assert 'parallel maps pull requests to one round and other configured events to two' grep -Fq "github.event_name == 'pull_request' && '1' || '2'" "$workflow"
+  assert 'native restores use exact keys only' sh -c '! grep -q "restore-keys:" "$1"' sh "$workflow"
+  assert 'cache excludes final and global outputs' sh -c '! grep -E "^[[:space:]]+path: .*(zig-out|\.zig-cache/global|\.lock)" "$1"' sh "$workflow"
+  assert 'workflow pins cache restore' grep -Fq 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$workflow"
+  assert 'workflow pins cache save' grep -Fq 'actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$workflow"
+  assert 'GCC compiler cache save is success miss only' grep -Fq "success() && steps.gcc_compiler_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'GCC native cache save is success miss only' grep -Fq "success() && steps.gcc_native_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'Clang compiler cache save is success miss only' grep -Fq "success() && steps.clang_compiler_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'Clang native cache save is success miss only' grep -Fq "success() && steps.clang_native_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'workflow pins evidence upload' grep -Fq 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' "$workflow"
+  assert 'workflow bounds evidence retention' grep -Fq 'retention-days: 7' "$workflow"
+  assert 'format selects minimal setup profile' grep -Fq 'profile: format' "$workflow"
+  assert 'aggregate passes needs through environment' grep -Fq 'SMOKE_RESULT: ${{ needs.integration-smoke.result }}' "$workflow"
+  assert 'aggregate shell uses environment variables' grep -Fq 'integration-aggregate.sh "$SMOKE_RESULT" "$MATRIX_RESULT" "$PARALLEL_RESULT"' "$workflow"
+  printf 'workflow-static\trequired=4\tintegration-children=3\tpr-rounds=1\tpush-rounds=2\tdispatch-rounds=2\n' >>"$TMP/counts.tsv"
+
   fixture stage-selectors
   mkdir -p "$FIXTURE/test/ci"
   cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
