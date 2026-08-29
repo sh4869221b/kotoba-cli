@@ -124,16 +124,16 @@ API or recovery policy.
 Run the focused groups from the repository root:
 
 ```bash
-zig test src/sys.zig -lc --test-filter 'fault io happy'
-zig test src/sys.zig -lc --test-filter 'fault io failure'
-zig test src/fs.zig -lc --test-filter 'fault fs happy'
-zig test src/fs.zig -lc --test-filter 'fault fs failure'
-zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite happy'
-zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite failure'
-zig test src/net.zig -lc --test-filter 'fault http happy'
-zig test src/net.zig -lc --test-filter 'fault http failure'
-zig test src/models.zig -lc --test-filter 'fault install'
-zig test src/sys.zig -lc --test-filter 'fault boundary'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault io happy'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault io failure'
+mise exec -- zig test src/fs.zig -lc --test-filter 'fault fs happy'
+mise exec -- zig test src/fs.zig -lc --test-filter 'fault fs failure'
+mise exec -- zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite happy'
+mise exec -- zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite failure'
+mise exec -- zig test src/net.zig -lc --test-filter 'fault http happy'
+mise exec -- zig test src/net.zig -lc --test-filter 'fault http failure'
+mise exec -- zig test src/models.zig -lc --test-filter 'fault install'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault boundary'
 ```
 
 ## Build snapshots and coordination
@@ -172,14 +172,14 @@ From the repository root, these checks require no model for the deterministic
 and model-free paths:
 
 ```bash
-zig build test
-zig build test -Dtest-backend=true
-zig build
-bash test/integration/common.sh --self-test
-bash test/integration/parallel.sh --self-test
-bash test/integration/smoke.sh
-bash test/integration/bench.sh
-bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
+mise exec -- zig build test
+mise exec -- zig build test -Dtest-backend=true
+mise exec -- zig build
+mise exec -- bash test/integration/common.sh --self-test
+mise exec -- bash test/integration/parallel.sh --self-test
+mise exec -- bash test/integration/smoke.sh
+mise exec -- bash test/integration/bench.sh
+mise exec -- bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
 ```
 
 To inspect the installed artifacts without running the build's shared
@@ -188,7 +188,7 @@ To inspect the installed artifacts without running the build's shared
 ```bash
 E="$PWD/.omo/evidence/issue-47"
 mkdir -p "$E"
-zig build test-artifacts -Dtest-backend=true --prefix "$E/task-5-artifacts"
+mise exec -- zig build test-artifacts -Dtest-backend=true --prefix "$E/task-5-artifacts"
 "$E/task-5-artifacts/bin/kotoba-tests"
 ```
 
@@ -197,7 +197,7 @@ without both a model path and working `nvidia-smi`, this exact command should
 exit successfully with the existing skip message:
 
 ```bash
-env -u KOTOBA_CUDA_MODEL bash test/integration/cuda_smoke.sh
+env -u KOTOBA_CUDA_MODEL mise exec -- bash test/integration/cuda_smoke.sh
 # SKIP cuda qa: missing KOTOBA_CUDA_MODEL or nvidia-smi
 ```
 
@@ -208,12 +208,23 @@ integer from 1 through 1000. `--evidence-dir` must be an absolute path, and
 invalid or out-of-range arguments exit with status 2 and
 `parallel harness: invalid arguments`.
 
+The CI driver is separate from that local default: `integration --suite` accepts
+`all`, `smoke`, `matrix`, or `parallel`, defaults to `all`, and defaults to two
+parallel rounds. Its workflow runs smoke, matrix, and parallel as three child
+jobs, then accepts the required aggregate only when every child is `success`.
+Pull requests configure one parallel round; `master` pushes and manual dispatch
+configure two. Current exact-SHA local receipts observed 334 matrix cases
+(46 translate, 221 commands, 22 memory, 45 files); a two-round parallel receipt
+observed 18 children, eight unit logs, two benchmarks, 30 benchmark measurements,
+2,256 unit-test executions, and four matrix receipts. These observations do not
+prove a hosted schedule or run.
+
 Run it with an absolute evidence directory:
 
 ```bash
 E="$PWD/.omo/evidence/parallel"
 mkdir -p "$E"
-bash test/integration/parallel.sh --rounds 2 --evidence-dir "$E"
+mise exec -- bash test/integration/parallel.sh --rounds 2 --evidence-dir "$E"
 ```
 
 The driver records every child status and start/finish timestamps, preserves
@@ -238,13 +249,13 @@ parallel harness, and verifies all four group counts against passing case
 receipts. The stable entrypoint for automation is:
 
 ```bash
-bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
+mise exec -- bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
 # Optional focused selection; default is all four groups.
-bash test/integration/cli_matrix.sh --group translate --evidence-dir "$PWD/.omo/evidence/translate"
-bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/commands"
-bash test/integration/cli_matrix.sh --group memory --evidence-dir "$PWD/.omo/evidence/memory"
-bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evidence/files"
-bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
+mise exec -- bash test/integration/cli_matrix.sh --group translate --evidence-dir "$PWD/.omo/evidence/translate"
+mise exec -- bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/commands"
+mise exec -- bash test/integration/cli_matrix.sh --group memory --evidence-dir "$PWD/.omo/evidence/memory"
+mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evidence/files"
+mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
 The final Issue #54 matrix run records 334 measured CLI cases: translate 46,
