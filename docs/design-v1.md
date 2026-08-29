@@ -129,6 +129,19 @@ Kotoba follows XDG directories:
 - cache: `~/.cache/kotoba/`
 - state/logs: `~/.local/state/kotoba/`
 
+Each domain accepts only an absolute XDG base, which takes precedence and is
+joined with `kotoba`. Unset values use the corresponding HOME fallback;
+empty and relative values are rejected and use that fallback. An unusable HOME
+fails only the domains that require it, while four absolute XDG bases are
+independent of HOME. There is no current-working-directory fallback.
+
+Resolution is side-effect-free; it only classifies and derives paths.
+`ensureDirs` is the separate mutation boundary used by commands that create
+state. A valid `doctor` prepends path checks in `config_path`, `data_path`,
+`cache_path`, `state_path` order: direct/unset fallback is `ok`, empty/relative
+fallback is `warn` with `xdg_path_invalid`, and an unresolved domain is `error`
+with `path_resolution_failed`.
+
 ## Text encoding contract
 
 Translation text is valid UTF-8 and must not contain a NUL byte. This applies
