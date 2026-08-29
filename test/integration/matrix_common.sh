@@ -23,6 +23,11 @@ matrix_case() {
   export CASE_FILE_SIZE_LIMIT=""
   export HOME="${CASE_ROOT}/home" XDG_CONFIG_HOME="${CASE_ROOT}/config" XDG_DATA_HOME="${CASE_ROOT}/data"
   export XDG_CACHE_HOME="${CASE_ROOT}/cache" XDG_STATE_HOME="${CASE_ROOT}/state"
+  export CASE_ENV_HOME_MODE=absolute CASE_ENV_HOME_VALUE="$HOME"
+  export CASE_ENV_CONFIG_MODE=absolute CASE_ENV_CONFIG_VALUE="$XDG_CONFIG_HOME"
+  export CASE_ENV_DATA_MODE=absolute CASE_ENV_DATA_VALUE="$XDG_DATA_HOME"
+  export CASE_ENV_CACHE_MODE=absolute CASE_ENV_CACHE_VALUE="$XDG_CACHE_HOME"
+  export CASE_ENV_STATE_MODE=absolute CASE_ENV_STATE_VALUE="$XDG_STATE_HOME"
   CASE_DB="${XDG_DATA_HOME}/kotoba/memory.sqlite3"
   mkdir -p "$CASE_DIR" "$CASE_ROOT/work" "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
   : >"$CASE_STDIN"
@@ -193,10 +198,28 @@ def capture(args: list[str]) -> None:
     executable = os.environ["CASE_BIN"]
     profile = os.environ["CASE_PROFILE"]
     file_size_limit = int(os.environ["CASE_FILE_SIZE_LIMIT"]) if os.environ["CASE_FILE_SIZE_LIMIT"] else None
+    child_environment = os.environ.copy()
+    environment_classes = {}
+    for name, suffix in (("HOME", "HOME"), ("XDG_CONFIG_HOME", "CONFIG"), ("XDG_DATA_HOME", "DATA"),
+                         ("XDG_CACHE_HOME", "CACHE"), ("XDG_STATE_HOME", "STATE")):
+        mode_key = f"CASE_ENV_{suffix}_MODE"
+        value_key = f"CASE_ENV_{suffix}_VALUE"
+        mode = os.environ[mode_key]
+        value = os.environ[value_key]
+        assert mode in {"unset", "empty", "absolute", "relative"}
+        if mode == "unset":
+            child_environment.pop(name, None)
+        else:
+            child_environment[name] = "" if mode == "empty" else value
+            assert Path(child_environment[name]).is_absolute() == (mode == "absolute")
+        child_environment.pop(mode_key, None)
+        child_environment.pop(value_key, None)
+        environment_classes[name] = mode
     receipt = {"case_id": directory.name, "level": "helper" if profile == "helper" else "cli", "profile": profile,
                "group": os.environ["MATRIX_GROUP"],
                "executable": executable, "executable_sha256": digest(Path(executable)), "argv": [executable, *args],
                "stdin_sha256": digest(directory / "stdin"), "cwd": str(Path.cwd()), "fixture_root": str(root),
+               "environment_classes": environment_classes,
                "stdout": "stdout", "stderr": "stderr", "fs_before": "fs-before.json", "fs_after": "fs-after.json",
                "db_before": "db-before.json", "db_after": "db-after.json", "verdict": "pending", "assertions": [],
                "timeout_seconds": 120, "harness_timeout": False, "file_size_limit_bytes": file_size_limit}
@@ -235,7 +258,7 @@ def capture(args: list[str]) -> None:
             assert receipt["permission"]["execution_mode"] == 0 and not os.access(denied, os.R_OK)
             dump(directory / "receipt.json", receipt)
         with (directory / "stdin").open("rb") as stdin, (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
-            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True,
+            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, env=child_environment, start_new_session=True,
                                        preexec_fn=limit_child if file_size_limit is not None else None)
             try:
                 process.wait(timeout=120)
