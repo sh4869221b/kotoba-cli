@@ -1,17 +1,56 @@
 name: Set up Linux CPU toolchain
 description: Install Ubuntu packages and checksum-verified official Zig 0.16.0
+inputs:
+  profile:
+    description: Toolchain profile (native or format)
+    required: false
+    default: native
 runs:
   using: composite
   steps:
-    - name: Install distribution build dependencies
+    - name: Validate setup profile
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+        case "$PROFILE" in
+          native|format) ;;
+          *) echo 'linux setup: invalid profile' >&2; exit 2 ;;
+        esac
+    - name: Verify format runner tools
+      if: inputs.profile == 'format'
       shell: bash
       run: |
         set -euo pipefail
-        packages=(build-essential clang cmake pkg-config libsqlite3-dev git ripgrep python3 xz-utils ca-certificates curl)
+        for tool in git python3 curl xz sha256sum; do
+          command -v "$tool"
+        done
+    - name: Install distribution build dependencies
+      if: inputs.profile == 'native'
+      shell: bash
+      run: |
+        set -euo pipefail
+        packages=(build-essential clang ccache cmake pkg-config libsqlite3-dev git ripgrep python3 xz-utils ca-certificates curl)
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends "${packages[@]}"
         # Ubuntu maintains these packages; record the actual resolution on every run.
         dpkg-query -W -f='${Package}\t${Version}\n' "${packages[@]}"
+    - name: Configure isolated compiler caches
+      if: inputs.profile == 'native'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cache_root="${RUNNER_TEMP}/kotoba-ccache"
+        mkdir -p "$cache_root/gcc" "$cache_root/clang"
+        ccache --version
+        {
+          printf 'KOTOBA_CCACHE_GCC_DIR=%s/gcc\nKOTOBA_CCACHE_CLANG_DIR=%s/clang\n' "$cache_root" "$cache_root"
+          printf 'CCACHE_DIR=%s/gcc\n' "$cache_root"
+          printf 'CCACHE_COMPILERCHECK=content\nCCACHE_CONFIGPATH=/dev/null\nCCACHE_SLOPPINESS=\nCCACHE_HASHDIR=true\n'
+          printf 'CMAKE_C_COMPILER_LAUNCHER=%s\nCMAKE_CXX_COMPILER_LAUNCHER=%s\n' "$(command -v ccache)" "$(command -v ccache)"
+          printf 'CC=gcc\nCXX=g++\n'
+        } >>"${GITHUB_ENV}"
     - name: Verify and install official Zig
       shell: bash
       run: |
