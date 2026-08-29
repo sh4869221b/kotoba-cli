@@ -109,7 +109,7 @@ fixture() {
   git -C "$FIXTURE/vendor/llama.cpp" checkout --quiet --detach "$PIN"
   cp "$ROOT/build.zig" "$FIXTURE/build.zig"
   cp "$ROOT/src/llama_api_probe.c" "$FIXTURE/src/llama_api_probe.c"
-  cp "$ROOT/test/ci/native-cache.sh" "$ROOT/test/ci/native-cache.py" "$FIXTURE/test/ci/"
+  cp "$ROOT/test/ci/native-cache.sh" "$ROOT/test/ci/native-cache.py" "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/"
   cp "$ROOT/.github/actions/setup-linux/action.yml" "$FIXTURE/.github/actions/setup-linux/action.yml"
 }
 recorder() {
@@ -519,6 +519,7 @@ case_stages() {
     fixture "stage-$stage"
     mkdir -p "$FIXTURE/test/ci"
     cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+    cp "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/integration-evidence.py"
     cp "$ROOT/test/integration/build_contract.sh" "$FIXTURE/test/integration/build_contract.sh"
     cd "$FIXTURE"
     cp build.zig "$TMP/stage-$stage-build.saved"
@@ -576,6 +577,91 @@ WRAPPER
     printf '%s\tbaseline=0\tmutation=nonzero\trestored=0\tsource_restored=yes\n' "$stage" >>"$TMP/counts.tsv"
     cd "$ROOT"
   done
+  fixture stage-selectors
+  mkdir -p "$FIXTURE/test/ci"
+  cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+  cp "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/integration-evidence.py"
+  cd "$FIXTURE"
+  local invalid_root invalid_name invalid_status
+  for invalid_name in rounds-zero rounds-large rounds-nondecimal rounds-missing duplicate-suite unknown-suite matrix-rounds extra-build; do
+    invalid_root="$EVIDENCE/stage-selector-invalid-$invalid_name"
+    case "$invalid_name" in
+      rounds-zero) set -- integration --suite parallel --rounds 0 ;;
+      rounds-large) set -- integration --suite parallel --rounds 1001 ;;
+      rounds-nondecimal) set -- integration --suite parallel --rounds 01 ;;
+      rounds-missing) set -- integration --suite parallel --rounds ;;
+      duplicate-suite) set -- integration --suite all --suite all ;;
+      unknown-suite) set -- integration --suite unknown ;;
+      matrix-rounds) set -- integration --suite matrix --rounds 1 ;;
+      extra-build) set -- build --suite parallel ;;
+    esac
+    capture "stage-selector-invalid-$invalid_name" env KOTOBA_CI_EVIDENCE_DIR="$invalid_root" bash test/ci/linux.sh "$@"
+    invalid_status=2
+    assert "$invalid_name rejects before fixture allocation" test "$STATUS" -eq "$invalid_status"
+    if [[ "$invalid_name" == extra-build ]]; then
+      assert "$invalid_name preserves stage diagnostic" grep -qx 'linux ci: invalid stage' "$TMP/stage-selector-invalid-$invalid_name.stderr"
+    else
+      assert "$invalid_name preserves integration diagnostic" grep -qx 'linux ci: invalid integration arguments' "$TMP/stage-selector-invalid-$invalid_name.stderr"
+    fi
+    assert "$invalid_name creates no evidence root" test ! -e "$invalid_root"
+  done
+  local suite rounds name
+  while IFS='|' read -r suite rounds; do
+    name="stage-selector-$suite-$rounds"
+    if [[ "$suite" == parallel ]]; then
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite "$suite" --rounds "$rounds" </dev/null
+    else
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite "$suite" </dev/null
+    fi
+    assert "$suite selected run passes" test "$STATUS" -eq 0
+    assert "$suite status names selector" grep -qx "suite=$suite" "$EVIDENCE/$name/status.txt"
+    assert "$suite status names rounds" grep -qx "rounds=$rounds" "$EVIDENCE/$name/status.txt"
+    assert "$suite common self-test runs" test -s "$EVIDENCE/$name/common.command"
+    if [[ "$suite" == smoke ]]; then
+      assert 'smoke selected without matrix' test ! -e "$EVIDENCE/$name/cli-matrix.command"
+      assert 'smoke selected without parallel' test ! -e "$EVIDENCE/$name/parallel.command"
+    elif [[ "$suite" == matrix ]]; then
+      assert 'matrix selected without smoke' test ! -e "$EVIDENCE/$name/smoke.command"
+      assert 'matrix selected without parallel' test ! -e "$EVIDENCE/$name/parallel.command"
+    else
+      assert 'parallel selected without smoke' test ! -e "$EVIDENCE/$name/smoke.command"
+      assert 'parallel selected without matrix' test ! -e "$EVIDENCE/$name/cli-matrix.command"
+      assert "parallel $rounds exact child count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*.status' | wc -l)" -eq "$((9 * rounds))"
+      assert "parallel $rounds exact unit log count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*-unit-*.err' | wc -l)" -eq "$((4 * rounds))"
+      assert "parallel $rounds exact benchmark count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*-bench.out' | wc -l)" -eq "$rounds"
+      assert "parallel $rounds exact measurement count" grep -Fqx "$(printf 'parallel-benchmark-measurements\t%s' "$((15 * rounds))")" "$EVIDENCE/$name/counts.tsv"
+      assert "parallel $rounds preserves positive unit total" awk -F '\t' '$1 == "parallel-unit-tests" { found = 1; if ($2 > 0) passed = 1 } END { exit !(found && passed) }' "$EVIDENCE/$name/counts.tsv"
+    fi
+  done <<'SELECTORS'
+smoke|2
+matrix|2
+parallel|1
+parallel|2
+SELECTORS
+  name=stage-selector-parallel-failure
+  capture "$name" env KOTOBA_BENCH_EXPECT_MISMATCH=1 KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite parallel --rounds 1
+  assert 'selected benchmark failure propagates' test "$STATUS" -ne 0
+  assert 'selected benchmark diagnostic remains visible' grep -Fq 'benchmark validation failed: direct translated text mismatch' "$TMP/$name.stdout" "$TMP/$name.stderr"
+  capture stage-selector-parallel-self-test bash test/integration/parallel.sh --self-test
+  assert 'parallel signal cleanup self-test passes' test "$STATUS" -eq 0
+  local selector_source selector_parallel corrupt label
+  selector_source="$EVIDENCE/stage-selector-parallel-1"
+  selector_parallel="$(find "$selector_source/parallel" -mindepth 1 -maxdepth 1 -type d -name 'parallel.*')"
+  for label in missing-child extra-child wrong-round failed-child bad-benchmark bad-unit-log; do
+    corrupt="$TMP/stage-selector-corrupt-$label"
+    cp -a "$selector_source" "$corrupt"
+    case "$label" in
+      missing-child) rm "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" ;;
+      extra-child) cp "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-5.status" ;;
+      wrong-round) mv "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-4.status" "$corrupt/parallel/$(basename "$selector_parallel")/round-2-unit-4.status" ;;
+      failed-child) sed -i 's/status=0/status=1/' "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" ;;
+      bad-benchmark) printf '{}\n' >"$corrupt/parallel/$(basename "$selector_parallel")/round-1-bench.out" ;;
+      bad-unit-log) printf 'unexpected unit output\n' >"$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.err" ;;
+    esac
+    capture "stage-selector-corrupt-$label" python3 test/ci/integration-evidence.py --suite parallel --rounds 1 --evidence-dir "$corrupt"
+    assert "$label receipt corruption is rejected" test "$STATUS" -ne 0
+  done
+  cd "$ROOT"
 }
 if [[ "$CASE" == all ]]; then CASES=(pin probe runner cache tools); else CASES=("$CASE"); fi
 for ACTIVE_CASE in "${CASES[@]}"; do

@@ -1,10 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-invalid() { echo 'linux ci: invalid stage' >&2; exit 2; }
-[[ "$#" == 1 ]] || invalid
+invalid_stage() { echo 'linux ci: invalid stage' >&2; exit 2; }
+invalid_integration() { echo 'linux ci: invalid integration arguments' >&2; exit 2; }
+[[ "$#" -ge 1 ]] || invalid_stage
 STAGE="$1"
-case "$STAGE" in format|build|unit|integration) ;; *) invalid ;; esac
+shift
+case "$STAGE" in format|build|unit|integration) ;; *) invalid_stage ;; esac
+SUITE=all
+SUITE_EXPLICIT=0
+ROUNDS=2
+ROUNDS_EXPLICIT=0
+if [[ "$STAGE" == integration ]]; then
+  while (($#)); do
+    (($# >= 2)) || invalid_integration
+    case "$1" in
+      --suite)
+        [[ "$SUITE_EXPLICIT" == 0 ]] || invalid_integration
+        SUITE="$2"
+        SUITE_EXPLICIT=1
+        ;;
+      --rounds)
+        [[ "$ROUNDS_EXPLICIT" == 0 && "$2" =~ ^[1-9][0-9]{0,3}$ ]] || invalid_integration
+        ROUNDS="$2"
+        ROUNDS_EXPLICIT=1
+        (( ROUNDS <= 1000 )) || invalid_integration
+        ;;
+      *) invalid_integration ;;
+    esac
+    shift 2
+  done
+  case "$SUITE" in all|smoke|matrix|parallel) ;; *) invalid_integration ;; esac
+  [[ "$ROUNDS_EXPLICIT" == 0 || "$SUITE" == all || "$SUITE" == parallel ]] || invalid_integration
+else
+  [[ "$#" == 0 ]] || invalid_stage
+fi
+PARALLEL_CHILDREN=0
+PARALLEL_UNIT_LOGS=0
+PARALLEL_BENCHMARKS=0
+PARALLEL_MEASUREMENTS=0
+if [[ "$SUITE" == all || "$SUITE" == parallel ]]; then
+  PARALLEL_CHILDREN=$((9 * ROUNDS))
+  PARALLEL_UNIT_LOGS=$((4 * ROUNDS))
+  PARALLEL_BENCHMARKS="$ROUNDS"
+  PARALLEL_MEASUREMENTS=$((15 * ROUNDS))
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 if [[ -n "${KOTOBA_CI_EVIDENCE_DIR:-}" ]]; then
@@ -48,7 +88,13 @@ cleanup() {
     echo 'linux ci: source status changed' >&2
     [[ "$status" != 0 ]] || status=1
   fi
-  printf 'stage=%s\nexit=%s\nowned=%s\nowned_removed=%s\n' "$STAGE" "$status" "$OWNED" "$([[ ! -e "$OWNED" ]] && echo yes || echo no)" >"$EVIDENCE/status.txt"
+  {
+    printf 'stage=%s\nexit=%s\nowned=%s\nowned_removed=%s\n' "$STAGE" "$status" "$OWNED" "$([[ ! -e "$OWNED" ]] && echo yes || echo no)"
+    if [[ "$STAGE" == integration ]]; then
+      printf 'suite=%s\nrounds=%s\nparallel_children=%s\nparallel_unit_logs=%s\nparallel_benchmarks=%s\nparallel_benchmark_measurements=%s\n' \
+        "$SUITE" "$ROUNDS" "$PARALLEL_CHILDREN" "$PARALLEL_UNIT_LOGS" "$PARALLEL_BENCHMARKS" "$PARALLEL_MEASUREMENTS"
+    fi
+  } >"$EVIDENCE/status.txt"
   cat "$EVIDENCE/status.txt"
   [[ ! -f "$EVIDENCE/counts.tsv" ]] || cat "$EVIDENCE/counts.tsv"
   [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] || cat "$EVIDENCE/identity.txt" "$EVIDENCE/status.txt" "$EVIDENCE/counts.tsv" >>"$GITHUB_STEP_SUMMARY"
@@ -179,55 +225,19 @@ PY
     ;;
   integration)
     run common bash test/integration/common.sh --self-test
-    run smoke bash test/integration/smoke.sh
-    run cli-matrix bash test/integration/cli_matrix.sh --evidence-dir "$EVIDENCE/cli-matrix"
-    run parallel bash test/integration/parallel.sh --rounds 2 --evidence-dir "$EVIDENCE/parallel"
-    python3 - "$EVIDENCE" >>"$EVIDENCE/counts.tsv" <<'PY'
-import collections, json, pathlib, re, sys
-root = pathlib.Path(sys.argv[1])
-assert 'harness self-test ok' in (root / 'common.stdout').read_text()
-assert 'smoke ok' in (root / 'smoke.stdout').read_text()
-matrices = list((root / 'cli-matrix').glob('cli-matrix.*'))
-assert len(matrices) == 1, matrices
-matrix = matrices[0]
-summary = json.loads((matrix / 'summary.json').read_text())
-receipts = [json.loads(path.read_text()) for path in (matrix / 'cases').glob('*/receipt.json')]
-counts = collections.Counter(receipt['group'] for receipt in receipts)
-assert set(counts) == {'translate', 'commands', 'memory', 'files'} and all(counts.values()), counts
-assert dict(counts) == summary['groups'] and len(receipts) == summary['passed'] > 0
-assert len(set(summary['cases'])) == len(receipts) and set(summary['cases']) == {r['case_id'] for r in receipts}
-for receipt in receipts:
-    assert receipt['level'] == 'cli' and receipt['verdict'] == 'pass' and not receipt['harness_timeout']
-    assert receipt['assertions'] and all(check['passed'] for check in receipt['assertions'])
-    case = matrix / 'cases' / receipt['case_id']
-    assert int((case / 'status').read_text()) == receipt['status']
-    for artifact in ('stdout', 'stderr', 'fs_before', 'fs_after', 'db_before', 'db_after'):
-        assert (case / receipt[artifact]).is_file(), (case, artifact)
-cleanup = json.loads((matrix / 'cleanup.json').read_text())
-assert cleanup['exit_status'] == 0 and cleanup['temporary_removed'] and cleanup['lock_released']
-for group, count in sorted(counts.items()):
-    print(f'cli-matrix-{group}\t{count}')
-print(f'cli-matrix-total\t{len(receipts)}')
-runs = list((root / 'parallel').glob('parallel.*'))
-assert len(runs) == 1, runs
-run = runs[0]
-statuses = list(run.glob('round-*.status'))
-assert len(statuses) == 18 and all(re.search(r' status=0\n?$', p.read_text()) for p in statuses)
-unit_total = 0
-for path in run.glob('round-*-unit-*.err'):
-    match = re.search(r'All (\d+) tests passed\.', path.read_text())
-    assert match and int(match[1]) > 0, path
-    unit_total += int(match[1])
-assert len(list(run.glob('round-*-unit-*.err'))) == 8
-benchmarks = list(run.glob('round-*-bench.out'))
-assert len(benchmarks) == 2
-measurements = 0
-for path in benchmarks:
-    payload = json.loads(path.read_text())
-    assert payload['iterations'] == 5 and len(payload['inputs']) == 3
-    measurements += payload['iterations'] * len(payload['inputs'])
-print(f'common\t1\nsmoke\t1\nparallel-children\t{len(statuses)}\nparallel-unit-tests\t{unit_total}\nparallel-benchmark-measurements\t{measurements}')
-PY
+    if [[ "$SUITE" == all || "$SUITE" == smoke ]]; then run smoke bash test/integration/smoke.sh; fi
+    if [[ "$SUITE" == all || "$SUITE" == matrix ]]; then run cli-matrix bash test/integration/cli_matrix.sh --evidence-dir "$EVIDENCE/cli-matrix"; fi
+    if [[ "$SUITE" == all || "$SUITE" == parallel ]]; then
+      if run parallel bash test/integration/parallel.sh --rounds "$ROUNDS" --evidence-dir "$EVIDENCE/parallel"; then
+        :
+      else
+        parallel_status=$?
+        find "$EVIDENCE/parallel" -name 'round-*-bench.err' -type f -exec cat {} \; >&2
+        exit "$parallel_status"
+      fi
+    fi
+    run integration-evidence python3 test/ci/integration-evidence.py --suite "$SUITE" --rounds "$ROUNDS" --evidence-dir "$EVIDENCE"
+    cat "$EVIDENCE/integration-evidence.stdout" >>"$EVIDENCE/counts.tsv"
     ;;
 esac
 
