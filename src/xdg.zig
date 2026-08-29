@@ -133,7 +133,7 @@ fn getenvOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     };
 }
 
-fn resolveFromEnvironment(allocator: std.mem.Allocator) !Resolution {
+pub fn resolveFromEnvironment(allocator: std.mem.Allocator) !Resolution {
     const config = try getenvOptional(allocator, "XDG_CONFIG_HOME");
     defer if (config) |value| allocator.free(value);
     const data = try getenvOptional(allocator, "XDG_DATA_HOME");
