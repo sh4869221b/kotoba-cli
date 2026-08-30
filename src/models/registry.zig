@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("../errors.zig");
 const sys = @import("../sys.zig");
 const strict = @import("../strict_toml.zig");
+const staged_output = @import("../staged_output.zig");
 const types = @import("types.zig");
 const url = @import("../url.zig");
 const validation = @import("validation.zig");
@@ -51,6 +52,11 @@ pub fn defaultTemplate() []const u8 {
 }
 
 pub fn ensure(path: []const u8) !void {
+    return ensureWithOptions(path, .{});
+}
+
+fn ensureWithOptions(path: []const u8, options: sys.StagedFileOptions) !void {
+    _ = options;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var owner = load(arena.allocator(), path) catch |err| switch (err) {
@@ -228,6 +234,11 @@ pub fn save(path: []const u8, list: List) !void {
 }
 
 fn saveWithAllocator(allocator: std.mem.Allocator, path: []const u8, list: List) !void {
+    return saveWithAllocatorAndOptions(allocator, path, list, .{});
+}
+
+fn saveWithAllocatorAndOptions(allocator: std.mem.Allocator, path: []const u8, list: List, options: sys.StagedFileOptions) !void {
+    _ = options;
     var out = strict.Buffer.init(allocator);
     defer out.deinit();
     validateModels(out.allocator, list) catch |err| switch (err) {
@@ -304,6 +315,125 @@ fn appendStringField(out: *std.array_list.Managed(u8), key: []const u8, value: [
 
 fn appendFmt(out: *std.array_list.Managed(u8), comptime fmt: []const u8, args: anytype) !void {
     try out.print(fmt, args);
+}
+
+fn testExpectOnlyRegistryEntries(dir: std.Io.Dir, existing: bool) !void {
+    var iterator_dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer iterator_dir.close(std.testing.io);
+    var iterator = iterator_dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |entry| {
+        count += 1;
+        if (std.mem.eql(u8, entry.name, "sibling") or std.mem.eql(u8, entry.name, "models.toml")) continue;
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, if (existing) 2 else 1), count);
+}
+
+test "atomic registry ensure keeps a missing registry absent through publication failures" {
+    const operations = [_]staged_output.Faults.Operation{ .candidate, .create, .write, .flush, .sync, .close, .rename };
+    for (operations) |operation| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ root, "models.toml" });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "unrelated" });
+        var faults: staged_output.Faults = .{};
+        try faults.arm(operation, 1, error.InputOutput);
+        var report: staged_output.CleanupReport = .{};
+        try std.testing.expectError(error.InputOutput, ensureWithOptions(path, .{ .faults = &faults, .cleanup_report = &report }));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "models.toml", .{}));
+        try std.testing.expectEqual(null, report.secondary);
+        try testExpectOnlyRegistryEntries(tmp.dir, false);
+    }
+}
+
+test "atomic registry ensure cleanup secondary retains only its stage and collision is preserved" {
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ root, "models.toml" });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "unrelated" });
+        var faults: staged_output.Faults = .{};
+        try faults.arm(.write, 1, error.InputOutput);
+        try faults.arm(.cleanup, 1, error.AccessDenied);
+        var report: staged_output.CleanupReport = .{};
+        try std.testing.expectError(error.InputOutput, ensureWithOptions(path, .{ .faults = &faults, .cleanup_report = &report }));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "models.toml", .{}));
+        try std.testing.expectEqual(error.AccessDenied, report.secondary.?);
+        var iterator_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer iterator_dir.close(std.testing.io);
+        var iterator = iterator_dir.iterate();
+        var count: usize = 0;
+        while (try iterator.next(std.testing.io)) |entry| {
+            count += 1;
+            if (std.mem.eql(u8, entry.name, "sibling")) continue;
+            try std.testing.expect(std.mem.startsWith(u8, entry.name, ".kotoba-output-"));
+        }
+        try std.testing.expectEqual(@as(usize, 2), count);
+    }
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ root, "models.toml" });
+        defer std.testing.allocator.free(path);
+        const collision = ".kotoba-output-00000000000000000000000000000000.tmp";
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = collision, .data = "collision" });
+        const candidates = [_][16]u8{ @splat(0), @splat(1) };
+        var faults: staged_output.Faults = .{ .candidate_sequence = &candidates };
+        try ensureWithOptions(path, .{ .faults = &faults });
+        const collision_bytes = try tmp.dir.readFileAlloc(std.testing.io, collision, std.testing.allocator, .limited(32));
+        defer std.testing.allocator.free(collision_bytes);
+        try std.testing.expectEqualStrings("collision", collision_bytes);
+        const registry_bytes = try tmp.dir.readFileAlloc(std.testing.io, "models.toml", std.testing.allocator, .limited(4096));
+        defer std.testing.allocator.free(registry_bytes);
+        try std.testing.expectEqualStrings(defaultTemplate(), registry_bytes);
+        try std.testing.expectEqual(@as(usize, 2), faults.attemptsFor(.create));
+        var iterator_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer iterator_dir.close(std.testing.io);
+        var iterator = iterator_dir.iterate();
+        var count: usize = 0;
+        while (try iterator.next(std.testing.io)) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 2), count);
+    }
+}
+
+test "atomic registry save preserves destination through every publication boundary" {
+    const operations = [_]staged_output.Faults.Operation{ .candidate, .create, .write, .flush, .sync, .close, .rename };
+    var models = [_]Model{.{ .id = "new-registry", .name = "New Registry" }};
+    const list = List{ .models = &models };
+    for (operations) |operation| for ([_]bool{ false, true }) |existing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ root, "models.toml" });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "unrelated" });
+        if (existing) {
+            try sys.writeFile(path, "old registry bytes\n");
+            try tmp.dir.setFilePermissions(std.testing.io, "models.toml", .fromMode(0o640), .{});
+        }
+        var faults: staged_output.Faults = .{};
+        try faults.arm(operation, 1, error.InputOutput);
+        var report: staged_output.CleanupReport = .{};
+        try std.testing.expectError(error.InputOutput, saveWithAllocatorAndOptions(std.testing.allocator, path, list, .{ .faults = &faults, .cleanup_report = &report }));
+        if (existing) {
+            const bytes = try tmp.dir.readFileAlloc(std.testing.io, "models.toml", std.testing.allocator, .limited(128));
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("old registry bytes\n", bytes);
+            try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), (try tmp.dir.statFile(std.testing.io, "models.toml", .{})).permissions.toMode() & 0o7777);
+        } else try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "models.toml", .{}));
+        try std.testing.expectEqual(null, report.secondary);
+        try testExpectOnlyRegistryEntries(tmp.dir, existing);
+    };
 }
 
 test "parse model list" {
@@ -1160,41 +1290,36 @@ fn exerciseRegistryMutation(backing: std.mem.Allocator, scenario: MutationCase, 
     const path = try std.fs.path.join(a, &.{ root, "models.toml" });
     defer a.free(path);
     try sys.writeFile(path, ownership_fixture);
-    const file = try tmp.dir.openFile(std.testing.io, "models.toml", .{});
-    defer file.close(std.testing.io);
-    const save_error = scenario == .save_upsert or scenario == .save_remove;
-    if (save_error) try file.setPermissions(std.testing.io, .fromMode(0o400));
-    defer if (save_error) file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
+    const read_only_existing = scenario == .save_upsert or scenario == .save_remove;
+    if (read_only_existing) try tmp.dir.setFilePermissions(std.testing.io, "models.toml", .fromMode(0o400), .{});
     switch (scenario) {
         .append, .replace, .save_upsert => {
             upsert(allocator, path, .{ .id = if (scenario == .append) "new" else "same", .name = "replacement" }) catch |err| {
                 if (err == error.OutOfMemory) return err;
-                if (!save_error) return err;
-                try std.testing.expectEqual(error.AccessDenied, err);
-                return;
+                return err;
             };
-            try std.testing.expect(!save_error);
         },
         .remove, .missing, .save_remove => {
             var removed = removeById(allocator, path, if (scenario == .missing) "absent" else "same") catch |err| {
                 if (err == error.OutOfMemory) return err;
-                const expected: anyerror = if (scenario == .missing) error.ModelRegistryInvalid else if (save_error) error.AccessDenied else return err;
+                const expected: anyerror = if (scenario == .missing) error.ModelRegistryInvalid else return err;
                 try std.testing.expectEqual(expected, err);
                 return;
             };
             defer removed.deinit();
             try std.testing.expectEqualStrings("first", removed.view().name);
-            try std.testing.expect(!save_error and scenario != .missing);
+            try std.testing.expect(scenario != .missing);
         },
     }
     var reloaded = try load(a, path);
     defer reloaded.deinit();
-    if (scenario == .remove) {
+    if (scenario == .remove or scenario == .save_remove) {
         try std.testing.expect(find(reloaded.view(), "same") == null);
         try std.testing.expect(find(reloaded.view(), "kept") != null);
     } else {
         try std.testing.expectEqualStrings("replacement", find(reloaded.view(), if (scenario == .append) "new" else "same").?.name);
     }
+    if (read_only_existing) try std.testing.expectEqual(@as(std.posix.mode_t, 0o400), (try tmp.dir.statFile(std.testing.io, "models.toml", .{})).permissions.toMode() & 0o7777);
     try expectOnlyEntry(tmp.dir, "models.toml");
 }
 

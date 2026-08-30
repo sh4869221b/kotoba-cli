@@ -3,6 +3,7 @@ const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
 const strict = @import("strict_toml.zig");
+const staged_output = @import("staged_output.zig");
 
 pub const Mode = enum {
     default,
@@ -305,6 +306,11 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
 }
 
 pub fn save(path: []const u8, cfg: Config) !void {
+    return saveWithOptions(path, cfg, .{});
+}
+
+fn saveWithOptions(path: []const u8, cfg: Config, options: sys.StagedFileOptions) !void {
+    _ = options;
     var out = strict.Buffer.init(std.heap.page_allocator);
     defer out.deinit();
     appendConfig(&out, cfg) catch |err| switch (err) {
@@ -358,6 +364,48 @@ fn parseBool(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
     return errors.Error.InvalidArguments;
+}
+
+fn testExpectOnlyConfigEntries(dir: std.Io.Dir, existing: bool) !void {
+    var iterator_dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer iterator_dir.close(std.testing.io);
+    var iterator = iterator_dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |entry| {
+        count += 1;
+        if (std.mem.eql(u8, entry.name, "sibling") or std.mem.eql(u8, entry.name, "config.toml")) continue;
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, if (existing) 2 else 1), count);
+}
+
+test "atomic config save preserves destination through every publication boundary" {
+    const operations = [_]staged_output.Faults.Operation{ .candidate, .create, .write, .flush, .sync, .close, .rename };
+    for (operations) |operation| for ([_]bool{ false, true }) |existing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const path = try std.fs.path.join(std.testing.allocator, &.{ root, "config.toml" });
+        defer std.testing.allocator.free(path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "unrelated" });
+        if (existing) {
+            try sys.writeFile(path, "old config bytes\n");
+            try tmp.dir.setFilePermissions(std.testing.io, "config.toml", .fromMode(0o600), .{});
+        }
+        var faults: staged_output.Faults = .{};
+        try faults.arm(operation, 1, error.InputOutput);
+        var report: staged_output.CleanupReport = .{};
+        try std.testing.expectError(error.InputOutput, saveWithOptions(path, .{ .model_id = "new-config" }, .{ .faults = &faults, .cleanup_report = &report }));
+        if (existing) {
+            const bytes = try tmp.dir.readFileAlloc(std.testing.io, "config.toml", std.testing.allocator, .limited(128));
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("old config bytes\n", bytes);
+            try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try tmp.dir.statFile(std.testing.io, "config.toml", .{})).permissions.toMode() & 0o7777);
+        } else try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "config.toml", .{}));
+        try std.testing.expectEqual(null, report.secondary);
+        try testExpectOnlyConfigEntries(tmp.dir, existing);
+    };
 }
 
 test {
