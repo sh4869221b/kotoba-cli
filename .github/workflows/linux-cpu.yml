@@ -17,56 +17,266 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          submodules: recursive
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-linux
+        with:
+          profile: format
       - name: Run format checks
         env:
           KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-format
         run: bash test/ci/linux.sh format
-  build:
-    name: Linux CPU / build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - name: Upload format evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          submodules: recursive
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: ./.github/actions/setup-linux
-      - name: Run build checks
-        env:
-          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-build
-        run: bash test/ci/linux.sh build
+          name: linux-cpu-${{ github.run_id }}-${{ github.run_attempt }}-format
+          path: ${{ runner.temp }}/linux-cpu-format
+          if-no-files-found: warn
+          retention-days: 7
+
   unit:
     name: Linux CPU / unit
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      STAGE_SLUG: unit
+      KOTOBA_CI_NATIVE_CACHE: 1
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+      - &native_checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-linux
+      - &native_setup
+        uses: ./.github/actions/setup-linux
+      - &native_evidence
+        name: Prepare native stage evidence
+        run: |
+          echo "EVIDENCE_DIR=${RUNNER_TEMP}/linux-cpu-${STAGE_SLUG}" >>"$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/linux-cpu-${STAGE_SLUG}"
+      - &gcc_identity
+        name: Compute GCC cache identity
+        id: gcc_identity
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          bash test/ci/native-cache.sh identity --compiler gcc --output "$EVIDENCE_DIR/native-gcc.json" | tee -a "$GITHUB_OUTPUT"
+      - &gcc_compiler_restore
+        name: Restore GCC compiler cache
+        id: gcc_compiler_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/kotoba-ccache/gcc
+          key: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.compiler_key }}
+      - &gcc_native_restore
+        name: Restore GCC native cache
+        id: gcc_native_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache/llama.cpp/cpu
+          key: kotoba-native-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.native_key }}
+      - &gcc_cache_metadata
+        name: Record and enforce exact GCC cache matches
+        env:
+          COMPILER_REQUESTED: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.compiler_key }}
+          COMPILER_MATCHED: ${{ steps.gcc_compiler_restore.outputs.cache-matched-key }}
+          COMPILER_HIT: ${{ steps.gcc_compiler_restore.outputs.cache-hit }}
+          NATIVE_REQUESTED: kotoba-native-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.native_key }}
+          NATIVE_MATCHED: ${{ steps.gcc_native_restore.outputs.cache-matched-key }}
+          NATIVE_HIT: ${{ steps.gcc_native_restore.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          for kind in COMPILER NATIVE; do
+            eval 'requested=$'"${kind}_REQUESTED"
+            eval 'matched=$'"${kind}_MATCHED"
+            eval 'hit=$'"${kind}_HIT"
+            printf '%s\trequested=%s\tmatched=%s\thit=%s\n' "$kind" "$requested" "$matched" "$hit" | tee -a "$EVIDENCE_DIR/cache-metadata.tsv"
+            [[ -z "$matched" || "$matched" == "$requested" ]]
+          done
       - name: Run unit checks
         env:
-          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-unit
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
         run: bash test/ci/linux.sh unit
-  integration:
-    name: Linux CPU / integration
+      - &gcc_compiler_save
+        name: Save GCC compiler cache
+        if: ${{ success() && steps.gcc_compiler_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/kotoba-ccache/gcc
+          key: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.compiler_key }}
+      - &gcc_native_save
+        name: Save GCC native cache
+        if: ${{ success() && steps.gcc_native_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache/llama.cpp/cpu
+          key: kotoba-native-${{ runner.os }}-${{ runner.arch }}-gcc-${{ steps.gcc_identity.outputs.native_key }}
+      - &native_evidence_upload
+        name: Upload native stage evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-cpu-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.STAGE_SLUG }}
+          path: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  build:
+    name: Linux CPU / build
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      STAGE_SLUG: build
+      KOTOBA_CI_NATIVE_CACHE: 1
+    steps:
+      - *native_checkout
+      - *native_setup
+      - *native_evidence
+      - *gcc_identity
+      - *gcc_compiler_restore
+      - *gcc_native_restore
+      - *gcc_cache_metadata
+      - name: Compute Clang cache identity
+        id: clang_identity
+        env:
+          CC: clang
+          CXX: clang++
+          CCACHE_DIR: ${{ runner.temp }}/kotoba-ccache/clang
+        run: bash test/ci/native-cache.sh identity --compiler clang --output "$EVIDENCE_DIR/native-clang.json" | tee -a "$GITHUB_OUTPUT"
+      - name: Restore Clang compiler cache
+        id: clang_compiler_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/kotoba-ccache/clang
+          key: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.compiler_key }}
+      - name: Restore Clang native cache
+        id: clang_native_restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache/ci-clang/llama.cpp/cpu
+          key: kotoba-native-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.native_key }}
+      - name: Record and enforce exact Clang cache matches
+        env:
+          COMPILER_REQUESTED: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.compiler_key }}
+          COMPILER_MATCHED: ${{ steps.clang_compiler_restore.outputs.cache-matched-key }}
+          COMPILER_HIT: ${{ steps.clang_compiler_restore.outputs.cache-hit }}
+          NATIVE_REQUESTED: kotoba-native-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.native_key }}
+          NATIVE_MATCHED: ${{ steps.clang_native_restore.outputs.cache-matched-key }}
+          NATIVE_HIT: ${{ steps.clang_native_restore.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          for kind in COMPILER NATIVE; do
+            eval 'requested=$'"${kind}_REQUESTED"
+            eval 'matched=$'"${kind}_MATCHED"
+            eval 'hit=$'"${kind}_HIT"
+            printf 'CLANG_%s\trequested=%s\tmatched=%s\thit=%s\n' "$kind" "$requested" "$matched" "$hit" | tee -a "$EVIDENCE_DIR/cache-metadata.tsv"
+            [[ -z "$matched" || "$matched" == "$requested" ]]
+          done
+      - name: Run build checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
+        run: bash test/ci/linux.sh build
+      - *gcc_compiler_save
+      - *gcc_native_save
+      - name: Save Clang compiler cache
+        if: ${{ success() && steps.clang_compiler_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/kotoba-ccache/clang
+          key: kotoba-ccache-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.compiler_key }}
+      - name: Save Clang native cache
+        if: ${{ success() && steps.clang_native_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .zig-cache/ci-clang/llama.cpp/cpu
+          key: kotoba-native-${{ runner.os }}-${{ runner.arch }}-clang-${{ steps.clang_identity.outputs.native_key }}
+      - *native_evidence_upload
+
+  integration-smoke:
+    name: Linux CPU / integration / smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      STAGE_SLUG: integration-smoke
+      KOTOBA_CI_NATIVE_CACHE: 1
+    steps:
+      - *native_checkout
+      - *native_setup
+      - *native_evidence
+      - *gcc_identity
+      - *gcc_compiler_restore
+      - *gcc_native_restore
+      - *gcc_cache_metadata
+      - name: Run smoke integration checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
+        run: bash test/ci/linux.sh integration --suite smoke
+      - *gcc_compiler_save
+      - *gcc_native_save
+      - *native_evidence_upload
+
+  integration-matrix:
+    name: Linux CPU / integration / matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      STAGE_SLUG: integration-matrix
+      KOTOBA_CI_NATIVE_CACHE: 1
+    steps:
+      - *native_checkout
+      - *native_setup
+      - *native_evidence
+      - *gcc_identity
+      - *gcc_compiler_restore
+      - *gcc_native_restore
+      - *gcc_cache_metadata
+      - name: Run matrix integration checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
+        run: bash test/ci/linux.sh integration --suite matrix
+      - *gcc_compiler_save
+      - *gcc_native_save
+      - *native_evidence_upload
+
+  integration-parallel:
+    name: Linux CPU / integration / parallel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      STAGE_SLUG: integration-parallel
+      KOTOBA_CI_NATIVE_CACHE: 1
+    steps:
+      - *native_checkout
+      - *native_setup
+      - *native_evidence
+      - *gcc_identity
+      - *gcc_compiler_restore
+      - *gcc_native_restore
+      - *gcc_cache_metadata
+      - name: Run parallel integration checks
+        env:
+          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-${{ env.STAGE_SLUG }}
+          ROUNDS: ${{ github.event_name == 'pull_request' && '1' || '2' }}
+        run: bash test/ci/linux.sh integration --suite parallel --rounds "$ROUNDS"
+      - *gcc_compiler_save
+      - *gcc_native_save
+      - *native_evidence_upload
+
+  integration:
+    name: Linux CPU / integration
+    needs: [integration-smoke, integration-matrix, integration-parallel]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
-      - uses: ./.github/actions/setup-linux
-      - name: Run integration checks
+      - name: Require every integration lane to succeed
         env:
-          KOTOBA_CI_EVIDENCE_DIR: ${{ runner.temp }}/linux-cpu-integration
-        run: bash test/ci/linux.sh integration
+          SMOKE_RESULT: ${{ needs.integration-smoke.result }}
+          MATRIX_RESULT: ${{ needs.integration-matrix.result }}
+          PARALLEL_RESULT: ${{ needs.integration-parallel.result }}
+        run: bash test/ci/integration-aggregate.sh "$SMOKE_RESULT" "$MATRIX_RESULT" "$PARALLEL_RESULT"

@@ -99,6 +99,7 @@ commands_error() {
     glossary_invalid) message='glossary.toml is invalid.' ;;
     invalid_utf8) message='Text must be valid UTF-8.' ;;
     embedded_nul) message='Text must not contain NUL bytes.' ;;
+    path_resolution_failed) message='Could not resolve XDG paths from absolute XDG values or HOME.' ;;
     *) return 2 ;;
   esac
   commands_streams "$status" '' "kotoba: $code: $message"$'\n'
@@ -215,6 +216,9 @@ variant, output = sys.argv[1:]
 checks = []
 def add(name, message, status='ok', code=''):
     checks.append(dict(name=name, status=status, code=code, message=message))
+for name, variable in [('config_path','XDG_CONFIG_HOME'), ('data_path','XDG_DATA_HOME'),
+                       ('cache_path','XDG_CACHE_HOME'), ('state_path','XDG_STATE_HOME')]:
+    add(name, str(Path(os.environ[variable]) / 'kotoba'))
 if variant == 'absent':
     add('config','Kotoba is not initialized. Run `kotoba init`.','error','not_initialized')
     add('models','Kotoba is not initialized. Run `kotoba init`.','error','not_initialized')
@@ -234,6 +238,109 @@ directory = Path(os.environ['CASE_DIR'])
 text = json.dumps(value, separators=(',',':'))+'\n' if output == 'json' else ''.join(f"{c['status']}: {c['name']}: {c['message']}\n" for c in checks)
 (directory / 'expected.stdout').write_text(text)
 PY
+}
+
+commands_env_case() {
+  matrix_case "$1"
+  export CASE_ENV_HOME_MODE=absolute CASE_ENV_HOME_VALUE="$HOME"
+  export CASE_ENV_CONFIG_MODE=absolute CASE_ENV_CONFIG_VALUE="$XDG_CONFIG_HOME"
+  export CASE_ENV_DATA_MODE=absolute CASE_ENV_DATA_VALUE="$XDG_DATA_HOME"
+  export CASE_ENV_CACHE_MODE=absolute CASE_ENV_CACHE_VALUE="$XDG_CACHE_HOME"
+  export CASE_ENV_STATE_MODE=absolute CASE_ENV_STATE_VALUE="$XDG_STATE_HOME"
+}
+
+commands_env_set() {
+  local variable="$1" mode="$2" value="${3:-}" mode_name value_name
+  case "$variable" in HOME|CONFIG|DATA|CACHE|STATE) ;; *) return 2 ;; esac
+  case "$mode" in unset|empty|absolute|relative) ;; *) return 2 ;; esac
+  mode_name="CASE_ENV_${variable}_MODE"
+  value_name="CASE_ENV_${variable}_VALUE"
+  printf -v "$mode_name" '%s' "$mode"
+  printf -v "$value_name" '%s' "$value"
+  export "${mode_name?}" "${value_name?}"
+}
+
+commands_env_finalize() {
+  local expected_data_dir="$1"
+  CASE_DB="${expected_data_dir}/memory.sqlite3"
+  export CASE_DB
+  python3 - "$CASE_DIR/expected-environment.json" \
+    "$CASE_ENV_HOME_MODE" "$CASE_ENV_CONFIG_MODE" "$CASE_ENV_DATA_MODE" "$CASE_ENV_CACHE_MODE" "$CASE_ENV_STATE_MODE" <<'PY'
+import json, sys
+from pathlib import Path
+names = ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']
+Path(sys.argv[1]).write_text(json.dumps(dict(zip(names, sys.argv[2:])), sort_keys=True))
+PY
+}
+
+commands_env_assert() {
+  matrix_assert custom environment-contract python3 - "$CASE_DIR" "$CASE_BIN" "$CASE_ROOT/work" "$@" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+directory, executable, cwd, *argv = sys.argv[1:]
+directory = Path(directory)
+receipt = json.loads((directory / 'receipt.json').read_text())
+expected_environment = json.loads((directory / 'expected-environment.json').read_text())
+assert receipt['environment_classes'] == expected_environment
+assert receipt['argv'] == [executable, *argv]
+assert receipt['cwd'] == cwd
+assert receipt['executable_sha256'] == hashlib.sha256(Path(executable).read_bytes()).hexdigest()
+assert receipt['stdout'] == 'stdout' and receipt['stderr'] == 'stderr'
+assert receipt['fs_before'] == 'fs-before.json' and receipt['fs_after'] == 'fs-after.json'
+assert receipt['db_before'] == 'db-before.json' and receipt['db_after'] == 'db-after.json'
+assert receipt['signal'] == 0 and not receipt['harness_timeout']
+assert set(receipt['environment_classes'].values()) <= {'unset','empty','absolute','relative'}
+print(json.dumps({'argv': receipt['argv'], 'cwd': receipt['cwd'], 'environment_classes': expected_environment,
+                  'executable_sha256': receipt['executable_sha256']}, sort_keys=True))
+PY
+}
+
+commands_xdg_doctor_expectation() {
+  local output="$1"; shift
+  python3 - "$output" "$@" <<'PY'
+import json, os, sys
+from pathlib import Path
+output, *items = sys.argv[1:]
+assert len(items) == 8
+checks = []
+failed = False
+for name, path, reason in zip(('config_path','data_path','cache_path','state_path'), items[::2], items[1::2]):
+    if reason == 'unresolved':
+        checks.append(dict(name=name, status='error', code='path_resolution_failed',
+                           message='Could not resolve XDG paths from absolute XDG values or HOME.'))
+        failed = True
+    else:
+        status = 'warn' if reason in ('empty','relative') else 'ok'
+        code = 'xdg_path_invalid' if status == 'warn' else ''
+        checks.append(dict(name=name, status=status, code=code, message=path))
+if not failed:
+    message = 'Kotoba is not initialized. Run `kotoba init`.'
+    checks.extend([dict(name='config', status='error', code='not_initialized', message=message),
+                   dict(name='models', status='error', code='not_initialized', message=message)])
+value = dict(ok=False, checks=checks)
+directory = Path(os.environ['CASE_DIR'])
+(directory / 'expected-doctor.json').write_text(json.dumps(value))
+text = json.dumps(value, separators=(',',':')) + '\n' if output == 'json' else ''.join(
+    f"{check['status']}: {check['name']}: {check['message']}\n" for check in checks)
+(directory / 'expected.stdout').write_text(text)
+PY
+}
+
+commands_xdg_doctor_run() {
+  local output="$1"; shift
+  commands_xdg_doctor_expectation "$output" "$@"
+  if [[ "$output" == json ]]; then matrix_run doctor --format json; else matrix_run doctor; fi
+  matrix_assert status 1
+  matrix_assert stdout "$CASE_DIR/expected.stdout"
+  matrix_assert stderr "$CASE_STDIN"
+  if [[ "$output" == json ]]; then
+    matrix_assert json doctor
+    matrix_assert json-values "$(cat "$CASE_DIR/expected-doctor.json")"
+    commands_env_assert doctor --format json
+  else
+    commands_env_assert doctor
+  fi
+  commands_unchanged
 }
 
 # The permission observer snapshots readable bytes, denies only the actual CLI
@@ -374,6 +481,9 @@ target, failure, format = sys.argv[1:]
 checks = []
 def add(name, message, status='ok', code=''):
     checks.append(dict(name=name, status=status, code=code, message=message))
+for name, variable in [('config_path','XDG_CONFIG_HOME'), ('data_path','XDG_DATA_HOME'),
+                       ('cache_path','XDG_CACHE_HOME'), ('state_path','XDG_STATE_HOME')]:
+    add(name, str(Path(os.environ[variable]) / 'kotoba'))
 message = target + ('.toml is invalid.' if failure == 'malformed' else '.toml uses an unsupported schema or version.')
 code = target + ('_invalid' if failure == 'malformed' else '_schema_unsupported')
 if target == 'config':
@@ -697,6 +807,226 @@ PY
       commands_unchanged
     done
   done
+
+  local home_mode variable mode lower expected_config expected_data expected_cache expected_state special_config c1_config
+  local config_reason data_reason cache_reason state_reason
+  for home_mode in unset empty relative; do
+    commands_env_case "commands-xdg-all-absolute-home-$home_mode"
+    commands_env_set HOME "$home_mode" "${home_mode}-home"
+    expected_config="$XDG_CONFIG_HOME/kotoba"
+    expected_data="$XDG_DATA_HOME/kotoba"
+    expected_cache="$XDG_CACHE_HOME/kotoba"
+    expected_state="$XDG_STATE_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    commands_xdg_doctor_run json "$expected_config" direct "$expected_data" direct "$expected_cache" direct "$expected_state" direct
+  done
+
+  for mode in unset empty relative; do
+    for variable in CONFIG DATA CACHE STATE; do
+      lower="${variable,,}"
+      commands_env_case "commands-xdg-$lower-$mode"
+      commands_env_set "$variable" "$mode" "rejected-$lower-$mode"
+      expected_config="$XDG_CONFIG_HOME/kotoba"
+      expected_data="$XDG_DATA_HOME/kotoba"
+      expected_cache="$XDG_CACHE_HOME/kotoba"
+      expected_state="$XDG_STATE_HOME/kotoba"
+      config_reason=direct
+      data_reason=direct
+      cache_reason=direct
+      state_reason=direct
+      case "$variable" in
+        CONFIG) expected_config="$HOME/.config/kotoba"; config_reason="$mode" ;;
+        DATA) expected_data="$HOME/.local/share/kotoba"; data_reason="$mode" ;;
+        CACHE) expected_cache="$HOME/.cache/kotoba"; cache_reason="$mode" ;;
+        STATE) expected_state="$HOME/.local/state/kotoba"; state_reason="$mode" ;;
+      esac
+      commands_env_finalize "$expected_data"
+      commands_xdg_doctor_run json "$expected_config" "$config_reason" "$expected_data" "$data_reason" \
+        "$expected_cache" "$cache_reason" "$expected_state" "$state_reason"
+    done
+  done
+
+  commands_env_case commands-xdg-mixed-domains
+  commands_env_set CONFIG relative rejected-config-mixed
+  commands_env_set DATA empty
+  commands_env_set CACHE unset
+  expected_config="$HOME/.config/kotoba"
+  expected_data="$HOME/.local/share/kotoba"
+  expected_cache="$HOME/.cache/kotoba"
+  expected_state="$XDG_STATE_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  commands_xdg_doctor_run json "$expected_config" relative "$expected_data" empty "$expected_cache" unset "$expected_state" direct
+
+  for home_mode in unset empty relative; do
+    commands_env_case "commands-home-fallback-$home_mode"
+    commands_env_set HOME "$home_mode" "${home_mode}-home"
+    commands_env_set CONFIG unset
+    expected_data="$XDG_DATA_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    matrix_run config list
+    commands_error path_resolution_failed
+    commands_env_assert config list
+    commands_unchanged
+  done
+
+  for format in human json; do
+    commands_env_case "commands-doctor-xdg-fallback-$format"
+    commands_env_set CONFIG relative rejected-doctor-config
+    commands_env_set DATA empty
+    commands_env_set CACHE unset
+    expected_config="$HOME/.config/kotoba"
+    expected_data="$HOME/.local/share/kotoba"
+    expected_cache="$HOME/.cache/kotoba"
+    expected_state="$XDG_STATE_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    commands_xdg_doctor_run "$format" "$expected_config" relative "$expected_data" empty "$expected_cache" unset "$expected_state" direct
+  done
+
+  for format in human json; do
+    commands_env_case "commands-doctor-xdg-unresolved-$format"
+    commands_env_set HOME unset
+    commands_env_set CONFIG relative rejected-doctor-unresolved
+    expected_data="$XDG_DATA_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    commands_xdg_doctor_run "$format" '' unresolved "$expected_data" direct "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
+  done
+
+  commands_env_case commands-doctor-xdg-special-json
+  commands_env_set HOME relative rejected-special-home
+  special_config="$CASE_ROOT/special space/quoted\" back\\slash/config"
+  commands_env_set CONFIG absolute "$special_config"
+  expected_config="$special_config/kotoba"
+  expected_data="$XDG_DATA_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  commands_xdg_doctor_run json "$expected_config" direct "$expected_data" direct "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
+
+  for format in human json; do
+    commands_env_case "commands-doctor-xdg-c1-$format"
+    commands_env_set HOME relative rejected-c1-home
+    c1_config="$CASE_ROOT/c1-"$'\u009b''2J'$'\u009d''TERM'
+    commands_env_set CONFIG absolute "$c1_config"
+    expected_config="$CASE_ROOT/c1-\\u009b2J\\u009dTERM/kotoba"
+    expected_data="$XDG_DATA_HOME/kotoba"
+    commands_env_finalize "$expected_data"
+    commands_xdg_doctor_expectation "$format" "$expected_config" direct "$expected_data" direct \
+      "$XDG_CACHE_HOME/kotoba" direct "$XDG_STATE_HOME/kotoba" direct
+    if [[ "$format" == json ]]; then matrix_run doctor --format json; else matrix_run doctor; fi
+    matrix_assert status 1
+    matrix_assert stdout "$CASE_DIR/expected.stdout"
+    matrix_assert stderr "$CASE_STDIN"
+    if [[ "$format" == json ]]; then
+      matrix_assert json doctor
+      matrix_assert json-values "$(cat "$CASE_DIR/expected-doctor.json")"
+    fi
+    matrix_assert custom c1-controls python3 - "$CASE_DIR/stdout" "$format" <<'PY'
+import json, sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+output = sys.argv[2]
+assert bytes((0xc2, 0x9b)) not in raw, 'raw UTF-8 U+009B must not reach terminal output'
+assert bytes((0xc2, 0x9d)) not in raw, 'raw UTF-8 U+009D must not reach terminal output'
+assert not [byte for byte in raw if byte < 0x20 and byte != 0x0a], 'only structural LF bytes are allowed'
+assert raw.count(b'\\u009b') == 1 and raw.count(b'\\u009d') == 1, 'C1 escapes must be deterministic'
+if output == 'json':
+    report = json.loads(raw)
+    assert all(type(check['message']) is str for check in report['checks'])
+    assert report['checks'][0]['message'].endswith('/c1-\\u009b2J\\u009dTERM/kotoba')
+    assert raw.count(bytes((10,))) == 1 and raw.endswith(bytes((10,)))
+else:
+    lines = raw.decode('utf-8').splitlines()
+    assert len(lines) == 6 and all(lines), 'each human check must occupy exactly one line'
+PY
+    if [[ "$format" == json ]]; then commands_env_assert doctor --format json; else commands_env_assert doctor; fi
+    commands_unchanged
+  done
+
+  commands_env_case commands-doctor-xdg-non-utf8-json
+  commands_env_set HOME relative rejected-non-utf8-home
+  non_utf8_config="$CASE_ROOT/non-utf8-"$'\xff'
+  commands_env_set CONFIG absolute "$non_utf8_config"
+  expected_data="$XDG_DATA_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  matrix_run doctor --format json
+  matrix_assert status 1
+  matrix_assert stderr "$CASE_STDIN"
+  matrix_assert json doctor
+  matrix_assert custom non-utf8-message python3 - "$CASE_DIR/stdout" <<'PY'
+import json, sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+report = json.loads(raw)
+messages = [check['message'] for check in report['checks']]
+assert all(type(message) is str for message in messages), 'doctor message JSON type must be string'
+assert messages[0].endswith('/non-utf8-\\xff/kotoba'), 'invalid byte must be escaped deterministically'
+assert bytes([255]) not in raw, 'JSON must not expose a raw invalid byte'
+assert raw.count(bytes([10])) == 1 and raw.endswith(bytes([10])), 'JSON output must stay one line'
+assert report['ok'] is False and report['checks'][0]['status'] == 'ok' and report['checks'][0]['code'] == ''
+PY
+  commands_env_assert doctor --format json
+  commands_unchanged
+
+  commands_env_case commands-home-unresolved-readonly
+  commands_env_set HOME unset
+  commands_env_set CONFIG relative rejected-readonly-config
+  expected_data="$XDG_DATA_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  matrix_run models list
+  commands_error path_resolution_failed
+  commands_env_assert models list
+  commands_unchanged
+
+  commands_env_case commands-home-unresolved-init
+  commands_env_set HOME empty
+  commands_env_set CONFIG unset
+  expected_data="$XDG_DATA_HOME/kotoba"
+  commands_env_finalize "$expected_data"
+  matrix_run init --yes
+  commands_error path_resolution_failed
+  commands_env_assert init --yes
+  commands_unchanged
+
+  commands_env_case commands-xdg-relative-init
+  commands_env_set CONFIG relative rejected-config-relative
+  commands_env_set DATA relative rejected-data-relative
+  commands_env_set CACHE relative rejected-cache-relative
+  commands_env_set STATE relative rejected-state-relative
+  expected_config="$HOME/.config/kotoba"
+  expected_data="$HOME/.local/share/kotoba"
+  expected_cache="$HOME/.cache/kotoba"
+  expected_state="$HOME/.local/state/kotoba"
+  commands_env_finalize "$expected_data"
+  commands_default_expectations init
+  matrix_run init --yes
+  commands_streams 0 $'initialized\n'
+  commands_env_assert init --yes
+  matrix_assert custom resolved-init-only python3 - "$CASE_DIR" "$CASE_ROOT" "$commands_umask" <<'PY'
+import json, sqlite3, sys, tomllib
+from pathlib import Path
+directory, root = map(Path, sys.argv[1:3])
+before, after = ({entry['path']: entry for entry in json.loads((directory / f'fs-{phase}.json').read_text())}
+                 for phase in ('before', 'after'))
+created = set(after) - set(before)
+expected = {
+    'home/.config', 'home/.config/kotoba', 'home/.config/kotoba/config.toml', 'home/.config/kotoba/models.toml',
+    'home/.config/kotoba/glossary.toml', 'home/.local', 'home/.local/share', 'home/.local/share/kotoba',
+    'home/.local/share/kotoba/models', 'home/.local/share/kotoba/memory.sqlite3', 'home/.cache', 'home/.cache/kotoba',
+    'home/.local/state', 'home/.local/state/kotoba',
+}
+assert created == expected, (created, expected)
+for rejected in ('rejected-config-relative','rejected-data-relative','rejected-cache-relative','rejected-state-relative','kotoba'):
+    assert not (root / 'work' / rejected).exists()
+config = tomllib.loads((root / 'home/.config/kotoba/config.toml').read_text())
+models = tomllib.loads((root / 'home/.config/kotoba/models.toml').read_text())
+glossary = tomllib.loads((root / 'home/.config/kotoba/glossary.toml').read_text())
+assert config == json.loads((directory / 'expected-config.json').read_text())
+assert models == json.loads((directory / 'expected-models.json').read_text())
+assert glossary == json.loads((directory / 'expected-glossary.json').read_text())
+with sqlite3.connect(root / 'home/.local/share/kotoba/memory.sqlite3') as db:
+    assert db.execute('SELECT count(*) FROM translations').fetchone() == (0,)
+print(json.dumps({'created': sorted(created), 'cwd_destinations_absent': True, 'relative_destinations_absent': True}))
+PY
+  matrix_finish
+
   for id in doctor-invalid-json invalid-json; do
     matrix_case "commands-$id"
     commands_fixture

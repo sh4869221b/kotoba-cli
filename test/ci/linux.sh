@@ -1,10 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-invalid() { echo 'linux ci: invalid stage' >&2; exit 2; }
-[[ "$#" == 1 ]] || invalid
+invalid_stage() { echo 'linux ci: invalid stage' >&2; exit 2; }
+invalid_integration() { echo 'linux ci: invalid integration arguments' >&2; exit 2; }
+[[ "$#" -ge 1 ]] || invalid_stage
 STAGE="$1"
-case "$STAGE" in format|build|unit|integration) ;; *) invalid ;; esac
+shift
+case "$STAGE" in format|build|unit|integration) ;; *) invalid_stage ;; esac
+SUITE=all
+SUITE_EXPLICIT=0
+ROUNDS=2
+ROUNDS_EXPLICIT=0
+if [[ "$STAGE" == integration ]]; then
+  while (($#)); do
+    (($# >= 2)) || invalid_integration
+    case "$1" in
+      --suite)
+        [[ "$SUITE_EXPLICIT" == 0 ]] || invalid_integration
+        SUITE="$2"
+        SUITE_EXPLICIT=1
+        ;;
+      --rounds)
+        [[ "$ROUNDS_EXPLICIT" == 0 && "$2" =~ ^[1-9][0-9]{0,3}$ ]] || invalid_integration
+        ROUNDS="$2"
+        ROUNDS_EXPLICIT=1
+        (( ROUNDS <= 1000 )) || invalid_integration
+        ;;
+      *) invalid_integration ;;
+    esac
+    shift 2
+  done
+  case "$SUITE" in all|smoke|matrix|parallel) ;; *) invalid_integration ;; esac
+  [[ "$ROUNDS_EXPLICIT" == 0 || "$SUITE" == all || "$SUITE" == parallel ]] || invalid_integration
+else
+  [[ "$#" == 0 ]] || invalid_stage
+fi
+PARALLEL_CHILDREN=0
+PARALLEL_UNIT_LOGS=0
+PARALLEL_BENCHMARKS=0
+PARALLEL_MEASUREMENTS=0
+if [[ "$SUITE" == all || "$SUITE" == parallel ]]; then
+  PARALLEL_CHILDREN=$((9 * ROUNDS))
+  PARALLEL_UNIT_LOGS=$((4 * ROUNDS))
+  PARALLEL_BENCHMARKS="$ROUNDS"
+  PARALLEL_MEASUREMENTS=$((15 * ROUNDS))
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 if [[ -n "${KOTOBA_CI_EVIDENCE_DIR:-}" ]]; then
@@ -18,8 +58,12 @@ EVIDENCE="$KOTOBA_CI_EVIDENCE_DIR"
 OWNED="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/kotoba-ci-${STAGE}.XXXXXX")"
 CHILD_PID=""
 snapshot() {
-  git status --porcelain=v1 --untracked-files=all --ignore-submodules=none >"$EVIDENCE/source.$1" &&
+  git status --porcelain=v1 --untracked-files=all --ignore-submodules=none >"$EVIDENCE/source.$1" || return
+  if [[ "$STAGE" == format ]]; then
+    printf 'not-required\n' >"$EVIDENCE/vendor.$1"
+  else
     git -C vendor/llama.cpp status --porcelain=v1 --untracked-files=all >"$EVIDENCE/vendor.$1"
+  fi
 }
 cleanup() {
   local status=$?
@@ -28,6 +72,16 @@ cleanup() {
   if [[ -n "$CHILD_PID" ]]; then
     kill -TERM -- "-$CHILD_PID" 2>/dev/null
     wait "$CHILD_PID" 2>/dev/null
+  fi
+  if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then
+    for family in gcc clang; do
+      local directory="${KOTOBA_CCACHE_GCC_DIR:-}"
+      [[ "$family" == gcc ]] || directory="${KOTOBA_CCACHE_CLANG_DIR:-}"
+      [[ -n "$directory" && -d "$directory" ]] || continue
+      if ! CCACHE_DIR="$directory" ccache --show-stats >"$EVIDENCE/ccache-$family.after" 2>&1; then
+        [[ "$status" != 0 ]] || status=1
+      fi
+    done
   fi
   rm -rf -- "$OWNED"
   if [[ -e "$OWNED" && "$status" == 0 ]]; then status=1; fi
@@ -38,7 +92,13 @@ cleanup() {
     echo 'linux ci: source status changed' >&2
     [[ "$status" != 0 ]] || status=1
   fi
-  printf 'stage=%s\nexit=%s\nowned=%s\nowned_removed=%s\n' "$STAGE" "$status" "$OWNED" "$([[ ! -e "$OWNED" ]] && echo yes || echo no)" >"$EVIDENCE/status.txt"
+  {
+    printf 'stage=%s\nexit=%s\nowned=%s\nowned_removed=%s\n' "$STAGE" "$status" "$OWNED" "$([[ ! -e "$OWNED" ]] && echo yes || echo no)"
+    if [[ "$STAGE" == integration ]]; then
+      printf 'suite=%s\nrounds=%s\nparallel_children=%s\nparallel_unit_logs=%s\nparallel_benchmarks=%s\nparallel_benchmark_measurements=%s\n' \
+        "$SUITE" "$ROUNDS" "$PARALLEL_CHILDREN" "$PARALLEL_UNIT_LOGS" "$PARALLEL_BENCHMARKS" "$PARALLEL_MEASUREMENTS"
+    fi
+  } >"$EVIDENCE/status.txt"
   cat "$EVIDENCE/status.txt"
   [[ ! -f "$EVIDENCE/counts.tsv" ]] || cat "$EVIDENCE/counts.tsv"
   [[ -z "${GITHUB_STEP_SUMMARY:-}" ]] || cat "$EVIDENCE/identity.txt" "$EVIDENCE/status.txt" "$EVIDENCE/counts.tsv" >>"$GITHUB_STEP_SUMMARY"
@@ -52,8 +112,19 @@ export XDG_CACHE_HOME="$OWNED/cache" XDG_STATE_HOME="$OWNED/state" TMPDIR="$OWNE
 export ZIG_GLOBAL_CACHE_DIR="$ROOT/.zig-cache/global"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR"
 : >"$EVIDENCE/counts.tsv"
+if [[ "$STAGE" != format ]]; then
+  vendor_root="$(git -C vendor/llama.cpp rev-parse --show-toplevel 2>/dev/null || :)"
+  if [[ "$vendor_root" != "$ROOT/vendor/llama.cpp" ]]; then
+    echo 'llama.cpp submodule is not initialized; run git submodule update --init --recursive' >&2
+    exit 1
+  fi
+fi
 if ! snapshot before; then echo 'linux ci: cannot read source status' >&2; exit 1; fi
-{ git rev-parse HEAD; git ls-tree HEAD vendor/llama.cpp; git -C vendor/llama.cpp rev-parse HEAD; zig version; cc --version; cmake --version; } >"$EVIDENCE/identity.txt"
+if [[ "$STAGE" == format ]]; then
+  { git rev-parse HEAD; printf 'vendor=not-required\n'; zig version; } >"$EVIDENCE/identity.txt"
+else
+  { git rev-parse HEAD; git ls-tree HEAD vendor/llama.cpp; git -C vendor/llama.cpp rev-parse HEAD; zig version; cc --version; cmake --version; } >"$EVIDENCE/identity.txt"
+fi
 cat "$EVIDENCE/identity.txt"
 run() {
   local label="$1" status; shift
@@ -80,6 +151,46 @@ assert passed > 0 and skipped == int(sys.argv[3]) and passed + skipped == total,
 print(f'{sys.argv[2]}\t{passed}\n{sys.argv[2]}-skipped\t{skipped}\n{sys.argv[2]}-failed\t0')
 PY
 }
+cache_prepare() {
+  local family="$1" directory="$ROOT/.zig-cache"
+  export CC=gcc CXX=g++ CCACHE_DIR="$KOTOBA_CCACHE_GCC_DIR"
+  if [[ "$family" == clang ]]; then
+    directory="$ROOT/.zig-cache/ci-clang"
+    export CC=clang CXX=clang++ CCACHE_DIR="$KOTOBA_CCACHE_CLANG_DIR"
+  fi
+  run "native-$family-identity" bash test/ci/native-cache.sh identity --compiler "$family" --output "$EVIDENCE/native-$family.json"
+  run "native-$family-validate" bash test/ci/native-cache.sh validate --compiler "$family" --cache-dir "$directory" --identity "$EVIDENCE/native-$family.json"
+}
+cache_stamp() {
+  local family="$1" directory="$ROOT/.zig-cache"
+  [[ "$family" == gcc ]] || directory="$ROOT/.zig-cache/ci-clang"
+  run "native-$family-stamp" bash test/ci/native-cache.sh stamp --compiler "$family" --cache-dir "$directory" --identity "$EVIDENCE/native-$family.json"
+  cp "$directory/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/native-$family-CMakeCache.txt"
+}
+if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then
+  export KOTOBA_CCACHE_GCC_DIR="${KOTOBA_CCACHE_GCC_DIR:-${RUNNER_TEMP:-$ROOT/.zig-cache}/kotoba-ccache/gcc}"
+  export KOTOBA_CCACHE_CLANG_DIR="${KOTOBA_CCACHE_CLANG_DIR:-${RUNNER_TEMP:-$ROOT/.zig-cache}/kotoba-ccache/clang}"
+  for directory in "$KOTOBA_CCACHE_GCC_DIR" "$KOTOBA_CCACHE_CLANG_DIR"; do
+    [[ "$directory" == /* && "$directory" != "$OWNED"/* ]] || { echo 'linux ci cache: invalid compiler cache directory' >&2; exit 2; }
+    mkdir -p "$directory"
+  done
+  gcc_directory="$(realpath "$KOTOBA_CCACHE_GCC_DIR")"
+  clang_directory="$(realpath "$KOTOBA_CCACHE_CLANG_DIR")"
+  if [[ "$gcc_directory" == "$clang_directory" || "$gcc_directory" == "$clang_directory"/* || "$clang_directory" == "$gcc_directory"/* ]]; then
+    echo 'linux ci cache: compiler cache directories overlap' >&2
+    exit 2
+  fi
+  export CCACHE_COMPILERCHECK=content CCACHE_CONFIGPATH=/dev/null CCACHE_SLOPPINESS="" CCACHE_HASHDIR=true
+  CMAKE_C_COMPILER_LAUNCHER="$(command -v ccache)"
+  CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER"
+  export CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+  for family in gcc clang; do
+    directory="$KOTOBA_CCACHE_GCC_DIR"
+    [[ "$family" == gcc ]] || directory="$KOTOBA_CCACHE_CLANG_DIR"
+    CCACHE_DIR="$directory" ccache --show-stats >"$EVIDENCE/ccache-$family.before"
+  done
+  cache_prepare gcc
+fi
 case "$STAGE" in
   format)
     run zig-format zig fmt --check build.zig src
@@ -92,13 +203,22 @@ case "$STAGE" in
     cp "$ROOT/.zig-cache/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/production-CMakeCache.txt"
     run clang-compiler clang++ --version
     run clang-runtime clang++ -### -x c++ /dev/null -o /dev/null
-    run clang-production-build env CC=clang CXX=clang++ zig build --cache-dir "$OWNED/clang-cache" --prefix "$OWNED/clang-prefix"
-    cp "$OWNED/clang-cache/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/clang-CMakeCache.txt"
+    CLANG_CACHE="$OWNED/clang-cache"
+    if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 ]]; then
+      CLANG_CACHE="$ROOT/.zig-cache/ci-clang"
+      cache_prepare clang
+    fi
+    run clang-production-build env CC=clang CXX=clang++ zig build --cache-dir "$CLANG_CACHE" --prefix "$OWNED/clang-prefix"
+    cp "$CLANG_CACHE/llama.cpp/cpu/CMakeCache.txt" "$EVIDENCE/clang-CMakeCache.txt"
     grep -Eq '^CMAKE_CXX_COMPILER:(FILEPATH|STRING)=.*/clang\+\+(-[0-9]+)?$' "$EVIDENCE/clang-CMakeCache.txt"
     run clang-cli-version "$OWNED/clang-prefix/bin/kotoba" version
     cmp "$EVIDENCE/production-cli-version.stdout" "$EVIDENCE/clang-cli-version.stdout"
     run clang-linkage ldd "$OWNED/clang-prefix/bin/kotoba"
     sha256sum "$ROOT/zig-out/bin/kotoba" "$OWNED/clang-prefix/bin/kotoba" >"$EVIDENCE/binaries.sha256"
+    if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 ]]; then
+      cache_stamp clang
+      export CC=gcc CXX=g++ CCACHE_DIR="$KOTOBA_CCACHE_GCC_DIR"
+    fi
     run build-contract bash test/integration/build_contract.sh --case all --evidence-dir "$EVIDENCE/build-contract"
     python3 - "$EVIDENCE/build-contract/assertions.tsv" >>"$EVIDENCE/counts.tsv" <<'PY'
 import collections, pathlib, sys
@@ -120,54 +240,20 @@ PY
     ;;
   integration)
     run common bash test/integration/common.sh --self-test
-    run smoke bash test/integration/smoke.sh
-    run cli-matrix bash test/integration/cli_matrix.sh --evidence-dir "$EVIDENCE/cli-matrix"
-    run parallel bash test/integration/parallel.sh --rounds 2 --evidence-dir "$EVIDENCE/parallel"
-    python3 - "$EVIDENCE" >>"$EVIDENCE/counts.tsv" <<'PY'
-import collections, json, pathlib, re, sys
-root = pathlib.Path(sys.argv[1])
-assert 'harness self-test ok' in (root / 'common.stdout').read_text()
-assert 'smoke ok' in (root / 'smoke.stdout').read_text()
-matrices = list((root / 'cli-matrix').glob('cli-matrix.*'))
-assert len(matrices) == 1, matrices
-matrix = matrices[0]
-summary = json.loads((matrix / 'summary.json').read_text())
-receipts = [json.loads(path.read_text()) for path in (matrix / 'cases').glob('*/receipt.json')]
-counts = collections.Counter(receipt['group'] for receipt in receipts)
-assert set(counts) == {'translate', 'commands', 'memory', 'files'} and all(counts.values()), counts
-assert dict(counts) == summary['groups'] and len(receipts) == summary['passed'] > 0
-assert len(set(summary['cases'])) == len(receipts) and set(summary['cases']) == {r['case_id'] for r in receipts}
-for receipt in receipts:
-    assert receipt['level'] == 'cli' and receipt['verdict'] == 'pass' and not receipt['harness_timeout']
-    assert receipt['assertions'] and all(check['passed'] for check in receipt['assertions'])
-    case = matrix / 'cases' / receipt['case_id']
-    assert int((case / 'status').read_text()) == receipt['status']
-    for artifact in ('stdout', 'stderr', 'fs_before', 'fs_after', 'db_before', 'db_after'):
-        assert (case / receipt[artifact]).is_file(), (case, artifact)
-cleanup = json.loads((matrix / 'cleanup.json').read_text())
-assert cleanup['exit_status'] == 0 and cleanup['temporary_removed'] and cleanup['lock_released']
-for group, count in sorted(counts.items()):
-    print(f'cli-matrix-{group}\t{count}')
-print(f'cli-matrix-total\t{len(receipts)}')
-runs = list((root / 'parallel').glob('parallel.*'))
-assert len(runs) == 1, runs
-run = runs[0]
-statuses = list(run.glob('round-*.status'))
-assert len(statuses) == 18 and all(re.search(r' status=0\n?$', p.read_text()) for p in statuses)
-unit_total = 0
-for path in run.glob('round-*-unit-*.err'):
-    match = re.search(r'All (\d+) tests passed\.', path.read_text())
-    assert match and int(match[1]) > 0, path
-    unit_total += int(match[1])
-assert len(list(run.glob('round-*-unit-*.err'))) == 8
-benchmarks = list(run.glob('round-*-bench.out'))
-assert len(benchmarks) == 2
-measurements = 0
-for path in benchmarks:
-    payload = json.loads(path.read_text())
-    assert payload['iterations'] == 5 and len(payload['inputs']) == 3
-    measurements += payload['iterations'] * len(payload['inputs'])
-print(f'common\t1\nsmoke\t1\nparallel-children\t{len(statuses)}\nparallel-unit-tests\t{unit_total}\nparallel-benchmark-measurements\t{measurements}')
-PY
+    if [[ "$SUITE" == all || "$SUITE" == smoke ]]; then run smoke bash test/integration/smoke.sh; fi
+    if [[ "$SUITE" == all || "$SUITE" == matrix ]]; then run cli-matrix bash test/integration/cli_matrix.sh --evidence-dir "$EVIDENCE/cli-matrix"; fi
+    if [[ "$SUITE" == all || "$SUITE" == parallel ]]; then
+      if run parallel bash test/integration/parallel.sh --rounds "$ROUNDS" --evidence-dir "$EVIDENCE/parallel"; then
+        :
+      else
+        parallel_status=$?
+        find "$EVIDENCE/parallel" -name 'round-*-bench.err' -type f -exec cat {} \; >&2
+        exit "$parallel_status"
+      fi
+    fi
+    run integration-evidence python3 test/ci/integration-evidence.py --suite "$SUITE" --rounds "$ROUNDS" --evidence-dir "$EVIDENCE"
+    cat "$EVIDENCE/integration-evidence.stdout" >>"$EVIDENCE/counts.tsv"
     ;;
 esac
+
+if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 && "$STAGE" != format ]]; then cache_stamp gcc; fi

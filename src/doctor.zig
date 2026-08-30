@@ -22,7 +22,50 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
     const command_allocator = invocation_arena.allocator();
     var checks = std.array_list.Managed(Check).init(command_allocator);
     defer checks.deinit();
+    return runChecks(command_allocator, paths, &checks, true, json);
+}
+
+pub fn runResolution(allocator: std.mem.Allocator, resolution: xdg.Resolution, json: bool) !u8 {
+    var invocation_arena = std.heap.ArenaAllocator.init(allocator);
+    defer invocation_arena.deinit();
+    const command_allocator = invocation_arena.allocator();
+    var checks = std.array_list.Managed(Check).init(command_allocator);
+    defer checks.deinit();
     var ok = true;
+    try appendPathChecks(resolution, &checks, &ok);
+    if (!ok) return print(command_allocator, checks.items, false, json);
+    const paths = try resolution.requirePaths(command_allocator);
+    return runChecks(command_allocator, paths, &checks, true, json);
+}
+
+fn appendPathChecks(resolution: xdg.Resolution, checks: *std.array_list.Managed(Check), ok: *bool) !void {
+    inline for ([_]struct { domain: xdg.Domain, name: []const u8 }{
+        .{ .domain = .config, .name = "config_path" },
+        .{ .domain = .data, .name = "data_path" },
+        .{ .domain = .cache, .name = "cache_path" },
+        .{ .domain = .state, .name = "state_path" },
+    }) |entry| {
+        const resolved = resolution.get(entry.domain);
+        if (resolved.path) |path| {
+            switch (resolved.reason) {
+                .direct, .fallback_unset => try checks.append(.{ .name = entry.name, .status = .ok, .message = path }),
+                .fallback_empty, .fallback_relative => try checks.append(.{ .name = entry.name, .status = .warn, .code = "xdg_path_invalid", .message = path }),
+                .unresolved_home_unset, .unresolved_home_empty, .unresolved_home_relative => unreachable,
+            }
+        } else {
+            try checks.append(.{
+                .name = entry.name,
+                .status = .@"error",
+                .code = "path_resolution_failed",
+                .message = "Could not resolve XDG paths from absolute XDG values or HOME.",
+            });
+            ok.* = false;
+        }
+    }
+}
+
+fn runChecks(command_allocator: std.mem.Allocator, paths: xdg.Paths, checks: *std.array_list.Managed(Check), ok_in: bool, json: bool) !u8 {
+    var ok = ok_in;
 
     var have_config = true;
     var owned_config: ?config.OwnedConfig = config.load(command_allocator, paths.config_file) catch |err| blk: {
@@ -43,16 +86,16 @@ pub fn run(allocator: std.mem.Allocator, paths: xdg.Paths, json: bool) !u8 {
         try checks.append(.{ .name = "models", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         if (!have_config) return print(command_allocator, checks.items, ok, json);
-        try appendModelChecks(command_allocator, null, cfg, &checks, &ok);
-        return continueAfterModelCheck(command_allocator, paths, cfg, &checks, ok, json);
+        try appendModelChecks(command_allocator, null, cfg, checks, &ok);
+        return continueAfterModelCheck(command_allocator, paths, cfg, checks, ok, json);
     };
     defer list_owner.deinit();
     const list = list_owner.view();
     try checks.append(.{ .name = "models", .status = .ok, .message = "models.toml is readable" });
-    try appendUnsafeRemoteUrlCheck(list, &checks);
+    try appendUnsafeRemoteUrlCheck(list, checks);
     if (!have_config) return print(command_allocator, checks.items, ok, json);
-    try appendModelChecks(command_allocator, list, cfg, &checks, &ok);
-    return continueAfterModelCheck(command_allocator, paths, cfg, &checks, ok, json);
+    try appendModelChecks(command_allocator, list, cfg, checks, &ok);
+    return continueAfterModelCheck(command_allocator, paths, cfg, checks, ok, json);
 }
 
 fn appendUnsafeRemoteUrlCheck(list: models.List, checks: *std.array_list.Managed(Check)) !void {
@@ -128,18 +171,84 @@ fn continueAfterModelCheck(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: 
 }
 
 fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u8 {
-    _ = allocator;
     if (json) {
-        sys.stdoutPrint("{{\"ok\":{},\"checks\":[", .{ok});
-        for (checks, 0..) |check, i| {
-            if (i > 0) sys.stdoutPrint(",", .{});
-            sys.stdoutPrint("{{\"name\":\"{s}\",\"status\":\"{s}\",\"code\":\"{s}\",\"message\":\"{s}\"}}", .{ check.name, @tagName(check.status), check.code, check.message });
-        }
-        sys.stdoutPrint("]}}\n", .{});
+        var rendered_checks = std.array_list.Managed(Check).init(allocator);
+        defer rendered_checks.deinit();
+        for (checks) |check| try rendered_checks.append(.{
+            .name = check.name,
+            .status = check.status,
+            .code = check.code,
+            .message = try diagnosticText(allocator, check.message),
+        });
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &out.writer };
+        try stringify.write(.{ .ok = ok, .checks = rendered_checks.items });
+        try out.writer.writeByte('\n');
+        sys.stdoutWrite(out.written());
     } else {
-        for (checks) |check| sys.stdoutPrint("{s}: {s}: {s}\n", .{ @tagName(check.status), check.name, check.message });
+        for (checks) |check| {
+            sys.stdoutPrint("{s}: {s}: ", .{ @tagName(check.status), check.name });
+            writeHumanOneLine(try diagnosticText(allocator, check.message));
+            sys.stdoutWrite("\n");
+        }
     }
     return if (ok) 0 else 1;
+}
+
+fn diagnosticText(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const hex = "0123456789abcdef";
+    var escaped = std.array_list.Managed(u8).init(allocator);
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (byte < 0x80) {
+            switch (byte) {
+                '\n' => try escaped.appendSlice("\\n"),
+                '\r' => try escaped.appendSlice("\\r"),
+                '\t' => try escaped.appendSlice("\\t"),
+                0...8, 11...12, 14...31, 127 => try escaped.appendSlice(&.{ '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 0x0f] }),
+                else => try escaped.append(byte),
+            }
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        };
+        if (index + sequence_len > value.len) {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        }
+        const sequence = value[index .. index + sequence_len];
+        const codepoint = std.unicode.utf8Decode(sequence) catch {
+            try escaped.appendSlice(&.{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+            index += 1;
+            continue;
+        };
+        if (codepoint >= 0x80 and codepoint <= 0x9f) {
+            const control: u8 = @intCast(codepoint);
+            try escaped.appendSlice(&.{ '\\', 'u', '0', '0', hex[control >> 4], hex[control & 0x0f] });
+        } else {
+            try escaped.appendSlice(sequence);
+        }
+        index += sequence_len;
+    }
+    return escaped.toOwnedSlice();
+}
+
+fn writeHumanOneLine(value: []const u8) void {
+    const hex = "0123456789abcdef";
+    for (value) |byte| switch (byte) {
+        '\n' => sys.stdoutWrite("\\n"),
+        '\r' => sys.stdoutWrite("\\r"),
+        '\t' => sys.stdoutWrite("\\t"),
+        0...8, 11...12, 14...31, 127 => sys.stdoutPrint("\\u00{c}{c}", .{ hex[byte >> 4], hex[byte & 0x0f] }),
+        else => sys.stdoutWrite(&.{byte}),
+    };
 }
 
 const TestStdoutCapture = struct {
@@ -359,4 +468,197 @@ test "secret URL doctor warning uses only static text" {
     try std.testing.expectEqual(@as(usize, 1), countText(rendered, "\"code\":\"model_source_credentials\""));
     try std.testing.expectEqual(@as(usize, 1), countText(rendered, "Model registry contains unsafe remote URL metadata. Reads do not change it; the next registry write removes unsafe URL fields. Re-pull with a fresh --model-url when needed."));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "KOTOBA_") == null);
+}
+
+test "doctor prepends resolved XDG path checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const resolution = try xdg.resolve(allocator, .{
+        .config = root,
+        .data = root,
+        .cache = root,
+        .state = root,
+    });
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    _ = try runResolution(allocator, resolution, true);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
+    const report = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer report.deinit();
+    const checks = report.value.object.get("checks").?.array.items;
+    try std.testing.expect(checks.len >= 4);
+    try std.testing.expectEqualStrings("config_path", checks[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("data_path", checks[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("cache_path", checks[2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("state_path", checks[3].object.get("name").?.string);
+}
+
+test "doctor path warnings preserve health and expose only resolved paths" {
+    const allocator = std.testing.allocator;
+    const resolution = try xdg.resolve(allocator, .{
+        .home = "/fixture/home",
+        .config = "rejected-config",
+        .data = "",
+        .cache = null,
+        .state = "/fixture/state",
+    });
+    defer resolution.deinit(allocator);
+    var checks = std.array_list.Managed(Check).init(allocator);
+    defer checks.deinit();
+    var ok = true;
+    try appendPathChecks(resolution, &checks, &ok);
+
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(@as(usize, 4), checks.items.len);
+    try std.testing.expectEqual(Status.warn, checks.items[0].status);
+    try std.testing.expectEqualStrings("xdg_path_invalid", checks.items[0].code);
+    try std.testing.expectEqualStrings("/fixture/home/.config/kotoba", checks.items[0].message);
+    try std.testing.expectEqual(Status.warn, checks.items[1].status);
+    try std.testing.expectEqualStrings("xdg_path_invalid", checks.items[1].code);
+    try std.testing.expectEqual(Status.ok, checks.items[2].status);
+    try std.testing.expectEqualStrings("", checks.items[2].code);
+    try std.testing.expectEqual(Status.ok, checks.items[3].status);
+    try std.testing.expect(std.mem.indexOf(u8, checks.items[0].message, "rejected-config") == null);
+}
+
+test "doctor unresolved resolution returns exactly four path checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const state = try std.fs.path.join(allocator, &.{ root, "state" });
+    const expected_state = try std.fs.path.join(allocator, &.{ state, "kotoba" });
+    const resolution = try xdg.resolve(allocator, .{
+        .home = null,
+        .config = "rejected-config",
+        .data = "",
+        .cache = "rejected-cache",
+        .state = state,
+    });
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    const exit_code = try runResolution(allocator, resolution, true);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 8192);
+    const report = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expect(!report.value.object.get("ok").?.bool);
+    const checks = report.value.object.get("checks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), checks.len);
+    for (checks[0..3]) |check| {
+        try std.testing.expectEqualStrings("error", check.object.get("status").?.string);
+        try std.testing.expectEqualStrings("path_resolution_failed", check.object.get("code").?.string);
+        try std.testing.expectEqualStrings("Could not resolve XDG paths from absolute XDG values or HOME.", check.object.get("message").?.string);
+    }
+    try std.testing.expectEqualStrings("ok", checks[3].object.get("status").?.string);
+    try std.testing.expectEqualStrings(expected_state, checks[3].object.get("message").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "rejected-config") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"config\"") == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "state", .{}));
+}
+
+test "doctor JSON keeps non-UTF-8 path diagnostics as strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const invalid_base = try std.mem.concat(allocator, u8, &.{ root, "/non-utf8-", &.{0xff} });
+    const resolution = try xdg.resolve(allocator, .{
+        .config = invalid_base,
+        .data = invalid_base,
+        .cache = invalid_base,
+        .state = invalid_base,
+    });
+    const output = try tmp.dir.createFile(sys.io(), "json", .{ .read = true });
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    const exit_code = try runResolution(allocator, resolution, true);
+    capture.restore();
+    const rendered = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "json" }), 8192);
+    const report = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    const checks = report.value.object.get("checks").?.array.items;
+    try std.testing.expect(checks.len > 4);
+    for (checks) |check| {
+        const message = check.object.get("message").?;
+        try std.testing.expect(message == .string);
+    }
+    for (checks[0..4]) |check| {
+        const message = check.object.get("message").?;
+        switch (message) {
+            .string => |text| try std.testing.expect(std.mem.indexOf(u8, text, "\\xff") != null),
+            else => unreachable,
+        }
+    }
+}
+
+test "doctor diagnostic text escapes Unicode C0 and C1 controls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const actual = try diagnosticText(arena.allocator(), "quote\" back\\slash 日本語\n\t\x01\u{009b}\u{009d}");
+    try std.testing.expectEqualStrings("quote\" back\\slash 日本語\\n\\t\\u0001\\u009b\\u009d", actual);
+}
+
+test "doctor diagnostic text preserves valid UTF-8 around invalid bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const actual = try diagnosticText(arena.allocator(), "日本語\xff quote\" back\\slash");
+    try std.testing.expectEqualStrings("日本語\\xff quote\" back\\slash", actual);
+}
+
+test "doctor JSON decodes special paths and human output stays one line per check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const special = try std.mem.concat(allocator, u8, &.{ root, "/quote\" back\\slash\nline\ttab", &.{1} });
+    const resolution = try xdg.resolve(allocator, .{
+        .config = special,
+        .data = special,
+        .cache = special,
+        .state = special,
+    });
+    const expected_diagnostic = try std.mem.concat(allocator, u8, &.{ root, "/quote\" back\\slash\\nline\\ttab\\u0001/kotoba" });
+
+    const json_output = try tmp.dir.createFile(sys.io(), "json", .{ .read = true });
+    defer json_output.close(sys.io());
+    var json_capture = try TestStdoutCapture.start(json_output);
+    const json_exit = try runResolution(allocator, resolution, true);
+    json_capture.restore();
+    const rendered_json = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "json" }), 8192);
+    const report = try std.json.parseFromSlice(std.json.Value, allocator, rendered_json, .{});
+    defer report.deinit();
+    try std.testing.expectEqual(@as(u8, 1), json_exit);
+    const json_checks = report.value.object.get("checks").?.array.items;
+    try std.testing.expect(json_checks.len > 4);
+    for (json_checks[0..4]) |check| try std.testing.expectEqualStrings(expected_diagnostic, check.object.get("message").?.string);
+    for (rendered_json[0 .. rendered_json.len - 1]) |byte| try std.testing.expect(byte >= 0x20);
+
+    const human_output = try tmp.dir.createFile(sys.io(), "human", .{ .read = true });
+    defer human_output.close(sys.io());
+    var human_capture = try TestStdoutCapture.start(human_output);
+    _ = try runResolution(allocator, resolution, false);
+    human_capture.restore();
+    const rendered_human = try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "human" }), 8192);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_human, "quote\" back\\slash\\nline\\ttab\\u0001/kotoba\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_human, "back\\slash\nline") == null);
 }

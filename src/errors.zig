@@ -26,6 +26,7 @@ pub const Code = enum {
     invalid_utf8,
     embedded_nul,
     interrupted,
+    path_resolution_failed,
     io_error,
 
     pub fn asText(self: Code) []const u8 {
@@ -54,6 +55,7 @@ pub const Code = enum {
             .invalid_utf8 => "invalid_utf8",
             .embedded_nul => "embedded_nul",
             .interrupted => "interrupted",
+            .path_resolution_failed => "path_resolution_failed",
             .io_error => "io_error",
         };
     }
@@ -84,6 +86,7 @@ pub const Error = error{
     InvalidUtf8,
     EmbeddedNul,
     Interrupted,
+    PathResolutionFailed,
 };
 
 pub const AppError = struct {
@@ -125,6 +128,7 @@ pub fn fromError(err: anyerror) AppError {
         Error.InvalidUtf8 => .{ .code = .invalid_utf8, .message = "Text must be valid UTF-8." },
         Error.EmbeddedNul => .{ .code = .embedded_nul, .message = "Text must not contain NUL bytes." },
         Error.Interrupted => .{ .code = .interrupted, .message = "Interrupted." },
+        Error.PathResolutionFailed => .{ .code = .path_resolution_failed, .message = "Could not resolve XDG paths from absolute XDG values or HOME." },
         else => .{ .code = .io_error, .message = @errorName(err) },
     };
 }
@@ -164,6 +168,13 @@ test "secret URL missing source and invalid arguments error mapping" {
     try std.testing.expectEqualStrings("invalid_arguments", invalid.code.asText());
     try std.testing.expectEqual(@as(u8, 2), invalid.exitCode());
     try std.testing.expectEqualStrings("Invalid arguments.", invalid.message);
+}
+
+test "path resolution failure has stable public mapping" {
+    const failure = fromError(error.PathResolutionFailed);
+    try std.testing.expectEqualStrings("path_resolution_failed", failure.code.asText());
+    try std.testing.expectEqualStrings("Could not resolve XDG paths from absolute XDG values or HOME.", failure.message);
+    try std.testing.expectEqual(@as(u8, 1), failure.exitCode());
 }
 
 test "strict persistence error categories have exact safe messages" {

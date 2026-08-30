@@ -124,16 +124,16 @@ API or recovery policy.
 Run the focused groups from the repository root:
 
 ```bash
-zig test src/sys.zig -lc --test-filter 'fault io happy'
-zig test src/sys.zig -lc --test-filter 'fault io failure'
-zig test src/fs.zig -lc --test-filter 'fault fs happy'
-zig test src/fs.zig -lc --test-filter 'fault fs failure'
-zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite happy'
-zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite failure'
-zig test src/net.zig -lc --test-filter 'fault http happy'
-zig test src/net.zig -lc --test-filter 'fault http failure'
-zig test src/models.zig -lc --test-filter 'fault install'
-zig test src/sys.zig -lc --test-filter 'fault boundary'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault io happy'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault io failure'
+mise exec -- zig test src/fs.zig -lc --test-filter 'fault fs happy'
+mise exec -- zig test src/fs.zig -lc --test-filter 'fault fs failure'
+mise exec -- zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite happy'
+mise exec -- zig test src/memory.zig -lc -lsqlite3 --test-filter 'fault sqlite failure'
+mise exec -- zig test src/net.zig -lc --test-filter 'fault http happy'
+mise exec -- zig test src/net.zig -lc --test-filter 'fault http failure'
+mise exec -- zig test src/models.zig -lc --test-filter 'fault install'
+mise exec -- zig test src/sys.zig -lc --test-filter 'fault boundary'
 ```
 
 ## Build snapshots and coordination
@@ -172,14 +172,14 @@ From the repository root, these checks require no model for the deterministic
 and model-free paths:
 
 ```bash
-zig build test
-zig build test -Dtest-backend=true
-zig build
-bash test/integration/common.sh --self-test
-bash test/integration/parallel.sh --self-test
-bash test/integration/smoke.sh
-bash test/integration/bench.sh
-bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
+mise exec -- zig build test
+mise exec -- zig build test -Dtest-backend=true
+mise exec -- zig build
+mise exec -- bash test/integration/common.sh --self-test
+mise exec -- bash test/integration/parallel.sh --self-test
+mise exec -- bash test/integration/smoke.sh
+mise exec -- bash test/integration/bench.sh
+mise exec -- bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
 ```
 
 To inspect the installed artifacts without running the build's shared
@@ -188,7 +188,7 @@ To inspect the installed artifacts without running the build's shared
 ```bash
 E="$PWD/.omo/evidence/issue-47"
 mkdir -p "$E"
-zig build test-artifacts -Dtest-backend=true --prefix "$E/task-5-artifacts"
+mise exec -- zig build test-artifacts -Dtest-backend=true --prefix "$E/task-5-artifacts"
 "$E/task-5-artifacts/bin/kotoba-tests"
 ```
 
@@ -197,7 +197,7 @@ without both a model path and working `nvidia-smi`, this exact command should
 exit successfully with the existing skip message:
 
 ```bash
-env -u KOTOBA_CUDA_MODEL bash test/integration/cuda_smoke.sh
+env -u KOTOBA_CUDA_MODEL mise exec -- bash test/integration/cuda_smoke.sh
 # SKIP cuda qa: missing KOTOBA_CUDA_MODEL or nvidia-smi
 ```
 
@@ -208,12 +208,23 @@ integer from 1 through 1000. `--evidence-dir` must be an absolute path, and
 invalid or out-of-range arguments exit with status 2 and
 `parallel harness: invalid arguments`.
 
+The CI driver is separate from that local default: `integration --suite` accepts
+`all`, `smoke`, `matrix`, or `parallel`, defaults to `all`, and defaults to two
+parallel rounds. Its workflow runs smoke, matrix, and parallel as three child
+jobs, then accepts the required aggregate only when every child is `success`.
+Pull requests configure one parallel round; `master` pushes and manual dispatch
+configure two. Current exact-SHA local receipts observed 364 matrix cases
+(46 translate, 251 commands, 22 memory, 45 files); a two-round parallel receipt
+observed 18 children, eight unit logs, two benchmarks, 30 benchmark measurements,
+2,408 unit-test executions, and four 364-case matrix receipts. These observations do not
+prove a hosted schedule or run.
+
 Run it with an absolute evidence directory:
 
 ```bash
 E="$PWD/.omo/evidence/parallel"
 mkdir -p "$E"
-bash test/integration/parallel.sh --rounds 2 --evidence-dir "$E"
+mise exec -- bash test/integration/parallel.sh --rounds 2 --evidence-dir "$E"
 ```
 
 The driver records every child status and start/finish timestamps, preserves
@@ -238,17 +249,17 @@ parallel harness, and verifies all four group counts against passing case
 receipts. The stable entrypoint for automation is:
 
 ```bash
-bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
+mise exec -- bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/matrix"
 # Optional focused selection; default is all four groups.
-bash test/integration/cli_matrix.sh --group translate --evidence-dir "$PWD/.omo/evidence/translate"
-bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/commands"
-bash test/integration/cli_matrix.sh --group memory --evidence-dir "$PWD/.omo/evidence/memory"
-bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evidence/files"
-bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
+mise exec -- bash test/integration/cli_matrix.sh --group translate --evidence-dir "$PWD/.omo/evidence/translate"
+mise exec -- bash test/integration/cli_matrix.sh --group commands --evidence-dir "$PWD/.omo/evidence/commands"
+mise exec -- bash test/integration/cli_matrix.sh --group memory --evidence-dir "$PWD/.omo/evidence/memory"
+mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$PWD/.omo/evidence/files"
+mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The final Issue #54 matrix run records 334 measured CLI cases: translate 46,
-commands 221, memory 22, files 45. Counts come from each run's `summary.json`; never
+The final Issue #63 matrix run records 364 measured CLI cases: translate 46,
+commands 251, memory 22, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
@@ -272,6 +283,21 @@ state includes column names, ordered row values and hit counts. The observer
 does not initialize or repair a database. `summary.json` lists every case and
 group count; `cleanup.json` records removed TMP and released lock ownership.
 Evidence contains synthetic source/translation fixtures; no user state is read.
+
+Issue #63 adds 30 strict-XDG command cases with redacted environment classes
+(`unset`, `empty`, `absolute`, or `relative`) rather than raw values. The exact
+new IDs are `commands-xdg-all-absolute-home-{unset,empty,relative}`;
+`commands-xdg-{config,data,cache,state}-{unset,empty,relative}`;
+`commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`;
+`commands-doctor-xdg-fallback-{human,json}`;
+`commands-doctor-xdg-unresolved-{human,json}`;
+`commands-doctor-xdg-special-json`; `commands-doctor-xdg-c1-{human,json}`;
+`commands-doctor-xdg-non-utf8-json`;
+`commands-home-unresolved-{readonly,init}`;
+and `commands-xdg-relative-init`. Each receipt records the executable SHA-256,
+argv, cwd, streams, status, environment classes, and independent expected-path
+assertions. Doctor and unresolved-command cases require unchanged FS/DB
+snapshots; the relative-XDG `init` case requires only HOME-derived paths.
 
 Issue #54 adds two real CLI characterizations without using a subprocess as
 an allocator measurement. `commands-config-string-replacements` performs five
@@ -347,6 +373,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-{version,init-yes,config-list-ready,config-get-default,config-set,models-list,models-info,models-import,models-pull,models-use,models-verify-explicit,models-remove,glossary-ready,memory-status,memory-clear}` | 0; exact command-specific streams; local `file://` pull | Exact creation/update/removal sets; clear removes seed row; status preserves it |
 | `commands-{top-missing,top-invalid,init-invalid,config-invalid,config-get-arity,models-info-arity,glossary-arity,doctor-arity,memory-clear-arity-absent-db}` and other family arity cases | 2; exact `invalid_arguments`; JSON variants `commands-{invalid-json,doctor-invalid-json}` have parsed error stdout and empty stderr | Initialized failures unchanged; absent-state mutations characterized separately |
 | `commands-doctor-{ready,absent,missing-db}-{human,json}` | 0 ready / 1 absent or missing DB; exact human or typed JSON, empty stderr | Does not create missing state |
+| `commands-xdg-all-absolute-home-{unset,empty,relative}`; `commands-xdg-{config,data,cache,state}-{unset,empty,relative}`; `commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`; `commands-doctor-xdg-{fallback,unresolved,c1}-{human,json}`; `commands-doctor-xdg-special-json`; `commands-doctor-xdg-non-utf8-json`; `commands-home-unresolved-{readonly,init}`; `commands-xdg-relative-init` (30) | Parsed doctor checks are ordered `config_path`, `data_path`, `cache_path`, `state_path`; direct/unset is `ok`, empty/relative fallback is `warn`/`xdg_path_invalid`, unresolved is `error`/`path_resolution_failed`; accepted C1 controls are deterministic textual escapes in human and JSON output | Diagnostic and unresolved ordinary-command receipts preserve FS/TM; relative-XDG init creates only HOME fallback state |
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
 | `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
 | `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |

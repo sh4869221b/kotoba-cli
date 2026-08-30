@@ -3,16 +3,19 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 CASE=all
+NATIVE_CACHE_QA=0
 EVIDENCE=""
 invalid() { echo 'build contract: invalid arguments' >&2; exit 2; }
 while (($#)); do
   case "$1" in
     --case) (($# >= 2)) || invalid; CASE="$2"; shift 2 ;;
+    --native-cache-qa) [[ "$NATIVE_CACHE_QA" == 0 ]] || invalid; NATIVE_CACHE_QA=1; shift ;;
     --evidence-dir) (($# >= 2)) || invalid; EVIDENCE="$2"; shift 2 ;;
     *) invalid ;;
   esac
 done
 case "$CASE" in pin|probe|runner|cache|tools|stages|all) ;; *) invalid ;; esac
+[[ "$NATIVE_CACHE_QA" == 0 || "$CASE" == cache || "$CASE" == all ]] || invalid
 [[ "$EVIDENCE" == /* ]] || invalid
 mkdir -p "$EVIDENCE"
 EVIDENCE="$(cd "$EVIDENCE" && pwd)"
@@ -69,11 +72,15 @@ cleanup() {
     result=1
   fi
   git -C "$ROOT" status --short >"$TMP/source.after"
+  if ! cmp -s "$TMP/source.before" "$TMP/source.after"; then
+    echo 'build contract: original source changed' >&2
+    result=1
+  fi
   printf 'exit=%s\nfixture=%s\n' "$result" "$TMP" >"$TMP/cleanup.txt"
   shopt -s nullglob
   local logs=("$TMP"/*.command "$TMP"/*.stdout "$TMP"/*.stderr "$TMP"/*.status)
   if ((${#logs[@]})); then cp "${logs[@]}" "$EVIDENCE/" || result=1; fi
-  for artifact in assertions.tsv counts.tsv source.before source.after vendor.before vendor.after identity.txt cleanup.txt hashes.txt metadata.txt vendor-paths.before vendor-paths.after cmake-record; do
+  for artifact in assertions.tsv counts.tsv source.before source.after vendor.before vendor.after identity.txt cleanup.txt hashes.txt metadata.txt vendor-paths.before vendor-paths.after cmake-record native-cache-cleanup.txt; do
     if [[ -f "$TMP/$artifact" ]]; then cp "$TMP/$artifact" "$EVIDENCE/" || result=1; fi
   done
   local owned="$TMP"
@@ -102,6 +109,8 @@ fixture() {
   git -C "$FIXTURE/vendor/llama.cpp" checkout --quiet --detach "$PIN"
   cp "$ROOT/build.zig" "$FIXTURE/build.zig"
   cp "$ROOT/src/llama_api_probe.c" "$FIXTURE/src/llama_api_probe.c"
+  cp "$ROOT/test/ci/native-cache.sh" "$ROOT/test/ci/native-cache.py" "$ROOT/test/ci/integration-evidence.py" "$ROOT/test/ci/integration-aggregate.sh" "$FIXTURE/test/ci/"
+  cp "$ROOT/.github/actions/setup-linux/action.yml" "$FIXTURE/.github/actions/setup-linux/action.yml"
 }
 recorder() {
   mkdir -p "$TMP/recorder"
@@ -246,6 +255,187 @@ cache_values() {
 cache_fingerprint() {
   find "$1" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
 }
+guarded_cache_build() {
+  local family="$1" cache="$2" prefix="$3" identity="$4"
+  bash test/ci/native-cache.sh validate --compiler "$family" --cache-dir "$cache" --identity "$identity" &&
+    zig build --cache-dir "$cache" --prefix "$prefix" -j2 &&
+    bash test/ci/native-cache.sh stamp --compiler "$family" --cache-dir "$cache" --identity "$identity" &&
+    "$prefix/bin/kotoba" version
+}
+ccache_hits() {
+  ccache --print-stats | awk '$1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" { hits += $2 } END { print hits+0 }'
+}
+cache_identity_cases() (
+  fixture native-cache
+  cd "$FIXTURE"
+  local compiler_root family cache identity before after native label file old new saved fingerprint
+  mkdir -p "$ROOT/.zig-cache"
+  compiler_root="$(mktemp -d "$ROOT/.zig-cache/cache-contract.XXXXXX")"
+  cleanup_native_cache_qa() {
+    local result=$?
+    trap - EXIT INT TERM
+    set +e
+    if [[ -n "$CAPTURE_PID" ]]; then
+      kill -TERM -- "-$CAPTURE_PID" 2>/dev/null
+      wait "$CAPTURE_PID" 2>/dev/null
+    fi
+    rm -rf -- "$compiler_root" "$TMP/native-cache-home"
+    if [[ -e "$compiler_root" || -e "$TMP/native-cache-home" ]]; then result=1; fi
+    printf 'exit=%s\ncompiler_root=%s\ncompiler_root_removed=%s\nprivate_home_removed=%s\n' "$result" "$compiler_root" "$([[ ! -e "$compiler_root" ]] && echo yes || echo no)" "$([[ ! -e "$TMP/native-cache-home" ]] && echo yes || echo no)" >"$TMP/native-cache-cleanup.txt"
+    exit "$result"
+  }
+  trap cleanup_native_cache_qa EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  export HOME="$TMP/native-cache-home"
+  mkdir -p "$HOME"
+  export CCACHE_CONFIGPATH=/dev/null CCACHE_COMPILERCHECK=content CCACHE_SLOPPINESS="" CCACHE_HASHDIR=true
+  CMAKE_C_COMPILER_LAUNCHER="$(command -v ccache)"
+  CMAKE_CXX_COMPILER_LAUNCHER="$CMAKE_C_COMPILER_LAUNCHER"
+  export CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+  for family in gcc clang; do
+    export CC=gcc CXX=g++ CCACHE_DIR="$compiler_root/$family"
+    [[ "$family" == gcc ]] || { export CC=clang CXX=clang++; }
+    mkdir -p "$CCACHE_DIR"
+    cache="$TMP/native-$family"
+    identity="$TMP/identity-$family.json"
+    capture "native-$family-identity" bash test/ci/native-cache.sh identity --compiler "$family" --cache-dir "$cache" --output "$identity"
+    assert "$family expected identity created" test "$STATUS" -eq 0
+    cat "$identity" >>"$TMP/metadata.txt"
+    capture "ccache-$family-before" ccache --show-stats
+    capture "native-$family-cold" guarded_cache_build "$family" "$cache" "$TMP/native-prefix-$family" "$identity"
+    assert "$family cold native build and CLI version" test "$STATUS" -eq 0
+    assert "$family cold is miss" grep -qx 'native_cache=miss' "$TMP/native-$family-cold.stdout"
+    capture "ccache-$family-cold" ccache --show-stats
+    cache_values "$cache/llama.cpp/cpu"
+    cat "$cache/llama.cpp/cpu/CMakeFiles/"*/CMakeCXXCompiler.cmake >>"$TMP/metadata.txt"
+    capture "native-$family-warm" guarded_cache_build "$family" "$cache" "$TMP/native-warm-prefix-$family" "$identity"
+    assert "$family warm native and CLI version" test "$STATUS" -eq 0
+    assert "$family warm is hit" grep -qx 'native_cache=hit' "$TMP/native-$family-warm.stdout"
+    capture "native-$family-version" "$TMP/native-warm-prefix-$family/bin/kotoba" version
+    assert "$family produced version is nonempty" test -s "$TMP/native-$family-version.stdout"
+    before="$(ccache_hits)"
+    capture "native-$family-fresh-identity" bash test/ci/native-cache.sh identity --compiler "$family" --cache-dir "$cache-fresh" --output "$TMP/fresh-$family.json"
+    assert "$family fresh identity created" test "$STATUS" -eq 0
+    capture "native-$family-compiler-warm" guarded_cache_build "$family" "$cache-fresh" "$TMP/native-fresh-prefix-$family" "$TMP/fresh-$family.json"
+    assert "$family fresh native warm compiler build and CLI version" test "$STATUS" -eq 0
+    after="$(ccache_hits)"
+    assert "$family real compiler cache hit count increases" test "$after" -gt "$before"
+    capture "ccache-$family-after" ccache --show-stats
+    printf 'ccache-%s	before=%s	after=%s	directory=%s
+' "$family" "$before" "$after" "$CCACHE_DIR" >>"$TMP/counts.tsv"
+    printf 'compiler_cache_%s=%s
+' "$family" "$CCACHE_DIR" >>"$TMP/metadata.txt"
+  done
+  assert 'GCC and Clang CLI version agree' cmp -s "$TMP/native-gcc-version.stdout" "$TMP/native-clang-version.stdout"
+  export CC=gcc CXX=g++ CCACHE_DIR="$compiler_root/gcc"
+  cache="$TMP/native-gcc"
+  native="$cache/llama.cpp/cpu"
+  identity="$TMP/identity-gcc.json"
+  cp src/main.zig "$TMP/native-main.saved"
+  printf '
+// cache identity source-only fixture
+' >>src/main.zig
+  capture native-source-only bash test/ci/native-cache.sh identity --compiler gcc --cache-dir "$cache" --output "$TMP/source-only.json"
+  assert 'source-only identity generation succeeds' test "$STATUS" -eq 0
+  assert 'source-only change reuses native key' cmp -s "$identity" "$TMP/source-only.json"
+  capture native-source-build guarded_cache_build gcc "$cache" "$TMP/source-prefix" "$identity"
+  assert 'source-only warm native build and CLI version' test "$STATUS" -eq 0
+  cp "$TMP/native-main.saved" src/main.zig
+  for file in build.zig build.zig.zon; do
+    cp "$file" "$TMP/contract.saved"
+    printf '
+' >>"$file"
+    capture "native-key-$file" bash test/ci/native-cache.sh identity --compiler gcc --cache-dir "$cache" --output "$TMP/changed.json"
+    assert "$file changed identity generated" test "$STATUS" -eq 0
+    assert "$file changes native key" test "$(sha256sum <"$identity")" != "$(sha256sum <"$TMP/changed.json")"
+    cp "$TMP/contract.saved" "$file"
+  done
+  # The same expected manifest must not conceal incompatible actual CMake metadata.
+  local compiler_metadata
+  compiler_metadata="$(find "$native/CMakeFiles" -name CMakeCXXCompiler.cmake)"
+  while IFS='|' read -r label file old new; do
+    [[ "$file" != compiler ]] || file="$compiler_metadata"
+    [[ "$file" != cache ]] || file="$native/CMakeCache.txt"
+    saved="$TMP/native-$label.saved"
+    cp "$file" "$saved"
+    sed "$old$new" "$saved" >"$file"
+    fingerprint="$(cache_fingerprint "$native")"
+    capture "native-reject-$label" guarded_cache_build gcc "$cache" "$TMP/rejected-$label-prefix" "$identity"
+    assert "$label rejected before build" test "$STATUS" -ne 0
+    assert "$label identity mismatch diagnostic" grep -q 'linux ci cache: identity mismatch' "$TMP/native-reject-$label.stderr"
+    assert "$label installs no candidate" test ! -e "$TMP/rejected-$label-prefix"
+    assert "$label preserves rejected cache bytes" test "$fingerprint" = "$(cache_fingerprint "$native")"
+    printf '%s before=%s after=%s\n' "$label" "$fingerprint" "$(cache_fingerprint "$native")" >>"$TMP/metadata.txt"
+    cp "$saved" "$file"
+  done <<'MUTATIONS'
+compiler-path|cache|s@^CMAKE_CXX_COMPILER:[^=]*=.*@CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/clang++@|
+compiler-family|compiler|s/COMPILER_ID "GNU"/COMPILER_ID "Clang"/|
+compiler-version|compiler|s/COMPILER_VERSION "[^"]*"/COMPILER_VERSION "0.0.0"/|
+missing-version|compiler|/COMPILER_VERSION "/d|
+duplicate-compiler|cache|/^CMAKE_CXX_COMPILER:/p|
+wrong-pin|cache|s/^GGML_BUILD_COMMIT:[^=]*=.*/GGML_BUILD_COMMIT:STRING=wrong/|
+launcher|cache|s@^CMAKE_CXX_COMPILER_LAUNCHER:[^=]*=.*@CMAKE_CXX_COMPILER_LAUNCHER:STRING=/bin/false@|
+missing-compiler|cache|/^CMAKE_C_COMPILER:/d|
+generated-compiler-path|compiler|s@set(CMAKE_CXX_COMPILER "[^"]*")@set(CMAKE_CXX_COMPILER "/bin/false")@|
+CPU-flags|cache|s/^GGML_NATIVE:BOOL=ON/GGML_NATIVE:BOOL=OFF/|
+source-path|cache|s@^CMAKE_HOME_DIRECTORY:[^=]*=.*@CMAKE_HOME_DIRECTORY:INTERNAL=/unrelated/source@|
+MUTATIONS
+  local manifest="$native/.kotoba-native-identity.json"
+  cp "$manifest" "$TMP/manifest.saved"
+  for label in cpu malformed missing duplicate; do
+    case "$label" in
+      cpu) python3 - "$manifest" <<'PYCPU'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data['cpu'] = 'different ISA'
+path.write_text(json.dumps(data))
+PYCPU
+      ;;
+      malformed) printf '{' >"$manifest" ;;
+      missing) mv "$manifest" "$TMP/missing-manifest.saved" ;;
+      duplicate) printf '{"schema":"1","schema":"1"}' >"$manifest" ;;
+    esac
+    fingerprint="$(cache_fingerprint "$native")"
+    capture "native-reject-$label" guarded_cache_build gcc "$cache" "$TMP/rejected-$label-prefix" "$identity"
+    assert "$label manifest rejected" test "$STATUS" -ne 0
+    assert "$label identity mismatch diagnostic" grep -q 'linux ci cache: identity mismatch' "$TMP/native-reject-$label.stderr"
+    assert "$label preserves rejected bytes" test "$fingerprint" = "$(cache_fingerprint "$native")"
+    assert "$label no candidate" test ! -e "$TMP/rejected-$label-prefix"
+    printf '%s before=%s after=%s\n' "$label" "$fingerprint" "$(cache_fingerprint "$native")" >>"$TMP/metadata.txt"
+    cp "$TMP/manifest.saved" "$manifest"
+  done
+  # A warm manifest never replaces the original checkout/index/docs guards in Zig.
+  cp docs/embedded-llama-api.md "$TMP/native-doc.saved"
+  sed "s/$PIN/0000000000000000000000000000000000000000/g" "$TMP/native-doc.saved" >docs/embedded-llama-api.md
+  capture native-warm-pin zig build --cache-dir "$cache" --prefix "$TMP/wrong-pin-prefix" -j2
+  assert 'warm native still runs original pin metadata guard' test "$STATUS" -ne 0
+  assert 'original warm pin guard diagnostic' grep -q 'llama.cpp metadata mismatch' "$TMP/native-warm-pin.stderr"
+  cp "$TMP/native-doc.saved" docs/embedded-llama-api.md
+  local alternate
+  alternate="$(printf 'native cache pin identity fixture\n' | git -C vendor/llama.cpp -c user.name=build-contract -c user.email=build-contract@example.invalid commit-tree "$PIN^{tree}" -p "$PIN")"
+  cp build.zig "$TMP/native-build.saved"
+  git -C vendor/llama.cpp checkout --quiet --detach "$alternate"
+  git update-index --cacheinfo "160000,$alternate,vendor/llama.cpp"
+  sed "s/$PIN/$alternate/g" "$TMP/native-build.saved" >build.zig
+  sed "s/$PIN/$alternate/g" "$TMP/native-doc.saved" >docs/embedded-llama-api.md
+  capture native-new-pin-identity bash test/ci/native-cache.sh identity --compiler gcc --cache-dir "$cache" --output "$TMP/new-pin.json"
+  assert 'consistent changed pin identity generated' test "$STATUS" -eq 0
+  assert 'pin contract changes native key' test "$(sha256sum <"$identity")" != "$(sha256sum <"$TMP/new-pin.json")"
+  capture native-new-pin-reject bash test/ci/native-cache.sh validate --compiler gcc --cache-dir "$cache" --identity "$TMP/new-pin.json"
+  assert 'changed pin rejects old native cache' test "$STATUS" -ne 0
+  git -C vendor/llama.cpp checkout --quiet --detach "$PIN"
+  git update-index --cacheinfo "160000,$PIN,vendor/llama.cpp"
+  cp "$TMP/native-build.saved" build.zig
+  cp "$TMP/native-doc.saved" docs/embedded-llama-api.md
+  capture native-explicit-recovery guarded_cache_build gcc "$TMP/native-gcc-fresh" "$TMP/recovery-prefix" "$TMP/fresh-gcc.json"
+  assert 'explicit independent fresh cache recovery' test "$STATUS" -eq 0
+  rm -rf -- "$HOME"
+  assert 'private cache QA HOME removed' test ! -e "$HOME"
+  assert 'GCC compiler cache outside fixture HOME' test -d "$compiler_root/gcc"
+  assert 'Clang compiler cache outside fixture HOME' test -d "$compiler_root/clang"
+)
 case_cache() {
   cd "$ROOT"
   capture cache-cpu zig build --cache-dir "$TMP/local-cache" --prefix "$TMP/private-prefix" -j2
@@ -290,6 +480,14 @@ WRAPPER
   sed -i "s/^GGML_BUILD_COMMIT:[^=]*=.*/GGML_BUILD_COMMIT:STRING=$PIN/" "$TMP/local-cache/llama.cpp/cpu/CMakeCache.txt"
   capture cache-restored zig build --cache-dir "$TMP/local-cache" --prefix "$TMP/private-prefix" -j2
   assert 'real CPU build recovers after metadata restoration' test "$STATUS" -eq 0
+  if [[ "${KOTOBA_CI_NATIVE_CACHE:-0}" == 1 ]]; then
+    capture cache-identity-self-test bash "$ROOT/test/ci/native-cache.sh" --self-test
+    assert 'CI native cache identity self-test passes' test "$STATUS" -eq 0
+  fi
+  if [[ "$NATIVE_CACHE_QA" == 1 ]]; then
+    cache_identity_cases
+    ASSERTIONS="$(wc -l <"$TMP/assertions.tsv")"
+  fi
 }
 case_tools() {
   cd "$ROOT"
@@ -321,6 +519,7 @@ case_stages() {
     fixture "stage-$stage"
     mkdir -p "$FIXTURE/test/ci"
     cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+    cp "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/integration-evidence.py"
     cp "$ROOT/test/integration/build_contract.sh" "$FIXTURE/test/integration/build_contract.sh"
     cd "$FIXTURE"
     cp build.zig "$TMP/stage-$stage-build.saved"
@@ -378,6 +577,152 @@ WRAPPER
     printf '%s\tbaseline=0\tmutation=nonzero\trestored=0\tsource_restored=yes\n' "$stage" >>"$TMP/counts.tsv"
     cd "$ROOT"
   done
+  fixture stage-format-minimal
+  mkdir -p "$FIXTURE/test/ci" "$TMP/native-unavailable"
+  cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+  for tool in cc c++ gcc g++ clang clang++ cmake ccache; do
+    printf '#!/usr/bin/env bash\necho native-tool-unavailable >&2\nexit 127\n' >"$TMP/native-unavailable/$tool"
+    chmod +x "$TMP/native-unavailable/$tool"
+  done
+  mv "$FIXTURE/vendor/llama.cpp" "$TMP/stage-format-minimal-vendor"
+  cd "$FIXTURE"
+  name='stage-format-minimal'
+  capture "$name" env PATH="$TMP/native-unavailable:$ORIGINAL_PATH" KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh format
+  assert 'format passes without initialized vendor or native tools' test "$STATUS" -eq 0
+  assert 'format records vendor as not required' grep -qx 'vendor=not-required' "$EVIDENCE/$name/identity.txt"
+  assert 'format identity omits native tools' sh -c '! grep -Eqi "(cc|cmake).*version" "$1"' sh "$EVIDENCE/$name/identity.txt"
+  name='stage-native-minimal'
+  capture "$name" env PATH="$TMP/native-unavailable:$ORIGINAL_PATH" KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh build
+  assert 'native stage rejects uninitialized vendor' test "$STATUS" -ne 0
+  assert 'native stage names initialization requirement' grep -Fq 'llama.cpp submodule is not initialized' "$TMP/$name.stderr"
+  printf 'format-minimal\tformat=0\tnative=nonzero\tvendor=not-required\n' >>"$TMP/counts.tsv"
+  cd "$ROOT"
+
+  ACTIVE_CASE=stages
+  capture aggregate-self-test bash "$ROOT/test/ci/integration-aggregate.sh" --self-test
+  assert 'aggregate self-test covers 64 combinations' test "$STATUS" -eq 0
+  assert 'aggregate self-test admits exactly one' grep -Fq '64 combinations, admitted=1, rejected=63' "$TMP/aggregate-self-test.stdout"
+  capture aggregate-success bash "$ROOT/test/ci/integration-aggregate.sh" success success success
+  assert 'aggregate accepts three successes' test "$STATUS" -eq 0
+  for result in failure skipped cancelled missing unknown; do
+    capture "aggregate-$result" bash "$ROOT/test/ci/integration-aggregate.sh" success "$result" success
+    assert "aggregate rejects $result" test "$STATUS" -ne 0
+    assert "aggregate names $result lane failure" grep -Fq 'linux ci: integration lane did not succeed' "$TMP/aggregate-$result.stderr"
+  done
+  capture aggregate-arity bash "$ROOT/test/ci/integration-aggregate.sh" success success
+  assert 'aggregate rejects bad arity with usage status' test "$STATUS" -eq 2
+
+  local workflow="$ROOT/.github/workflows/linux-cpu.yml"
+  assert 'workflow keeps format required name' test "$(grep -c '^    name: Linux CPU / format$' "$workflow")" -eq 1
+  assert 'workflow keeps build required name' test "$(grep -c '^    name: Linux CPU / build$' "$workflow")" -eq 1
+  assert 'workflow keeps unit required name' test "$(grep -c '^    name: Linux CPU / unit$' "$workflow")" -eq 1
+  assert 'workflow keeps integration aggregate required name' test "$(grep -c '^    name: Linux CPU / integration$' "$workflow")" -eq 1
+  assert 'workflow has smoke lane' grep -Fq '  integration-smoke:' "$workflow"
+  assert 'workflow has matrix lane' grep -Fq '  integration-matrix:' "$workflow"
+  assert 'workflow has parallel lane' grep -Fq '  integration-parallel:' "$workflow"
+  assert 'aggregate needs exactly three lanes' grep -Fqx '    needs: [integration-smoke, integration-matrix, integration-parallel]' "$workflow"
+  assert 'aggregate evaluates always' grep -Fqx '    if: ${{ always() }}' "$workflow"
+  assert 'parallel maps pull requests to one round and other configured events to two' grep -Fq "github.event_name == 'pull_request' && '1' || '2'" "$workflow"
+  assert 'native restores use exact keys only' sh -c '! grep -q "restore-keys:" "$1"' sh "$workflow"
+  assert 'cache excludes final and global outputs' sh -c '! grep -E "^[[:space:]]+path: .*(zig-out|\.zig-cache/global|\.lock)" "$1"' sh "$workflow"
+  assert 'workflow pins cache restore' grep -Fq 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$workflow"
+  assert 'workflow pins cache save' grep -Fq 'actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$workflow"
+  assert 'GCC compiler cache save is success miss only' grep -Fq "success() && steps.gcc_compiler_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'GCC native cache save is success miss only' grep -Fq "success() && steps.gcc_native_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'Clang compiler cache save is success miss only' grep -Fq "success() && steps.clang_compiler_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'Clang native cache save is success miss only' grep -Fq "success() && steps.clang_native_restore.outputs.cache-hit != 'true'" "$workflow"
+  assert 'workflow pins evidence upload' grep -Fq 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' "$workflow"
+  assert 'workflow bounds evidence retention' grep -Fq 'retention-days: 7' "$workflow"
+  assert 'format selects minimal setup profile' grep -Fq 'profile: format' "$workflow"
+  assert 'aggregate passes needs through environment' grep -Fq 'SMOKE_RESULT: ${{ needs.integration-smoke.result }}' "$workflow"
+  assert 'aggregate shell uses environment variables' grep -Fq 'integration-aggregate.sh "$SMOKE_RESULT" "$MATRIX_RESULT" "$PARALLEL_RESULT"' "$workflow"
+  printf 'workflow-static\trequired=4\tintegration-children=3\tpr-rounds=1\tpush-rounds=2\tdispatch-rounds=2\n' >>"$TMP/counts.tsv"
+
+  fixture stage-selectors
+  mkdir -p "$FIXTURE/test/ci"
+  cp "$ROOT/test/ci/linux.sh" "$FIXTURE/test/ci/linux.sh"
+  cp "$ROOT/test/ci/integration-evidence.py" "$FIXTURE/test/ci/integration-evidence.py"
+  cd "$FIXTURE"
+  local invalid_root invalid_name invalid_status
+  for invalid_name in rounds-zero rounds-large rounds-nondecimal rounds-missing duplicate-suite unknown-suite matrix-rounds extra-build; do
+    invalid_root="$EVIDENCE/stage-selector-invalid-$invalid_name"
+    case "$invalid_name" in
+      rounds-zero) set -- integration --suite parallel --rounds 0 ;;
+      rounds-large) set -- integration --suite parallel --rounds 1001 ;;
+      rounds-nondecimal) set -- integration --suite parallel --rounds 01 ;;
+      rounds-missing) set -- integration --suite parallel --rounds ;;
+      duplicate-suite) set -- integration --suite all --suite all ;;
+      unknown-suite) set -- integration --suite unknown ;;
+      matrix-rounds) set -- integration --suite matrix --rounds 1 ;;
+      extra-build) set -- build --suite parallel ;;
+    esac
+    capture "stage-selector-invalid-$invalid_name" env KOTOBA_CI_EVIDENCE_DIR="$invalid_root" bash test/ci/linux.sh "$@"
+    invalid_status=2
+    assert "$invalid_name rejects before fixture allocation" test "$STATUS" -eq "$invalid_status"
+    if [[ "$invalid_name" == extra-build ]]; then
+      assert "$invalid_name preserves stage diagnostic" grep -qx 'linux ci: invalid stage' "$TMP/stage-selector-invalid-$invalid_name.stderr"
+    else
+      assert "$invalid_name preserves integration diagnostic" grep -qx 'linux ci: invalid integration arguments' "$TMP/stage-selector-invalid-$invalid_name.stderr"
+    fi
+    assert "$invalid_name creates no evidence root" test ! -e "$invalid_root"
+  done
+  local suite rounds name
+  while IFS='|' read -r suite rounds; do
+    name="stage-selector-$suite-$rounds"
+    if [[ "$suite" == parallel ]]; then
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite "$suite" --rounds "$rounds" </dev/null
+    else
+      capture "$name" env KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite "$suite" </dev/null
+    fi
+    assert "$suite selected run passes" test "$STATUS" -eq 0
+    assert "$suite status names selector" grep -qx "suite=$suite" "$EVIDENCE/$name/status.txt"
+    assert "$suite status names rounds" grep -qx "rounds=$rounds" "$EVIDENCE/$name/status.txt"
+    assert "$suite common self-test runs" test -s "$EVIDENCE/$name/common.command"
+    if [[ "$suite" == smoke ]]; then
+      assert 'smoke selected without matrix' test ! -e "$EVIDENCE/$name/cli-matrix.command"
+      assert 'smoke selected without parallel' test ! -e "$EVIDENCE/$name/parallel.command"
+    elif [[ "$suite" == matrix ]]; then
+      assert 'matrix selected without smoke' test ! -e "$EVIDENCE/$name/smoke.command"
+      assert 'matrix selected without parallel' test ! -e "$EVIDENCE/$name/parallel.command"
+    else
+      assert 'parallel selected without smoke' test ! -e "$EVIDENCE/$name/smoke.command"
+      assert 'parallel selected without matrix' test ! -e "$EVIDENCE/$name/cli-matrix.command"
+      assert "parallel $rounds exact child count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*.status' | wc -l)" -eq "$((9 * rounds))"
+      assert "parallel $rounds exact unit log count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*-unit-*.err' | wc -l)" -eq "$((4 * rounds))"
+      assert "parallel $rounds exact benchmark count" test "$(find "$EVIDENCE/$name/parallel" -mindepth 2 -maxdepth 2 -name 'round-*-bench.out' | wc -l)" -eq "$rounds"
+      assert "parallel $rounds exact measurement count" grep -Fqx "$(printf 'parallel-benchmark-measurements\t%s' "$((15 * rounds))")" "$EVIDENCE/$name/counts.tsv"
+      assert "parallel $rounds preserves positive unit total" awk -F '\t' '$1 == "parallel-unit-tests" { found = 1; if ($2 > 0) passed = 1 } END { exit !(found && passed) }' "$EVIDENCE/$name/counts.tsv"
+    fi
+  done <<'SELECTORS'
+smoke|2
+matrix|2
+parallel|1
+parallel|2
+SELECTORS
+  name=stage-selector-parallel-failure
+  capture "$name" env KOTOBA_BENCH_EXPECT_MISMATCH=1 KOTOBA_CI_EVIDENCE_DIR="$EVIDENCE/$name" bash test/ci/linux.sh integration --suite parallel --rounds 1
+  assert 'selected benchmark failure propagates' test "$STATUS" -ne 0
+  assert 'selected benchmark diagnostic remains visible' grep -Fq 'benchmark validation failed: direct translated text mismatch' "$TMP/$name.stdout" "$TMP/$name.stderr"
+  capture stage-selector-parallel-self-test bash test/integration/parallel.sh --self-test
+  assert 'parallel signal cleanup self-test passes' test "$STATUS" -eq 0
+  local selector_source selector_parallel corrupt label
+  selector_source="$EVIDENCE/stage-selector-parallel-1"
+  selector_parallel="$(find "$selector_source/parallel" -mindepth 1 -maxdepth 1 -type d -name 'parallel.*')"
+  for label in missing-child extra-child wrong-round failed-child bad-benchmark bad-unit-log; do
+    corrupt="$TMP/stage-selector-corrupt-$label"
+    cp -a "$selector_source" "$corrupt"
+    case "$label" in
+      missing-child) rm "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" ;;
+      extra-child) cp "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-5.status" ;;
+      wrong-round) mv "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-4.status" "$corrupt/parallel/$(basename "$selector_parallel")/round-2-unit-4.status" ;;
+      failed-child) sed -i 's/status=0/status=1/' "$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.status" ;;
+      bad-benchmark) printf '{}\n' >"$corrupt/parallel/$(basename "$selector_parallel")/round-1-bench.out" ;;
+      bad-unit-log) printf 'unexpected unit output\n' >"$corrupt/parallel/$(basename "$selector_parallel")/round-1-unit-1.err" ;;
+    esac
+    capture "stage-selector-corrupt-$label" python3 test/ci/integration-evidence.py --suite parallel --rounds 1 --evidence-dir "$corrupt"
+    assert "$label receipt corruption is rejected" test "$STATUS" -ne 0
+  done
+  cd "$ROOT"
 }
 if [[ "$CASE" == all ]]; then CASES=(pin probe runner cache tools); else CASES=("$CASE"); fi
 for ACTIVE_CASE in "${CASES[@]}"; do
