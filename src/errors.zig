@@ -125,6 +125,7 @@ pub fn fromError(err: anyerror) AppError {
         Error.SqliteFailed => .{ .code = .sqlite_failed, .message = "SQLite translation memory operation failed." },
         Error.GlossaryInvalid => .{ .code = .glossary_invalid, .message = "glossary.toml is invalid." },
         Error.UnsupportedLanguagePair => .{ .code = .unsupported_language_pair, .message = "Only en -> ja and ja -> en are supported." },
+        error.AmbiguousLanguage => .{ .code = .invalid_arguments, .message = "Source language is ambiguous. Specify --from en or --from ja." },
         Error.InvalidArguments => .{ .code = .invalid_arguments, .message = "Invalid arguments." },
         Error.InvalidUtf8 => .{ .code = .invalid_utf8, .message = "Text must be valid UTF-8." },
         Error.EmbeddedNul => .{ .code = .embedded_nul, .message = "Text must not contain NUL bytes." },
@@ -150,6 +151,13 @@ test "text encoding error mapping" {
         try std.testing.expectEqualStrings(case.message, app_err.message);
         try std.testing.expectEqual(@as(u8, 1), app_err.exitCode());
     }
+}
+
+test "ambiguous source language requests an explicit source" {
+    const app_err = fromError(error.AmbiguousLanguage);
+    try std.testing.expectEqualStrings("invalid_arguments", app_err.code.asText());
+    try std.testing.expectEqualStrings("Source language is ambiguous. Specify --from en or --from ja.", app_err.message);
+    try std.testing.expectEqual(@as(u8, 2), app_err.exitCode());
 }
 
 pub fn printHuman(app_err: AppError) !void {

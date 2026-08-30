@@ -198,6 +198,20 @@ PY
   matrix_translate_plain_extra markdown-link-url 'See [site](https://example.test/a?q=1) now.' 'JA:See [site](https://example.test/a?q=1) now.' markdown
   matrix_translate_plain_extra markdown-all-protected $'```txt\nliteral\n```' $'```txt\nliteral\n```' markdown
 
+  for id in short symbol-only; do
+    matrix_translate_fixture "ambiguous-$id"
+    source=Hi
+    if [[ "$id" == symbol-only ]]; then source='123 !?'; fi
+    printf 'kotoba: invalid_arguments: Source language is ambiguous. Specify --from en or --from ja.\n' >"$CASE_DIR/expected.stderr"
+    matrix_run translate "$source" --to ja --no-memory
+    matrix_assert status 2
+    matrix_assert stdout "$CASE_DIR/empty"
+    matrix_assert stderr "$CASE_DIR/expected.stderr"
+    matrix_assert fs-equal
+    matrix_translate_state
+    matrix_finish
+  done
+
   for reader in direct stdin file; do
     matrix_translate_fixture "empty-$reader"
     input_args=()
