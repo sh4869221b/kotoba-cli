@@ -196,7 +196,7 @@ def schema(value, kind: str) -> None:
             assert type(value["cached"]) is bool
             assert type(value["warnings"]) is list and all(type(item) is str for item in value["warnings"])
             cached, total = value["cached_segments"], value["total_segments"]
-            assert cached <= total and value["cached"] == (cached == total)
+            assert cached <= total and value["cached"] == (total > 0 and cached == total)
             assert value["cache_status"] == ("none" if cached == 0 else "full" if cached == total else "partial")
         case _:
             raise AssertionError("unknown JSON schema")

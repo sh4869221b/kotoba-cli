@@ -154,7 +154,7 @@ PY
   matrix_finish
   negative="$MATRIX_CAPTURE/rejections"
   mkdir -p "$negative"
-  for name in status stdout stderr state malformed-json missing-key extra-key bool-integer; do
+  for name in status stdout stderr state malformed-json missing-key extra-key bool-integer zero-cache-contract; do
     CASE_DIR="$negative/$name"
     mkdir "$CASE_DIR"
     cp "$positive/"* "$CASE_DIR/"
@@ -179,6 +179,8 @@ match sys.argv[2]:
         value["extra"] = "unexpected"
     case "bool-integer":
         value["elapsed_ms"] = True
+    case "zero-cache-contract":
+        value.update(cached=True, cache_status="none", cached_segments=0, total_segments=0)
 Path(sys.argv[1]).write_text(json.dumps(value))
 PY
         set -- json success ;;
@@ -232,7 +234,7 @@ CHECK
     case "$kind" in
       error) payload='{"error":{"code":"invalid_arguments","message":"Invalid arguments."}}' ;;
       doctor) payload='{"ok":false,"checks":[{"name":"model","status":"fail","code":"missing","message":"Missing."}]}' ;;
-      success-source) payload='{"source_lang":"en","target_lang":"ja","mode":"default","model_id":"m","runtime":"embedded","cached":true,"cache_status":"none","cached_segments":0,"total_segments":0,"translated_text":"","warnings":[],"elapsed_ms":0,"source_text":""}' ;;
+      success-source) payload='{"source_lang":"en","target_lang":"ja","mode":"default","model_id":"m","runtime":"embedded","cached":false,"cache_status":"none","cached_segments":0,"total_segments":0,"translated_text":"","warnings":[],"elapsed_ms":0,"source_text":""}' ;;
     esac
     matrix_case "helper-json-$kind" helper
     matrix_run -c 'printf "%s\n" "$1"' bash "$payload"
@@ -284,7 +286,7 @@ from pathlib import Path
 import sys
 root = Path(sys.argv[1])
 rejections = {path.parent.name: int(path.read_text()) for path in (root / "rejections").glob("*/rejection.status")}
-assert len(rejections) == 8 and all(rejections.values())
+assert len(rejections) == 9 and all(rejections.values())
 wal_noop = root / "cases/helper-wal-noop"
 wal_mutation = root / "cases/helper-wal-sidecar-mutation"
 assert json.loads((wal_noop / "db-before.json").read_text())["sqlite_opened"] is False

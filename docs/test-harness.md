@@ -353,7 +353,8 @@ normalized, not translated bytes or counters. Error JSON is exactly
 and `checks:[{name,status,code,message:string}]`. If file routing wins over
 `--format json`, stdout is empty and the file contains translated bytes, so no
 JSON response is claimed. The helper self-test's synthetic zero-segment Result
-is not the real nonempty all-protected CLI case.
+uses `cached=false` and `cache_status=none`; it is not the real nonempty
+all-protected CLI case.
 
 ### Measured CLI rows (`level=cli`)
 
@@ -378,7 +379,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-xdg-all-absolute-home-{unset,empty,relative}`; `commands-xdg-{config,data,cache,state}-{unset,empty,relative}`; `commands-xdg-mixed-domains`; `commands-home-fallback-{unset,empty,relative}`; `commands-doctor-xdg-{fallback,unresolved,c1}-{human,json}`; `commands-doctor-xdg-special-json`; `commands-doctor-xdg-non-utf8-json`; `commands-home-unresolved-{readonly,init}`; `commands-xdg-relative-init` (30) | Parsed doctor checks are ordered `config_path`, `data_path`, `cache_path`, `state_path`; direct/unset is `ok`, empty/relative fallback is `warn`/`xdg_path_invalid`, unresolved is `error`/`path_resolution_failed`; accepted C1 controls are deterministic textual escapes in human and JSON output | Diagnostic and unresolved ordinary-command receipts preserve FS/TM; relative-XDG init creates only HOME fallback state |
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
 | `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
-| `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
+| `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=2` (two translatable paragraphs) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
 | `tm-broken-stdout-pipe` | 1; read end closed before exec, empty stdout, exact `kotoba: io_error: BrokenPipe` stderr; receipt records producer return/status, not a consumer status | TM commits the accepted `Matrix broken stdout pipe` -> `JA:Matrix broken stdout pipe` row before stdout failure; row count is 1 |
 | `tm-disabled-{flag,config}`; `tm-{directory-open-failure,corrupt-open-failure,statement-failure}` | Disabled/open failure 0 uncached, empty warnings; incompatible table 1 with parsed `sqlite_failed`; empty stderr | Disabled sentinel unchanged; invalid DB/directory unchanged, no replacement or new translation |
 | `glossary-{prefer,protect,hash-change,disabled-flag,disabled-config,empty-key-reuse,empty-key-reuse-config}` | 0; parsed JSON; no deterministic glossary substitution claim | Hash change/disable uses distinct key; disabled empty-glossary key reuse hits |
