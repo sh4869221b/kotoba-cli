@@ -66,8 +66,12 @@ pub const OwnedResult = struct {
 
 pub fn cacheStatus(r: Result) []const u8 {
     if (r.cached_segments == 0) return "none";
-    if (r.cached_segments == r.total_segments) return "full";
+    if (isFullyCached(r)) return "full";
     return "partial";
+}
+
+fn isFullyCached(r: Result) bool {
+    return r.total_segments > 0 and r.cached_segments == r.total_segments;
 }
 
 pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
@@ -90,7 +94,7 @@ fn renderJson(allocator: std.mem.Allocator, r: Result, include_source: bool) ![]
             .mode = r.mode.asText(),
             .model_id = r.model_id,
             .runtime = r.runtime,
-            .cached = r.cached_segments == r.total_segments,
+            .cached = isFullyCached(r),
             .cache_status = cacheStatus(r),
             .cached_segments = r.cached_segments,
             .total_segments = r.total_segments,
@@ -106,7 +110,7 @@ fn renderJson(allocator: std.mem.Allocator, r: Result, include_source: bool) ![]
         .mode = r.mode.asText(),
         .model_id = r.model_id,
         .runtime = r.runtime,
-        .cached = r.cached_segments == r.total_segments,
+        .cached = isFullyCached(r),
         .cache_status = cacheStatus(r),
         .cached_segments = r.cached_segments,
         .total_segments = r.total_segments,
@@ -158,6 +162,28 @@ test "cacheStatus reports none partial full" {
     var full = base;
     full.cached_segments = 3;
     try std.testing.expectEqualStrings("full", cacheStatus(full));
+}
+
+test "zero translatable JSON is not cached" {
+    const r: Result = .{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .default,
+        .model_id = "m",
+        .runtime = "embedded",
+        .cached_segments = 0,
+        .total_segments = 0,
+        .translated_text = "KOTOBA_PROTECT_000001",
+        .elapsed_ms = 0,
+    };
+    const json = try renderJson(std.testing.allocator, r, false);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("cached").?.bool);
+    try std.testing.expectEqualStrings("none", parsed.value.object.get("cache_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("cached_segments").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("total_segments").?.integer);
 }
 
 test "renderJson escapes quotes backslashes and control characters" {
@@ -234,7 +260,7 @@ fn expectJsonTextRoundTrip(r: Result, include_source: bool, json: []const u8) !v
     inline for (.{ "model_id", "runtime", "translated_text" }) |field| {
         try std.testing.expectEqualStrings(@field(r, field), object.get(field).?.string);
     }
-    try std.testing.expectEqual(r.cached_segments == r.total_segments, object.get("cached").?.bool);
+    try std.testing.expectEqual(isFullyCached(r), object.get("cached").?.bool);
     try std.testing.expectEqualStrings(cacheStatus(r), object.get("cache_status").?.string);
     try std.testing.expectEqual(@as(i64, @intCast(r.cached_segments)), object.get("cached_segments").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(r.total_segments)), object.get("total_segments").?.integer);
