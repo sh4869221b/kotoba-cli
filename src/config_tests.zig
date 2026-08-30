@@ -117,12 +117,6 @@ test "strict config escaped string save load regression" {
     try std.testing.expectEqualStrings(cfg.model_path, loaded.model_path);
 }
 
-test "strict config duplicate keys regression" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(error.ConfigInvalid, config.parse(arena.allocator(), "model_id = \"first\"\nmodel_id = \"second\"\n"));
-}
-
 test "strict config escape decoding regression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

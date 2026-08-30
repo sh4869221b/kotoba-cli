@@ -5,31 +5,25 @@ const text = @import("text.zig");
 
 pub const Kind = enum { text, markdown };
 
-pub const ReadResult = struct {
-    text: []const u8,
-    kind: Kind,
-    file_path: ?[]const u8 = null,
-};
-
-pub fn read(allocator: std.mem.Allocator, direct_text: ?[]const u8, file_path: ?[]const u8) !ReadResult {
+pub fn read(allocator: std.mem.Allocator, direct_text: ?[]const u8, file_path: ?[]const u8) ![]u8 {
     if (direct_text != null and file_path != null) return errors.Error.InvalidArguments;
     if (direct_text) |t| {
         try text.validate(t);
         if (t.len == 0) return errors.Error.InvalidArguments;
-        return .{ .text = try allocator.dupe(u8, t), .kind = .text };
+        return try allocator.dupe(u8, t);
     }
     if (file_path) |p| {
         const data = try sys.readFileAlloc(allocator, p, 64 * 1024 * 1024);
         errdefer allocator.free(data);
         try text.validate(data);
         if (data.len == 0) return errors.Error.InvalidArguments;
-        return .{ .text = data, .kind = if (isMarkdown(p)) .markdown else .text, .file_path = p };
+        return data;
     }
     const stdin = try sys.readStdinAlloc(allocator, 64 * 1024 * 1024);
     errdefer allocator.free(stdin);
     try text.validate(stdin);
     if (stdin.len == 0) return errors.Error.InvalidArguments;
-    return .{ .text = stdin, .kind = .text };
+    return stdin;
 }
 
 pub fn isMarkdown(path: []const u8) bool {
@@ -47,9 +41,8 @@ test "input text contract preserves direct and file bytes" {
     const allocator = std.testing.allocator;
 
     const direct = try read(allocator, "こんにちは😀", null);
-    defer allocator.free(direct.text);
-    try std.testing.expectEqual(Kind.text, direct.kind);
-    try std.testing.expectEqualStrings("こんにちは😀", direct.text);
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("こんにちは😀", direct);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -60,10 +53,8 @@ test "input text contract preserves direct and file bytes" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.md", .data = "e\u{301}" });
 
     const file = try read(allocator, null, path);
-    defer allocator.free(file.text);
-    try std.testing.expectEqual(Kind.markdown, file.kind);
-    try std.testing.expectEqualStrings("e\u{301}", file.text);
-    try std.testing.expectEqualStrings(path, file.file_path.?);
+    defer allocator.free(file);
+    try std.testing.expectEqualStrings("e\u{301}", file);
 }
 
 test "input text contract rejects invalid direct and file bytes" {

@@ -23,22 +23,9 @@ pub const ArgCursor = struct {
         return val;
     }
 
-    pub fn flag(self: *ArgCursor, name: []const u8) bool {
-        if (self.index >= self.args.len) return false;
-        if (std.mem.eql(u8, self.args[self.index], name)) {
-            self.index += 1;
-            return true;
-        }
-        return false;
-    }
-
     pub fn peek(self: ArgCursor) ?[]const u8 {
         if (self.index >= self.args.len) return null;
         return self.args[self.index];
-    }
-
-    pub fn remaining(self: ArgCursor) []const []const u8 {
-        return self.args[self.index..];
     }
 };
 
