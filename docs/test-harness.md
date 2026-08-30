@@ -258,8 +258,8 @@ mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$
 mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The final Issue #63 matrix run records 364 measured CLI cases: translate 46,
-commands 251, memory 22, files 45. Counts come from each run's `summary.json`; never
+The final Issue #63 matrix run records 365 measured CLI cases: translate 46,
+commands 251, memory 23, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
@@ -272,7 +272,9 @@ not check whether its configured model file exists.
 
 Each `cli-matrix.*/cases/ID/receipt.json` identifies `level=cli`, group, actual
 argv array, executable profile and SHA-256, stdin SHA-256, process status,
-raw stdout/stderr, before/after FS and TM snapshots, and assertion verdicts.
+raw stdout/stderr, stdout sink, before/after FS and TM snapshots, and assertion verdicts.
+`tm-broken-stdout-pipe` records a closed pipe read end before producer exec and
+the direct producer return code; it never substitutes a consumer's status.
 Captured paths are relative to the case evidence directory; executable and
 fixture paths describe the original, subsequently removed temporary tree.
 FS entries are sorted relative paths with type, mode, symlink target or content
@@ -377,6 +379,7 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-translate-{invalid-human,conflicting-inputs,unsupported-pair,absent-config,no-selection,cpu-model-missing}` | 2 invalid/conflicting; otherwise 1, exact respective error; CPU missing file is `model_missing`, distinct from `model_not_selected` | No FS/TM changes |
 | `commands-{models-list-absent,models-invalid-absent,models-list-arity-absent,memory-status-absent-db,memory-invalid-absent-db}`; `commands-translate-unknown-token` | List/status 0, invalid/arity and unknown initial option 2 | Inspection and rejected argv preserve absent state; model list uses an in-memory default registry without writes |
 | `tm-{miss,full-hit,partial-hit}` | 0; parsed JSON; partial has `cached_segments=1,total_segments=3` (two paragraphs plus separator) | Miss +1 row; full +0 rows / hit +1; partial +1 row / prior hit +1 |
+| `tm-broken-stdout-pipe` | 1; read end closed before exec, empty stdout, exact `kotoba: io_error: BrokenPipe` stderr; receipt records producer return/status, not a consumer status | TM commits the accepted `Matrix broken stdout pipe` -> `JA:Matrix broken stdout pipe` row before stdout failure; row count is 1 |
 | `tm-disabled-{flag,config}`; `tm-{directory-open-failure,corrupt-open-failure,statement-failure}` | Disabled/open failure 0 uncached, empty warnings; incompatible table 1 with parsed `sqlite_failed`; empty stderr | Disabled sentinel unchanged; invalid DB/directory unchanged, no replacement or new translation |
 | `glossary-{prefer,protect,hash-change,disabled-flag,disabled-config,empty-key-reuse,empty-key-reuse-config}` | 0; parsed JSON; no deterministic glossary substitution claim | Hash change/disable uses distinct key; disabled empty-glossary key reuse hits |
 | `glossary-invalid-before-tm{,-absent}` | 1; parsed `glossary_invalid`, empty stderr | Existing sentinel or absent DB stays unchanged |
@@ -426,7 +429,7 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |
-| gap | Broken stdout is not fully CLI covered; valid control-byte JSON coverage does not prove stdout-failure handling | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
+| covered | `tm-broken-stdout-pipe` closes the stdout read end before the real CLI producer exec, fixes producer exit/status and captured streams, and verifies the committed accepted TM row remains after `BrokenPipe` | [#13](https://github.com/sh4869221b/kotoba-cli/issues/13) |
 | bounded | Issue #25 covers normal write/flush/sync/checked-close/rename failures through a same-parent stage. Native RLIMIT CLI failure and real component prefix bytes are distinct from injected late boundaries. It does not promise TM rollback, directory fsync/power-loss durability, process-kill cleanup, or adversarial same-UID stage-tampering protection. | [#25](https://github.com/sh4869221b/kotoba-cli/issues/25) |
 | gap | Rejecting token-limited results: `max_tokens` currently succeeds and caches | [#31](https://github.com/sh4869221b/kotoba-cli/issues/31) |
 | covered | Rejected argv and read-only commands preserve absent state; unknown initial options are rejected. This does not establish concurrent-writer safety. | [#32](https://github.com/sh4869221b/kotoba-cli/issues/32) |
