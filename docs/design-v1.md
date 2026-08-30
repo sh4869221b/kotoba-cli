@@ -83,9 +83,14 @@ supported values semantically while rejecting malformed, unknown, duplicate,
 and unsupported schema data. Missing state remains distinct from parse,
 schema, native I/O, and allocation failures. The document also records the
 existing canonical URL exception and the preflight boundary for state-changing
-commands. This persistence contract does not promise full TOML conformance,
-atomic config/registry writes, locking, rollback, or crash durability. Translation
-output files use the separate staged-publication contract below.
+commands. Each `config.toml` and `models.toml` file is published independently
+by same-parent per-file atomic replacement: Kotoba writes a complete exclusive
+sibling stage, flushes it, syncs the file, closes it with checked errors, and
+then replaces the destination entry. This does not fsync the parent directory
+or promise power-loss durability or recovery. The two files are not one
+cross-file transaction: no rollback is attempted, and no inter-process locking
+is provided.
+Translation output files use the separate staged-publication contract below.
 
 Read-only memory and doctor checks preflight databases without concurrent
 writers before opening SQLite. WAL mode and `-wal`/`-shm` sidecars, along with

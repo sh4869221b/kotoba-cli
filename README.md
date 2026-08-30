@@ -209,9 +209,14 @@ it with defaults. Missing files remain distinct from parse, schema, native I/O,
 and allocation failures. See the complete
 [strict persistence TOML contract](docs/strict-toml.md) for the field tables,
 accepted syntax, manual repair guidance, canonical URL behavior, and mutation
-preflight boundary. The persistence contract does not promise full TOML support,
-atomic config/registry writes, rollback, locking, or crash durability. Translation
-output files use the separate staged-publication contract described above.
+preflight boundary. Each `config.toml` and `models.toml` file is published
+independently by same-parent per-file atomic replacement: Kotoba writes a
+complete exclusive sibling stage, flushes it, syncs the file, closes it with
+checked errors, and then replaces the destination entry. This does not fsync the
+parent directory or promise power-loss durability or recovery. The two files
+are not one cross-file transaction: no rollback is attempted, and no
+inter-process locking is provided. Translation output files use the separate
+staged-publication contract described above.
 
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
 before opening SQLite when examining a database without concurrent writers.

@@ -310,14 +310,13 @@ pub fn save(path: []const u8, cfg: Config) !void {
 }
 
 fn saveWithOptions(path: []const u8, cfg: Config, options: sys.StagedFileOptions) !void {
-    _ = options;
     var out = strict.Buffer.init(std.heap.page_allocator);
     defer out.deinit();
     appendConfig(&out, cfg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ConfigInvalid,
     };
-    try sys.writeFile(path, out.items);
+    try sys.atomicWriteFile(std.heap.page_allocator, path, out.items, options);
 }
 
 fn appendConfig(out: *strict.Buffer, cfg: Config) !void {

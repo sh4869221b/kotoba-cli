@@ -56,12 +56,11 @@ pub fn ensure(path: []const u8) !void {
 }
 
 fn ensureWithOptions(path: []const u8, options: sys.StagedFileOptions) !void {
-    _ = options;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var owner = load(arena.allocator(), path) catch |err| switch (err) {
         error.NotInitialized => {
-            try sys.writeFile(path, defaultTemplate());
+            try sys.atomicWriteFile(std.heap.page_allocator, path, defaultTemplate(), options);
             return;
         },
         else => return err,
@@ -238,7 +237,6 @@ fn saveWithAllocator(allocator: std.mem.Allocator, path: []const u8, list: List)
 }
 
 fn saveWithAllocatorAndOptions(allocator: std.mem.Allocator, path: []const u8, list: List, options: sys.StagedFileOptions) !void {
-    _ = options;
     var out = strict.Buffer.init(allocator);
     defer out.deinit();
     validateModels(out.allocator, list) catch |err| switch (err) {
@@ -249,7 +247,7 @@ fn saveWithAllocatorAndOptions(allocator: std.mem.Allocator, path: []const u8, l
     for (list.models) |m| {
         try appendModel(&out, m);
     }
-    try sys.writeFile(path, out.items);
+    try sys.atomicWriteFile(allocator, path, out.items, options);
 }
 
 fn validateModels(allocator: std.mem.Allocator, list: List) !void {
