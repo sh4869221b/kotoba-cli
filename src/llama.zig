@@ -121,11 +121,6 @@ const Sampler = struct {
     }
 };
 
-pub const BackendGuard = Backend;
-pub const ModelGuard = Model;
-pub const ContextGuard = Context;
-pub const SamplerGuard = Sampler;
-
 const AbortGuard = struct {
     allocator: std.mem.Allocator,
     state: *AbortState,
@@ -465,13 +460,6 @@ test "diagnostics callbacks can be toggled without model load" {
     quiet.deinit();
     const enabled = DiagnosticsGuard.init(true);
     enabled.deinit();
-}
-
-test "FFI resources expose guard wrappers" {
-    try std.testing.expect(@hasDecl(@This(), "ModelGuard"));
-    try std.testing.expect(@hasDecl(@This(), "ContextGuard"));
-    try std.testing.expect(@hasDecl(@This(), "SamplerGuard"));
-    try std.testing.expect(@hasDecl(@This(), "DiagnosticsGuard"));
 }
 
 test "decode status classification preserves timeout precedence" {
