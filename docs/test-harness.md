@@ -213,11 +213,11 @@ The CI driver is separate from that local default: `integration --suite` accepts
 parallel rounds. Its workflow runs smoke, matrix, and parallel as three child
 jobs, then accepts the required aggregate only when every child is `success`.
 Pull requests configure one parallel round; `master` pushes and manual dispatch
-configure two. Current exact-SHA local counts come from the matrix and parallel
-`summary.json` receipts. A two-round parallel receipt records 18 children, eight
-unit logs, two benchmarks, 30 benchmark measurements, the observed unit-test
-execution total, and four full matrix receipts. These observations do not
-prove a hosted schedule or run.
+configure two. Current exact-SHA local receipts observed 367 matrix cases
+(48 translate, 251 commands, 23 memory, 45 files); a two-round parallel receipt
+observed 18 children, eight unit logs, two benchmarks, 30 benchmark measurements,
+2,624 unit-test executions, and four 367-case matrix receipts. These observations
+do not prove a hosted schedule or run.
 
 Run it with an absolute evidence directory:
 
@@ -258,7 +258,8 @@ mise exec -- bash test/integration/cli_matrix.sh --group files --evidence-dir "$
 mise exec -- bash test/integration/cli_matrix.sh --self-test --evidence-dir "$PWD/.omo/evidence/helpers"
 ```
 
-The current matrix counts come from each run's `summary.json`; never
+The current matrix records 367 measured CLI cases: translate 48,
+commands 251, memory 23, files 45. Counts come from each run's `summary.json`; never
 infer a pass from a historical total. Setup calls are captured separately,
 not counted as cases.
 Every selected group must run at least one case; missing files, duplicate IDs,
