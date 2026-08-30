@@ -183,12 +183,12 @@ fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u
         });
         const out = try output_module.jsonLineAlloc(allocator, .{ .ok = ok, .checks = rendered_checks.items });
         defer allocator.free(out);
-        sys.stdoutWrite(out);
+        try sys.stdoutWrite(out);
     } else {
         for (checks) |check| {
-            sys.stdoutPrint("{s}: {s}: ", .{ @tagName(check.status), check.name });
-            writeHumanOneLine(try diagnosticText(allocator, check.message));
-            sys.stdoutWrite("\n");
+            try sys.stdoutPrint("{s}: {s}: ", .{ @tagName(check.status), check.name });
+            try writeHumanOneLine(try diagnosticText(allocator, check.message));
+            try sys.stdoutWrite("\n");
         }
     }
     return if (ok) 0 else 1;
@@ -238,14 +238,14 @@ fn diagnosticText(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return escaped.toOwnedSlice();
 }
 
-fn writeHumanOneLine(value: []const u8) void {
+fn writeHumanOneLine(value: []const u8) !void {
     const hex = "0123456789abcdef";
     for (value) |byte| switch (byte) {
-        '\n' => sys.stdoutWrite("\\n"),
-        '\r' => sys.stdoutWrite("\\r"),
-        '\t' => sys.stdoutWrite("\\t"),
-        0...8, 11...12, 14...31, 127 => sys.stdoutPrint("\\u00{c}{c}", .{ hex[byte >> 4], hex[byte & 0x0f] }),
-        else => sys.stdoutWrite(&.{byte}),
+        '\n' => try sys.stdoutWrite("\\n"),
+        '\r' => try sys.stdoutWrite("\\r"),
+        '\t' => try sys.stdoutWrite("\\t"),
+        0...8, 11...12, 14...31, 127 => try sys.stdoutPrint("\\u00{c}{c}", .{ hex[byte >> 4], hex[byte & 0x0f] }),
+        else => try sys.stdoutWrite(&.{byte}),
     };
 }
 

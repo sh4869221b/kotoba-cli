@@ -35,10 +35,12 @@ pub fn main(init: std.process.Init) !void {
         const args = try init.minimal.args.toSlice(argv_arena.allocator());
         break :blk cli.run(allocator, args) catch |err| err_blk: {
             const app_err = errors.fromError(err);
+            // Diagnostic delivery is best-effort after command failure: keep the
+            // original exit code and never recurse when its sink also fails.
             if (cli.errorPrefersJson(args)) {
                 errors.writeJson(app_err) catch {};
             } else {
-                errors.printHuman(app_err);
+                errors.printHuman(app_err) catch {};
             }
             break :err_blk app_err.exitCode();
         };

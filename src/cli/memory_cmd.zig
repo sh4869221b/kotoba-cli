@@ -20,7 +20,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             defer db.close();
             break :rows try db.count();
         };
-        sys.stdoutPrint("path: {s}\nrows: {d}\n", .{ paths.memory_file, rows });
+        try sys.stdoutPrint("path: {s}\nrows: {d}\n", .{ paths.memory_file, rows });
         return 0;
     }
     if (std.mem.eql(u8, cmd_args[0], "clear")) {

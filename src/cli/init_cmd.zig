@@ -38,8 +38,8 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     defer list_owner.deinit();
     const list = list_owner.view();
     if (!yes and model_id.len == 0 and model_path.len == 0) {
-        printInitChoices(list);
-        sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});
+        try printInitChoices(list);
+        try sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});
         return errors.Error.InvalidArguments;
     }
     var selected_registry_model: ?models.Model = null;
@@ -49,7 +49,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             if (m.path.len > 0 and sys.exists(m.path)) {
                 model_path = m.path;
             } else {
-                sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{});
+                try sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{});
                 return errors.Error.ModelMissing;
             }
         } else return errors.Error.InvalidArguments;
@@ -84,7 +84,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
-    sys.stdoutPrint("initialized\n", .{});
+    try sys.stdoutPrint("initialized\n", .{});
     return 0;
 }
 
@@ -105,13 +105,13 @@ test "init validates selections before creating XDG state" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "kotoba", .{}));
 }
 
-fn printInitChoices(list: models.List) void {
-    sys.stdoutPrint("Model choices:\n", .{});
+fn printInitChoices(list: models.List) !void {
+    try sys.stdoutPrint("Model choices:\n", .{});
     for (list.models) |m| {
         if (m.recommended and m.download_url.len > 0 and m.checksum.len > 0) {
-            sys.stdoutPrint("- {s}: {s} (requires `models pull` first)\n", .{ m.id, m.name });
+            try sys.stdoutPrint("- {s}: {s} (requires `models pull` first)\n", .{ m.id, m.name });
         }
     }
-    sys.stdoutPrint("- custom: provide --model-path PATH\n", .{});
-    sys.stdoutPrint("- later: use --yes to configure model_path later\n", .{});
+    try sys.stdoutPrint("- custom: provide --model-path PATH\n", .{});
+    try sys.stdoutPrint("- later: use --yes to configure model_path later\n", .{});
 }

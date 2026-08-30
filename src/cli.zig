@@ -23,7 +23,7 @@ pub fn run(allocator: std.mem.Allocator, args_slice: []const []const u8) !u8 {
     if (std.mem.eql(u8, cmd, "version")) {
         if (args_slice.len != 2) return errors.Error.InvalidArguments;
         const sys = @import("sys.zig");
-        sys.stdoutPrint("kotoba {s}\n", .{version});
+        try sys.stdoutPrint("kotoba {s}\n", .{version});
         return 0;
     }
     if (!std.mem.eql(u8, cmd, "init") and
@@ -207,6 +207,54 @@ test "ownership/commands invocation arena OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseCommandArenaOom, .{ paths, stdout, stderr, &runs });
     try std.testing.expect(runs > 1);
     std.debug.print("ownership/commands OOM exercise_invocations={d} command=config-get streams=restored\n", .{runs});
+}
+
+test "translate reports primary stdout failure after retaining accepted memory row" {
+    if (!@import("build_options").test_backend) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const paths = try testCommandPaths(allocator, root);
+    try prepareCommandFixture(allocator, paths);
+    const full = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/full", .{ .mode = .write_only });
+    defer full.close(std.testing.io);
+    const stderr = try tmp.dir.createFile(std.testing.io, "stderr", .{});
+    defer stderr.close(std.testing.io);
+    var capture = try TestStreamCapture.start(full, stderr);
+    defer capture.restore();
+
+    const result = translate_cmd.run(allocator, paths, &.{ "accepted", "--from", "en", "--to", "ja", "--no-glossary" });
+    try std.testing.expectError(error.NoSpaceLeft, result);
+    capture.restore();
+    var db = try memory.openReadOnly(allocator, paths.memory_file);
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 1), try db.count());
+}
+
+test "translation memory open failure emits no success stdout" {
+    if (!@import("build_options").test_backend) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var paths = try testCommandPaths(allocator, root);
+    try prepareCommandFixture(allocator, paths);
+    paths.memory_file = root;
+    const stdout = try tmp.dir.createFile(std.testing.io, "stdout", .{});
+    defer stdout.close(std.testing.io);
+    const stderr = try tmp.dir.createFile(std.testing.io, "stderr", .{});
+    defer stderr.close(std.testing.io);
+    var capture = try TestStreamCapture.start(stdout, stderr);
+    defer capture.restore();
+
+    try std.testing.expectError(errors.Error.SqliteFailed, translate_cmd.run(allocator, paths, &.{ "rejected", "--from", "en", "--to", "ja", "--no-glossary" }));
+    capture.restore();
+    try std.testing.expectEqual(@as(u64, 0), (try tmp.dir.statFile(std.testing.io, "stdout", .{})).size);
 }
 
 test "ownership/commands repeated calls" {

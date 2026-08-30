@@ -73,11 +73,11 @@ pub fn cacheStatus(r: Result) []const u8 {
 
 pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
     switch (fmt) {
-        .plain, .markdown => sys.stdoutPrint("{s}\n", .{r.translated_text}),
+        .plain, .markdown => try sys.stdoutPrint("{s}\n", .{r.translated_text}),
         .json => {
             const json = try renderJson(std.heap.page_allocator, r, include_source);
             defer std.heap.page_allocator.free(json);
-            sys.stdoutWrite(json);
+            try sys.stdoutWrite(json);
         },
     }
 }

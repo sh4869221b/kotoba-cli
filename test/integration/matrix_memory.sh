@@ -189,7 +189,8 @@ matrix_memory() {
         fi ;;
       tm-disabled-flag) flags=(--no-memory) ;;
       tm-disabled-config) printf 'memory_enabled = false\n' >>"$XDG_CONFIG_HOME/kotoba/config.toml" ;;
-      tm-statement-failure) error_code=sqlite_failed; error_message='SQLite translation memory operation failed.' ;;
+      tm-directory-open-failure|tm-corrupt-open-failure|tm-statement-failure)
+        error_code=sqlite_failed; error_message='SQLite translation memory operation failed.' ;;
       glossary-prefer) matrix_memory_glossary prefer 'command line' ;;
       glossary-protect) matrix_memory_glossary protect 'command line'; after='[["Matrix glossary CLI",0,"protect"]]' ;;
       glossary-hash-change|glossary-disabled-flag|glossary-disabled-config)

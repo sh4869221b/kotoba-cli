@@ -12,6 +12,6 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     var g_owner = try glossary.load(allocator, paths.glossary_file);
     defer g_owner.deinit();
     const g = g_owner.view();
-    sys.stdoutPrint("terms: {d}\nhash: {x}\n", .{ g.terms.len, glossary.hash(g) });
+    try sys.stdoutPrint("terms: {d}\nhash: {x}\n", .{ g.terms.len, glossary.hash(g) });
     return 0;
 }

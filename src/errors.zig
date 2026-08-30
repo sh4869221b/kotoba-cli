@@ -153,15 +153,15 @@ test "text encoding error mapping" {
     }
 }
 
-pub fn printHuman(app_err: AppError) void {
-    sys.stderrPrint("kotoba: {s}: {s}\n", .{ app_err.code.asText(), app_err.message });
+pub fn printHuman(app_err: AppError) !void {
+    try sys.stderrPrint("kotoba: {s}: {s}\n", .{ app_err.code.asText(), app_err.message });
 }
 
 pub fn writeJson(app_err: AppError) !void {
     try text.validate(app_err.message);
     const rendered = try output.jsonLineAlloc(std.heap.page_allocator, .{ .@"error" = .{ .code = app_err.code.asText(), .message = app_err.message } });
     defer std.heap.page_allocator.free(rendered);
-    sys.stdoutWrite(rendered);
+    try sys.stdoutWrite(rendered);
 }
 
 test "error JSON safely round trips every variable text byte" {
