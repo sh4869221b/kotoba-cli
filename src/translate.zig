@@ -30,11 +30,6 @@ pub const Options = struct {
     debug: bool = false,
 };
 
-pub const ReadInputResult = struct {
-    text: []const u8,
-    kind: input.Kind,
-};
-
 pub const ProtectedSource = struct {
     text: []const u8,
     doc: ?markdown.Document,
@@ -73,17 +68,18 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     defer call_arena.deinit();
     const allocator = call_arena.allocator();
 
-    const read = try readInput(allocator, opts);
-    defer allocator.free(read.text);
+    const source_text = try input.read(allocator, opts.text, opts.file_path);
+    defer allocator.free(source_text);
+    const read_kind = readKindForOptions(opts.format, opts.file_path);
     var glossary_owner: ?glossary.OwnedGlossary = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else null;
     defer if (glossary_owner) |*owner| owner.deinit();
     const g = if (glossary_owner) |*owner| owner.view() else glossary.Glossary{ .terms = &.{} };
-    const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, read.text);
+    const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, source_text);
     const mode = opts.mode orelse cfg.default_mode;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     defer warnings.deinit();
 
-    var protected = try protectMarkdown(allocator, read.text, read.kind);
+    var protected = try protectMarkdown(allocator, source_text, read_kind);
     defer protected.deinit(allocator);
 
     const segments = try segment.splitParagraphs(allocator, protected.text);
@@ -128,7 +124,7 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
         .translated_text = final_text,
         .warnings = warnings.items,
         .elapsed_ms = elapsed,
-        .source_text = read.text,
+        .source_text = source_text,
     });
 }
 
@@ -164,12 +160,6 @@ test "ownership/translation result survives reset" {
     try std.testing.expectEqualStrings("JA:Hello", independent.view().translated_text);
     try serializeOwnershipResults((&independent)[0..1]);
     std.debug.print("ownership/translation lifetime model_mutation=independent input_config=reset+reused+destroyed serialization=equal\n", .{});
-}
-
-pub fn readInput(allocator: std.mem.Allocator, opts: Options) !ReadInputResult {
-    const read_result = try input.read(allocator, opts.text, opts.file_path);
-    const read_kind = readKindForOptions(opts.format, opts.file_path);
-    return .{ .text = read_result.text, .kind = read_kind };
 }
 
 pub fn protectMarkdown(allocator: std.mem.Allocator, source_text: []const u8, read_kind: input.Kind) !ProtectedSource {
@@ -304,13 +294,6 @@ test "explicit markdown format controls read kind" {
     try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.markdown, "notes.txt"));
     try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(null, "notes.md"));
     try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.plain, "notes.md"));
-}
-
-test "readInput reads text and resolves kind" {
-    const result = try readInput(std.testing.allocator, .{ .text = "hello world", .format = .markdown });
-    defer std.testing.allocator.free(result.text);
-    try std.testing.expectEqual(input.Kind.markdown, result.kind);
-    try std.testing.expectEqualStrings("hello world", result.text);
 }
 
 test "protectMarkdown protects markdown source" {
