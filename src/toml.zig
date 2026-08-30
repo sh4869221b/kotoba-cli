@@ -19,17 +19,6 @@ pub fn unquote(value: []const u8) []const u8 {
     return v;
 }
 
-pub fn boolValue(value: []const u8) ?bool {
-    const v = trim(value);
-    if (std.mem.eql(u8, v, "true")) return true;
-    if (std.mem.eql(u8, v, "false")) return false;
-    return null;
-}
-
-pub fn intValue(value: []const u8) ?u32 {
-    return std.fmt.parseInt(u32, trim(value), 10) catch null;
-}
-
 pub fn signedIntValue(value: []const u8) ?i32 {
     return std.fmt.parseInt(i32, trim(value), 10) catch null;
 }
@@ -41,19 +30,4 @@ pub fn pair(line: []const u8) ?Pair {
     if (clean.len == 0 or clean[0] == '[') return null;
     const idx = std.mem.indexOfScalar(u8, clean, '=') orelse return null;
     return .{ .key = trim(clean[0..idx]), .value = trim(clean[idx + 1 ..]) };
-}
-
-pub fn stringArrayContains(value: []const u8, needle: []const u8) bool {
-    const v = trim(value);
-    if (v.len < 2 or v[0] != '[') return false;
-    var inner = v[1 .. v.len - 1];
-    while (inner.len > 0) {
-        inner = trim(inner);
-        const comma = std.mem.indexOfScalar(u8, inner, ',') orelse inner.len;
-        const item = unquote(trim(inner[0..comma]));
-        if (std.mem.eql(u8, item, needle)) return true;
-        if (comma == inner.len) break;
-        inner = inner[comma + 1 ..];
-    }
-    return false;
 }
