@@ -246,7 +246,7 @@ test "strict config accepts every enum and integer endpoints" {
     inline for (.{ "plain", "json", "markdown" }) |value| {
         var owner = try config.parse(allocator, "default_output='" ++ value ++ "'");
         defer owner.deinit();
-        try std.testing.expectEqual(try config.OutputFormat.parse(value), owner.view().default_output);
+        try std.testing.expectEqual(try config.OutputRenderer.parse(value), owner.view().default_output);
     }
     inline for (.{ "context_length", "threads", "max_tokens", "timeout_sec" }) |key| {
         inline for (.{ "0", "+0", "4294967295" }) |value| {

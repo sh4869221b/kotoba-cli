@@ -214,6 +214,18 @@ PY
     matrix_translate_state
     matrix_finish
   done
+
+  for option in input adapter; do
+    matrix_translate_fixture "unsupported-$option-option"
+    printf 'kotoba: invalid_arguments: Invalid arguments.\n' >"$CASE_DIR/expected.stderr"
+    matrix_run translate Hello "--$option" fixture --from en --to ja --no-memory
+    matrix_assert status 2
+    matrix_assert stdout "$CASE_DIR/empty"
+    matrix_assert stderr "$CASE_DIR/expected.stderr"
+    matrix_assert fs-equal
+    matrix_translate_state
+    matrix_finish
+  done
 }
 
 matrix_translate_text_contract() {

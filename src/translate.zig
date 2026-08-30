@@ -368,11 +368,26 @@ fn writeOutputWithOptions(allocator: std.mem.Allocator, res: output.Result, read
     return true;
 }
 
-test "explicit markdown format controls read kind" {
-    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.markdown, null));
-    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.markdown, "notes.txt"));
-    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(null, "notes.md"));
-    try std.testing.expectEqual(input.Kind.markdown, readKindForOptions(.plain, "notes.md"));
+test "auto input kind detects markdown extension" {
+    try std.testing.expectEqual(input.InputKind.markdown, resolveInputKind(.auto, "notes.md"));
+    try std.testing.expectEqual(input.InputKind.markdown, resolveInputKind(.auto, "notes.markdown"));
+    try std.testing.expectEqual(input.InputKind.text, resolveInputKind(.auto, "notes.txt"));
+}
+
+test "input output and adapter contracts are distinct types" {
+    const input_kind: input.InputKind = .adapter;
+    const renderer: config.OutputRenderer = .plain;
+    const adapter = input.AdapterId{ .value = "fixture" };
+    try std.testing.expect(@TypeOf(input_kind) != @TypeOf(renderer));
+    try std.testing.expect(@TypeOf(adapter) != @TypeOf(renderer));
+}
+
+test "explicit input kind overrides extension and auto is deterministic" {
+    try std.testing.expectEqual(input.InputKind.text, resolveInputKind(.text, "notes.md"));
+    try std.testing.expectEqual(input.InputKind.markdown, resolveInputKind(.markdown, "notes.txt"));
+    try std.testing.expectEqual(input.InputKind.markdown, resolveInputKind(.auto, "notes.md"));
+    try std.testing.expectEqual(input.InputKind.text, resolveInputKind(.auto, "notes.txt"));
+    try std.testing.expectEqual(input.InputKind.text, resolveInputKind(.auto, null));
 }
 
 test "protectMarkdown protects markdown source" {

@@ -77,5 +77,7 @@ test "translate rejects invalid argv before configuration or memory access" {
     var paths: xdg.Paths = undefined;
     paths.config_file = "missing/config.toml";
     try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--bogus", "--from", "en", "--to", "ja" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--input", "text", "Hello" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--adapter", "fixture", "Hello" }));
     try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "Hello", "--file", "input.txt" }));
 }
