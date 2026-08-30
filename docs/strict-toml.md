@@ -234,9 +234,13 @@ cleaned on every error path. Allocation failure remains `OutOfMemory`.
 Parsing and writing preserve data semantics, not source formatting. Comments,
 blank-line placement, quote style, key order, line endings, and other layout
 choices are not preserved. A successful write emits canonical field order,
-basic strings, LF endings, and registry language order. The writer does not
-promise atomic replacement, rollback, locking, crash safety, or durability;
-those are separate persistence concerns.
+basic strings, LF endings, and registry language order. Each configuration or
+registry file is published independently through a complete exclusive sibling
+stage in its parent directory: the stage is flushed, synced, checked closed,
+and then atomically replaces the destination entry. This is bounded per-file
+publication only. It does not fsync the parent directory, promise power-loss
+durability or recovery, coordinate config and registry as one transaction,
+provide rollback, or provide inter-process locking.
 
 For a canonical supported model `M`, the invariant is:
 
@@ -285,9 +289,11 @@ invalid or missing state. The existing size limits remain 1 MiB for config and
 2 MiB for the registry.
 
 `ensure` validates an existing registry without writing and creates the default
-template only when the registry is actually absent. Concurrent creation races
-remain outside this contract. Read-only model list and verify may use an
-in-memory default only for absent registry state.
+template only when the registry is actually absent. Its creation publication is
+no-replace: if another writer creates any destination entry after absence was
+observed, `ensure` returns `DestinationExists` and preserves that writer's
+bytes. Read-only model list and verify may use an in-memory default only for
+absent registry state.
 
 Before a state-changing operation, valid configuration and registry state is
 loaded before directories are created, files are copied or downloaded, files
@@ -332,7 +338,8 @@ cases require an ordinary non-root UID, deny reads only while the measured
 child runs, and record restoration separately from snapshots. See the
 [CLI matrix contract](test-harness.md#cli-contract-matrix) for capture and
 cleanup details. Component tests additionally cover finite f32 bit equality,
-parser tables, allocation failures, and canonical URL byte stability; CLI
-receipts do not stand in for those component guarantees. No check here claims
-real-model translation quality, external transfer success, atomic replacement,
-or transaction safety.
+parser tables, allocation failures, canonical URL byte stability, and bounded
+per-file publication; CLI receipts do not stand in for those component
+guarantees. No check here claims real-model translation quality, external
+transfer success, directory-fsync or power-loss durability, or cross-file
+transaction safety.

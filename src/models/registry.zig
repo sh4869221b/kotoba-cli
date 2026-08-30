@@ -55,12 +55,29 @@ pub fn ensure(path: []const u8) !void {
     return ensureWithOptions(path, .{});
 }
 
+const EnsurePublishHook = struct {
+    context: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+};
+
 fn ensureWithOptions(path: []const u8, options: sys.StagedFileOptions) !void {
+    return ensureWithOptionsAndPublishHook(path, options, null);
+}
+
+fn ensureWithOptionsAndPublishHook(path: []const u8, options: sys.StagedFileOptions, before_publish: ?EnsurePublishHook) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var owner = load(arena.allocator(), path) catch |err| switch (err) {
         error.NotInitialized => {
-            try sys.atomicWriteFile(std.heap.page_allocator, path, defaultTemplate(), options);
+            var publication_options = options;
+            publication_options.mode = .no_replace;
+            var pending = try staged_output.begin(std.heap.page_allocator, sys.io(), sys.cwd(), path, publication_options);
+            defer pending.deinit();
+            try pending.writeAll(defaultTemplate());
+            var finished = try pending.finish();
+            defer finished.deinit();
+            if (before_publish) |hook| try hook.call(hook.context);
+            try finished.publish(publication_options.mode);
             return;
         },
         else => return err,
@@ -326,6 +343,30 @@ fn testExpectOnlyRegistryEntries(dir: std.Io.Dir, existing: bool) !void {
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, if (existing) 2 else 1), count);
+}
+
+test "atomic registry ensure preserves a registry published after absence" {
+    const Competitor = struct {
+        dir: std.Io.Dir,
+
+        fn publish(context: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try self.dir.writeFile(std.testing.io, .{ .sub_path = "models.toml", .data = "concurrent registry bytes\n" });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "models.toml" });
+    defer std.testing.allocator.free(path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sibling", .data = "unrelated" });
+    var competitor = Competitor{ .dir = tmp.dir };
+    try std.testing.expectError(error.DestinationExists, ensureWithOptionsAndPublishHook(path, .{}, .{ .context = &competitor, .call = Competitor.publish }));
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "models.toml", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("concurrent registry bytes\n", bytes);
+    try testExpectOnlyRegistryEntries(tmp.dir, true);
 }
 
 test "atomic registry ensure keeps a missing registry absent through publication failures" {
@@ -1292,10 +1333,7 @@ fn exerciseRegistryMutation(backing: std.mem.Allocator, scenario: MutationCase, 
     if (read_only_existing) try tmp.dir.setFilePermissions(std.testing.io, "models.toml", .fromMode(0o400), .{});
     switch (scenario) {
         .append, .replace, .save_upsert => {
-            upsert(allocator, path, .{ .id = if (scenario == .append) "new" else "same", .name = "replacement" }) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return err;
-            };
+            try upsert(allocator, path, .{ .id = if (scenario == .append) "new" else "same", .name = "replacement" });
         },
         .remove, .missing, .save_remove => {
             var removed = removeById(allocator, path, if (scenario == .missing) "absent" else "same") catch |err| {
