@@ -26,7 +26,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             opts.mode = try config.Mode.parse(try cursor.requireValue());
         } else if (std.mem.eql(u8, a, "--format")) {
             _ = cursor.nextValue();
-            opts.format = try config.OutputFormat.parse(try cursor.requireValue());
+            opts.output_renderer = try config.OutputRenderer.parse(try cursor.requireValue());
         } else if (std.mem.eql(u8, a, "--include-source")) {
             _ = cursor.nextValue();
             opts.include_source = true;
@@ -56,6 +56,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         }
     }
     if (opts.text != null and opts.file_path != null) return errors.Error.InvalidArguments;
+    if (opts.output_renderer == .markdown) opts.input_kind = .markdown;
     var owned_config = try config.load(allocator, paths.config_file);
     defer owned_config.deinit();
     const cfg = owned_config.view();
@@ -63,13 +64,13 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         // Debug notice delivery is auxiliary; primary command output remains fallible.
         sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{}) catch {};
     }
-    const kind = translate.readKindForOptions(opts.format, opts.file_path);
+    const kind = translate.resolveInputKind(opts.input_kind, opts.file_path);
     var result_owner = try translate.run(original_allocator, paths, cfg, opts);
     defer result_owner.deinit();
     const res = result_owner.view();
     if (try translate.writeOutput(allocator, res, kind, opts.file_path, opts.output_path, opts.overwrite)) return 0;
-    const fmt = opts.format orelse if (kind == .markdown) config.OutputFormat.markdown else cfg.default_output;
-    try output.write(fmt, res, opts.include_source);
+    const renderer = opts.output_renderer orelse if (kind == .markdown) config.OutputRenderer.markdown else cfg.default_output;
+    try output.write(renderer, res, opts.include_source);
     return 0;
 }
 
@@ -77,5 +78,7 @@ test "translate rejects invalid argv before configuration or memory access" {
     var paths: xdg.Paths = undefined;
     paths.config_file = "missing/config.toml";
     try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--bogus", "--from", "en", "--to", "ja" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--input", "text", "Hello" }));
+    try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "--adapter", "fixture", "Hello" }));
     try std.testing.expectError(errors.Error.InvalidArguments, run(std.testing.allocator, paths, &.{ "Hello", "--file", "input.txt" }));
 }

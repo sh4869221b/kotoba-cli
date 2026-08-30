@@ -23,19 +23,19 @@ pub const Mode = enum {
     }
 };
 
-pub const OutputFormat = enum {
+pub const OutputRenderer = enum {
     plain,
     json,
     markdown,
 
-    pub fn parse(text: []const u8) !OutputFormat {
+    pub fn parse(text: []const u8) !OutputRenderer {
         if (std.mem.eql(u8, text, "plain")) return .plain;
         if (std.mem.eql(u8, text, "json")) return .json;
         if (std.mem.eql(u8, text, "markdown")) return .markdown;
         return errors.Error.InvalidArguments;
     }
 
-    pub fn asText(self: OutputFormat) []const u8 {
+    pub fn asText(self: OutputRenderer) []const u8 {
         return switch (self) {
             .plain => "plain",
             .json => "json",
@@ -49,7 +49,7 @@ pub const Config = struct {
     default_source_lang: ?lang.Language = null,
     default_target_lang: lang.Language = .ja,
     default_mode: Mode = .default,
-    default_output: OutputFormat = .plain,
+    default_output: OutputRenderer = .plain,
     model_id: []const u8 = "",
     model_path: []const u8 = "",
     gpu_layers: i32 = -1,

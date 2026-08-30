@@ -74,7 +74,7 @@ fn isFullyCached(r: Result) bool {
     return r.total_segments > 0 and r.cached_segments == r.total_segments;
 }
 
-pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
+pub fn write(fmt: config.OutputRenderer, r: Result, include_source: bool) !void {
     switch (fmt) {
         .plain, .markdown => try sys.stdoutPrint("{s}\n", .{r.translated_text}),
         .json => {
