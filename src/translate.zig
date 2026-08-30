@@ -117,12 +117,18 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
         .model_id = cfg.model_id,
         .runtime = "embedded",
         .cached_segments = translation.cached_segments,
-        .total_segments = segments.len,
+        .total_segments = countTranslatable(segments),
         .translated_text = final_text,
         .warnings = warnings.items,
         .elapsed_ms = elapsed,
         .source_text = source_text,
     });
+}
+
+fn countTranslatable(segments: []const segment.Segment) usize {
+    var count: usize = 0;
+    for (segments) |seg| count += @intFromBool(seg.translatable);
+    return count;
 }
 
 test "ownership/translation result survives reset" {
@@ -157,6 +163,35 @@ test "ownership/translation result survives reset" {
     try std.testing.expectEqualStrings("JA:Hello", independent.view().translated_text);
     try serializeOwnershipResults((&independent)[0..1]);
     std.debug.print("ownership/translation lifetime model_mutation=independent input_config=reset+reused+destroyed serialization=equal\n", .{});
+}
+
+test "full cache metadata counts only two translatable paragraphs" {
+    if (!@import("build_options").test_backend) return;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const memory_file = try std.fs.path.join(allocator, &.{ root, "memory.sqlite3" });
+    defer allocator.free(memory_file);
+    var paths: xdg.Paths = undefined;
+    paths.memory_file = memory_file;
+    var cfg = config.default();
+    cfg.model_id = "fixture";
+    cfg.model_path = "unused-by-test-backend.gguf";
+    const opts: Options = .{ .text = "first\n\nsecond", .source_lang = .en, .target_lang = .ja, .no_glossary = true };
+
+    var seeded = try run(allocator, paths, cfg, opts);
+    defer seeded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), seeded.view().total_segments);
+    try std.testing.expectEqual(@as(usize, 0), seeded.view().cached_segments);
+    try std.testing.expectEqualStrings("none", output.cacheStatus(seeded.view()));
+
+    var cached = try run(allocator, paths, cfg, opts);
+    defer cached.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cached.view().total_segments);
+    try std.testing.expectEqual(@as(usize, 2), cached.view().cached_segments);
+    try std.testing.expectEqualStrings("full", output.cacheStatus(cached.view()));
 }
 
 test "stdout failure after accepted row performs no compensating memory statements" {
@@ -969,7 +1004,7 @@ test "ownership/translation bounded batches" {
             @memset(try inputs.allocator().alloc(u8, 4096), 'x');
         }
         const view = owner.view();
-        try std.testing.expectEqual(@as(usize, 8), view.total_segments);
+        try std.testing.expectEqual(@as(usize, 4), view.total_segments);
         try std.testing.expectEqual(@as(usize, if (fixture < 2) 0 else 4), view.cached_segments);
         try std.testing.expectEqualStrings(expected[kind], view.translated_text);
         try std.testing.expectEqualStrings(sources[kind], view.source_text.?);
@@ -977,7 +1012,7 @@ test "ownership/translation bounded batches" {
         try expectReleased(&scratch);
         try expectReleased(&stable);
         if (i < 64) peaks[fixture] = @max(peaks[fixture], scratch.window_peak_bytes) else try std.testing.expect(scratch.window_peak_bytes <= peaks[fixture]);
-        if (i == 63 or i == owners.len - 1) std.debug.print("ownership/batches pid={d} completed={d} warmup=64 measured={d} segments=8 scratch_end={d} scratch_peak={d} stable_end={d} stable_peak={d} retained_result={d}\n", .{ std.os.linux.getpid(), i + 1, if (i < 64) @as(usize, 0) else i + 1 - 64, scratch.live_bytes, scratch.peak_bytes, stable.live_bytes, stable.peak_bytes, results.live_bytes });
+        if (i == 63 or i == owners.len - 1) std.debug.print("ownership/batches pid={d} completed={d} warmup=64 measured={d} segments=4 scratch_end={d} scratch_peak={d} stable_end={d} stable_peak={d} retained_result={d}\n", .{ std.os.linux.getpid(), i + 1, if (i < 64) @as(usize, 0) else i + 1 - 64, scratch.live_bytes, scratch.peak_bytes, stable.live_bytes, stable.peak_bytes, results.live_bytes });
     }
     try serializeOwnershipResults(owners);
     for (owners) |*owner| owner.deinit();

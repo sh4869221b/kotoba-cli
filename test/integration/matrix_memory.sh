@@ -74,7 +74,7 @@ import json
 from pathlib import Path
 import sys
 text, cache, destination = sys.argv[1:]
-cached, status, hits, segments = {"none": (False, "none", 0, 1), "full": (True, "full", 1, 1), "partial": (False, "partial", 1, 3)}[cache]
+cached, status, hits, segments = {"none": (False, "none", 0, 1), "full": (True, "full", 1, 1), "partial": (False, "partial", 1, 2)}[cache]
 value = {"source_lang": "en", "target_lang": "ja", "mode": "default", "model_id": "matrix-memory", "runtime": "embedded",
          "cached": cached, "cache_status": status, "cached_segments": hits, "total_segments": segments,
          "translated_text": text, "warnings": []}
