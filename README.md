@@ -367,6 +367,32 @@ Configuration follows XDG paths:
 - `~/.local/share/kotoba/models/`
 - `~/.local/share/kotoba/memory.sqlite3`
 
+An absolute `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, or
+`XDG_STATE_HOME` takes precedence for its domain and gains a `kotoba`
+component. An unset variable uses its HOME fallback; an empty or relative
+value is rejected and uses that same fallback. HOME is required only for a
+domain that needs a fallback, so all four absolute XDG values work with HOME
+unset, empty, or relative. Kotoba never falls back to the current directory.
+Path resolution itself does not create files or directories; writers call
+`ensureDirs` only when they need to mutate state.
+
+`kotoba doctor` reports `config_path`, `data_path`, `cache_path`, then
+`state_path` before its existing checks. Direct and unset-fallback paths are
+`ok`; empty/relative-XDG fallbacks are `warn` with `xdg_path_invalid`; an
+unresolved fallback is `error` with `path_resolution_failed`.
+
+For example, all-absolute XDG paths do not depend on HOME. This read-only
+diagnostic prints JSON; its final health can still be nonzero when the
+referenced Kotoba state is absent.
+
+```bash
+ROOT=$(mktemp -d)
+env HOME=relative XDG_CONFIG_HOME="$ROOT/config" XDG_DATA_HOME="$ROOT/data" \
+  XDG_CACHE_HOME="$ROOT/cache" XDG_STATE_HOME="$ROOT/state" \
+  kotoba doctor --format json
+rm -rf "$ROOT"
+```
+
 Embedded runtime config keys include:
 
 - `model_id`

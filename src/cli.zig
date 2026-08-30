@@ -35,11 +35,19 @@ pub fn run(allocator: std.mem.Allocator, args_slice: []const []const u8) !u8 {
         !std.mem.eql(u8, cmd, "glossary")) return errors.Error.InvalidArguments;
     var dispatch_arena = std.heap.ArenaAllocator.init(allocator);
     defer dispatch_arena.deinit();
-    // Paths and their environment-derived strings are borrowed by this dispatch only.
-    const paths = try xdg.paths(dispatch_arena.allocator());
+    const dispatch_allocator = dispatch_arena.allocator();
+    if (std.mem.eql(u8, cmd, "doctor")) {
+        const options = try doctor_cmd.parse(args_slice[2..]);
+        const resolution = try xdg.resolveFromEnvironment(dispatch_allocator);
+        defer resolution.deinit(dispatch_allocator);
+        return doctor_cmd.run(allocator, resolution, options);
+    }
+    // Resolution and derived paths are borrowed by this dispatch only.
+    const resolution = try xdg.resolveFromEnvironment(dispatch_allocator);
+    defer resolution.deinit(dispatch_allocator);
+    const paths = try resolution.requirePaths(dispatch_allocator);
     if (std.mem.eql(u8, cmd, "init")) return init_cmd.run(allocator, paths, args_slice[2..]);
     if (std.mem.eql(u8, cmd, "translate")) return translate_cmd.run(allocator, paths, args_slice[2..]);
-    if (std.mem.eql(u8, cmd, "doctor")) return doctor_cmd.run(allocator, paths, args_slice[2..]);
     if (std.mem.eql(u8, cmd, "config")) return config_cmd.run(allocator, paths, args_slice[2..]);
     if (std.mem.eql(u8, cmd, "models")) return models_cmd.run(allocator, paths, args_slice[2..]);
     if (std.mem.eql(u8, cmd, "memory")) return memory_cmd.run(allocator, paths, args_slice[2..]);
@@ -243,7 +251,7 @@ test "ownership/commands repeated calls" {
         try expectCommandReleased(&counter);
         try std.testing.expectEqual(@as(u8, 0), try memory_cmd.run(allocator, paths, &.{"status"}));
         try expectCommandReleased(&counter);
-        try std.testing.expectEqual(@as(u8, 0), try doctor_cmd.run(allocator, paths, &.{}));
+        try std.testing.expectEqual(@as(u8, 0), try doctor_cmd.runWithPaths(allocator, paths, &.{}));
         try expectCommandReleased(&counter);
         try std.testing.expectEqual(@as(u8, 0), try translate_cmd.run(allocator, paths, &.{ "Hello", "--no-memory", "--no-glossary" }));
         try expectCommandReleased(&counter);
