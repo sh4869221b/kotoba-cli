@@ -2,7 +2,6 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
-const toml = @import("toml.zig");
 const strict = @import("strict_toml.zig");
 
 pub const Mode = enum {
@@ -110,7 +109,7 @@ pub const OwnedConfig = struct {
                     .optional => cfg.default_source_lang = if (value.len == 0) null else try lang.Language.parse(value),
                     .@"enum" => @field(cfg, candidate) = try T.parse(value),
                     .int => @field(cfg, candidate) = if (T == i32)
-                        toml.signedIntValue(value) orelse return error.InvalidArguments
+                        std.fmt.parseInt(i32, std.mem.trim(u8, value, " \t\r\n"), 10) catch return error.InvalidArguments
                     else
                         std.fmt.parseInt(T, value, 10) catch return error.InvalidArguments,
                     .float => {

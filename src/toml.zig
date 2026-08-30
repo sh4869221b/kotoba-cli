@@ -19,10 +19,6 @@ pub fn unquote(value: []const u8) []const u8 {
     return v;
 }
 
-pub fn signedIntValue(value: []const u8) ?i32 {
-    return std.fmt.parseInt(i32, trim(value), 10) catch null;
-}
-
 pub const Pair = struct { key: []const u8, value: []const u8 };
 
 pub fn pair(line: []const u8) ?Pair {
