@@ -7,14 +7,7 @@ const c = @cImport({
 });
 
 pub const PathState = fs.PathState;
-pub const PendingStagedFile = staged_output.Pending;
-pub const FinishedStagedFile = staged_output.Finished;
 pub const StagedFileOptions = staged_output.Options;
-pub const CleanupReport = staged_output.CleanupReport;
-
-pub fn beginStagedFile(allocator: std.mem.Allocator, path: []const u8, options: StagedFileOptions) !PendingStagedFile {
-    return staged_output.begin(allocator, io(), cwd(), path, options);
-}
 
 pub fn atomicWriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, options: StagedFileOptions) !void {
     return staged_output.atomicWriteFile(allocator, io(), cwd(), path, bytes, options);
