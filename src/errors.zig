@@ -1,7 +1,6 @@
 const std = @import("std");
 const output = @import("output.zig");
 const sys = @import("sys.zig");
-const text = @import("text.zig");
 
 pub const Code = enum {
     not_initialized,
@@ -158,7 +157,7 @@ pub fn printHuman(app_err: AppError) !void {
 }
 
 pub fn writeJson(app_err: AppError) !void {
-    try text.validate(app_err.message);
+    try output.validateJsonString(app_err.message);
     const rendered = try output.jsonLineAlloc(std.heap.page_allocator, .{ .@"error" = .{ .code = app_err.code.asText(), .message = app_err.message } });
     defer std.heap.page_allocator.free(rendered);
     try sys.stdoutWrite(rendered);
@@ -175,7 +174,7 @@ test "error JSON safely round trips every variable text byte" {
     if (std.c.dup2(captured.handle, std.posix.STDOUT_FILENO) < 0) return error.StdoutCaptureFailed;
     defer if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
 
-    const message = "control:\x01 quote:\" slash:\\ unicode:日本語😀";
+    const message = "control:\x00\x01 quote:\" slash:\\ unicode:日本語😀";
     try @as(anyerror!void, writeJson(.{ .code = .io_error, .message = message }));
     if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) return error.StdoutRestoreFailed;
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "stdout", std.testing.allocator, .limited(4096));

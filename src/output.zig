@@ -2,7 +2,6 @@ const std = @import("std");
 const config = @import("config.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
-const text = @import("text.zig");
 
 /// Borrowed serializer view; its slices remain valid only while their owner lives.
 pub const Result = struct {
@@ -127,11 +126,15 @@ pub fn jsonLineAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 }
 
 fn validateResultText(r: Result, include_source: bool) !void {
-    try text.validate(r.model_id);
-    try text.validate(r.runtime);
-    try text.validate(r.translated_text);
-    for (r.warnings) |warning| try text.validate(warning);
-    if (include_source) try text.validate(r.source_text orelse "");
+    try validateJsonString(r.model_id);
+    try validateJsonString(r.runtime);
+    try validateJsonString(r.translated_text);
+    for (r.warnings) |warning| try validateJsonString(warning);
+    if (include_source) try validateJsonString(r.source_text orelse "");
+}
+
+pub fn validateJsonString(value: []const u8) error{InvalidUtf8}!void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
 }
 
 test "cacheStatus reports none partial full" {
@@ -199,7 +202,7 @@ test "renderJson omits source_text when include_source is false" {
     try std.testing.expectEqualStrings("{\"source_lang\":\"en\",\"target_lang\":\"ja\",\"mode\":\"technical\",\"model_id\":\"m\",\"runtime\":\"embedded\",\"cached\":true,\"cache_status\":\"full\",\"cached_segments\":1,\"total_segments\":1,\"translated_text\":\"translated\",\"warnings\":[],\"elapsed_ms\":0}\n", json);
 }
 
-const json_text_fixture = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\"\\日本語e\u{301}😀\u{FEFF}";
+const json_text_fixture = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\"\\日本語e\u{301}😀\u{FEFF}";
 
 fn jsonTextResult() Result {
     return .{
@@ -268,7 +271,6 @@ test "JSON text contract round trips every emitted variable field" {
 test "JSON text contract rejects invalid emitted fields" {
     const cases = [_]struct { bytes: []const u8, expected: anyerror }{
         .{ .bytes = "A\xFFB", .expected = error.InvalidUtf8 },
-        .{ .bytes = "A\x00B", .expected = error.EmbeddedNul },
         .{ .bytes = "\x00\xFF", .expected = error.InvalidUtf8 },
         .{ .bytes = "\xE3\x81", .expected = error.InvalidUtf8 },
     };
