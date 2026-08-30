@@ -7,6 +7,37 @@ const c = @cImport({
     @cInclude("llama.h");
 });
 
+fn llamaLength(len: usize) !c_int {
+    return std.math.cast(c_int, len) orelse errors.Error.LlamaDecodeFailed;
+}
+
+fn requiredTokenCount(value: c_int) !usize {
+    var count = value;
+    if (count == c.INT32_MIN) return errors.Error.LlamaDecodeFailed;
+    if (count < 0) count = -count;
+    if (count <= 0) return errors.Error.LlamaDecodeFailed;
+    return @intCast(count);
+}
+
+fn completedTokenCount(value: c_int, capacity: usize) !usize {
+    const count = std.math.cast(usize, value) orelse return errors.Error.LlamaDecodeFailed;
+    if (count > capacity) return errors.Error.LlamaDecodeFailed;
+    return count;
+}
+
+fn requiredPieceBytes(value: c_int) !usize {
+    var count = value;
+    if (count == c.INT32_MIN) return errors.Error.LlamaDecodeFailed;
+    if (count < 0) count = -count;
+    return @intCast(count);
+}
+
+fn completedPieceBytes(value: c_int, capacity: usize) !usize {
+    const count = std.math.cast(usize, value) orelse return errors.Error.LlamaDecodeFailed;
+    if (count > capacity) return errors.Error.LlamaDecodeFailed;
+    return count;
+}
+
 pub const Options = struct {
     model_path: []const u8,
     model_id: []const u8,
@@ -48,14 +79,21 @@ const DiagnosticsGuard = struct {
 
 const Model = struct {
     ptr: *c.llama_model,
+    released: bool = false,
+
+    fn take(self: *Model) ?*c.llama_model {
+        if (self.released) return null;
+        self.released = true;
+        return self.ptr;
+    }
 
     pub fn loadFromFile(path: [*:0]const u8, params: c.llama_model_params) !Model {
         const ptr = c.llama_model_load_from_file(path, params) orelse return errors.Error.ModelLoadFailed;
         return .{ .ptr = ptr };
     }
 
-    pub fn deinit(self: Model) void {
-        c.llama_model_free(self.ptr);
+    pub fn deinit(self: *Model) void {
+        if (self.take()) |ptr| c.llama_model_free(ptr);
     }
 
     pub fn getVocab(self: Model) !*const c.llama_vocab {
@@ -65,14 +103,21 @@ const Model = struct {
 
 const Context = struct {
     ptr: *c.llama_context,
+    released: bool = false,
+
+    fn take(self: *Context) ?*c.llama_context {
+        if (self.released) return null;
+        self.released = true;
+        return self.ptr;
+    }
 
     pub fn initFromModel(model: *c.llama_model, params: c.llama_context_params) !Context {
         const ptr = c.llama_init_from_model(model, params) orelse return errors.Error.LlamaInitFailed;
         return .{ .ptr = ptr };
     }
 
-    pub fn deinit(self: Context) void {
-        c.llama_free(self.ptr);
+    pub fn deinit(self: *Context) void {
+        if (self.take()) |ptr| c.llama_free(ptr);
     }
 
     pub fn clearMemory(self: Context) void {
@@ -82,14 +127,21 @@ const Context = struct {
 
 const Sampler = struct {
     ptr: *c.llama_sampler,
+    released: bool = false,
+
+    fn take(self: *Sampler) ?*c.llama_sampler {
+        if (self.released) return null;
+        self.released = true;
+        return self.ptr;
+    }
 
     pub fn initChainDefault() !Sampler {
         const ptr = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return errors.Error.LlamaInitFailed;
         return .{ .ptr = ptr };
     }
 
-    pub fn deinit(self: Sampler) void {
-        c.llama_sampler_free(self.ptr);
+    pub fn deinit(self: *Sampler) void {
+        if (self.take()) |ptr| c.llama_sampler_free(ptr);
     }
 
     pub fn reset(self: Sampler) void {
@@ -149,6 +201,7 @@ pub const Session = struct {
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) !Session {
         if (opts.model_path.len == 0) return errors.Error.ModelNotSelected;
+        if (std.mem.indexOfScalar(u8, opts.model_path, 0) != null) return errors.Error.EmbeddedNul;
         try validateOptions(opts);
         if (!sys.exists(opts.model_path)) return errors.Error.ModelMissing;
 
@@ -162,7 +215,7 @@ pub const Session = struct {
         defer allocator.free(path_z);
 
         const model_params = modelParamsForOptions(opts);
-        const model = try Model.loadFromFile(path_z.ptr, model_params);
+        var model = try Model.loadFromFile(path_z.ptr, model_params);
         errdefer model.deinit();
 
         const abort_guard = try AbortGuard.init(allocator);
@@ -178,12 +231,12 @@ pub const Session = struct {
             ctx_params.n_threads = threads;
             ctx_params.n_threads_batch = threads;
         }
-        const ctx = try Context.initFromModel(model.ptr, ctx_params);
+        var ctx = try Context.initFromModel(model.ptr, ctx_params);
         errdefer ctx.deinit();
 
         const vocab = try model.getVocab();
 
-        const sampler = try Sampler.initChainDefault();
+        var sampler = try Sampler.initChainDefault();
         errdefer sampler.deinit();
         if (opts.temperature <= 0) {
             sampler.addGreedy();
@@ -352,31 +405,25 @@ fn applyDiagnosticsMode(mode: DiagnosticsMode) void {
 }
 
 fn tokenize(allocator: std.mem.Allocator, vocab: *const c.llama_vocab, text: []const u8) ![]c.llama_token {
-    const text_len: c_int = @intCast(text.len);
-    var needed = c.llama_tokenize(vocab, text.ptr, text_len, null, 0, true, true);
-    if (needed == c.INT32_MIN) return errors.Error.LlamaDecodeFailed;
-    if (needed < 0) needed = -needed;
-    if (needed <= 0) return errors.Error.LlamaDecodeFailed;
-    const tokens = try allocator.alloc(c.llama_token, @intCast(needed));
+    const text_len = try llamaLength(text.len);
+    const needed = try requiredTokenCount(c.llama_tokenize(vocab, text.ptr, text_len, null, 0, true, true));
+    const tokens = try allocator.alloc(c.llama_token, needed);
     errdefer allocator.free(tokens);
-    const actual = c.llama_tokenize(vocab, text.ptr, text_len, tokens.ptr, needed, true, true);
-    if (actual < 0) return errors.Error.LlamaDecodeFailed;
-    return tokens[0..@intCast(actual)];
+    const actual = c.llama_tokenize(vocab, text.ptr, text_len, tokens.ptr, try llamaLength(tokens.len), true, true);
+    return tokens[0..try completedTokenCount(actual, tokens.len)];
 }
 
 fn appendTokenPiece(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), vocab: *const c.llama_vocab, token: c.llama_token) !void {
     var stack_buf: [256]u8 = undefined;
-    var n = c.llama_token_to_piece(vocab, token, &stack_buf, stack_buf.len, 0, false);
+    const n = c.llama_token_to_piece(vocab, token, &stack_buf, stack_buf.len, 0, false);
     if (n < 0) {
-        n = -n;
-        const buf = try allocator.alloc(u8, @intCast(n));
+        const buf = try allocator.alloc(u8, try requiredPieceBytes(n));
         defer allocator.free(buf);
-        const actual = c.llama_token_to_piece(vocab, token, buf.ptr, n, 0, false);
-        if (actual < 0) return errors.Error.LlamaDecodeFailed;
-        try out.appendSlice(buf[0..@intCast(actual)]);
+        const actual = c.llama_token_to_piece(vocab, token, buf.ptr, try llamaLength(buf.len), 0, false);
+        try out.appendSlice(buf[0..try completedPieceBytes(actual, buf.len)]);
         return;
     }
-    try out.appendSlice(stack_buf[0..@intCast(n)]);
+    try out.appendSlice(stack_buf[0..try completedPieceBytes(n, stack_buf.len)]);
 }
 
 test "embedded session rejects missing model" {
@@ -397,6 +444,61 @@ test "embedded session rejects missing model" {
         .timeout_sec = 1,
         .diagnostics_enabled = false,
     }));
+}
+
+test "embedded session rejects NUL in model paths before filesystem and C calls" {
+    try std.testing.expectError(errors.Error.EmbeddedNul, Session.init(std.testing.allocator, .{
+        .model_path = "missing.gguf\x00ignored.gguf",
+        .model_id = "missing",
+        .gpu_layers = -1,
+        .context_length = 4096,
+        .threads = 0,
+        .max_tokens = 128,
+        .temperature = 0.2,
+        .timeout_sec = 1,
+        .diagnostics_enabled = false,
+    }));
+}
+
+test "embedded session preserves model-load error and unwinds initialized guards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "invalid.gguf", .data = "not a gguf" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const model_path = try std.fs.path.join(std.testing.allocator, &.{ root, "invalid.gguf" });
+    defer std.testing.allocator.free(model_path);
+    resetDiagnostics();
+
+    try std.testing.expectError(errors.Error.ModelLoadFailed, Session.init(std.testing.allocator, .{
+        .model_path = model_path,
+        .model_id = "invalid",
+        .gpu_layers = 0,
+        .context_length = 512,
+        .threads = 1,
+        .max_tokens = 1,
+        .temperature = 0,
+        .timeout_sec = 1,
+        .diagnostics_enabled = false,
+    }));
+    try std.testing.expectEqual(DiagnosticsMode.default, diagnostics_mode);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "invalid.gguf", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("not a gguf", bytes);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Session.init(failing.allocator(), .{
+        .model_path = model_path,
+        .model_id = "invalid",
+        .gpu_layers = 0,
+        .context_length = 512,
+        .threads = 1,
+        .max_tokens = 1,
+        .temperature = 0,
+        .timeout_sec = 1,
+        .diagnostics_enabled = false,
+    }));
+    try std.testing.expectEqual(DiagnosticsMode.default, diagnostics_mode);
 }
 
 test "embedded session validates context length and threads" {
@@ -472,4 +574,42 @@ test "decode status classification preserves timeout precedence" {
     for ([_]i32{ 1, 2, -1, -2 }) |status| {
         try std.testing.expectEqual(contract.FinishReason.timeout, decodeFinishReason(status, true).?);
     }
+}
+
+test "tokenization rejects text lengths beyond c int before the C call" {
+    const vocab: *const c.llama_vocab = @ptrFromInt(4096);
+    const text_ptr: [*]const u8 = "text\x00".ptr;
+    const too_long = text_ptr[0 .. @as(usize, @intCast(std.math.maxInt(c_int))) + 1];
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, tokenize(std.testing.allocator, vocab, too_long));
+}
+
+test "tokenization rejects C counts beyond the allocated token capacity" {
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, requiredTokenCount(c.INT32_MIN));
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, requiredTokenCount(0));
+    try std.testing.expectEqual(@as(usize, 3), try requiredTokenCount(-3));
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, completedTokenCount(2, 1));
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, completedTokenCount(-1, 1));
+}
+
+test "token pieces reject C counts beyond the allocated byte capacity" {
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, completedPieceBytes(257, 256));
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, completedPieceBytes(-1, 256));
+}
+
+test "token pieces reject the minimum C sentinel without negation overflow" {
+    try std.testing.expectError(errors.Error.LlamaDecodeFailed, requiredPieceBytes(c.INT32_MIN));
+    try std.testing.expectEqual(@as(usize, 3), try requiredPieceBytes(-3));
+    try std.testing.expectEqual(@as(usize, 0), try requiredPieceBytes(0));
+}
+
+test "model context and sampler handles are consumed once" {
+    var model = Model{ .ptr = @ptrFromInt(4096) };
+    try std.testing.expect(model.take() != null);
+    try std.testing.expect(model.take() == null);
+    var context = Context{ .ptr = @ptrFromInt(8192) };
+    try std.testing.expect(context.take() != null);
+    try std.testing.expect(context.take() == null);
+    var sampler = Sampler{ .ptr = @ptrFromInt(12288) };
+    try std.testing.expect(sampler.take() != null);
+    try std.testing.expect(sampler.take() == null);
 }
