@@ -102,11 +102,10 @@ only stdout format that includes metadata.
 
 ### Invocation ownership
 
-Each command invocation owns temporary XDG, argument, parse, and diagnostic
-graphs in short-lived arenas. `cli.run` owns the dispatch/XDG arena; every
-public command adapter owns its invocation arena; `doctor.run` owns its own
-diagnostic arena even when called directly. `main` releases its argv arena
-before calling `process.exit`.
+Command adapters own temporary argument and parse graphs in short-lived arenas
+where needed. `cli.run` owns the dispatch/XDG arena; `doctor.run` owns the
+doctor diagnostic arena even when called directly. `main` releases its argv
+arena before calling `process.exit`.
 
 Translation is deliberately different at its return boundary: the adapter
 passes the original caller allocator into `translate.run`, which returns an
