@@ -83,72 +83,55 @@ pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
 }
 
 fn renderJson(allocator: std.mem.Allocator, r: Result, include_source: bool) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    const cached_segs = try std.fmt.allocPrint(allocator, "{}", .{r.cached_segments});
-    defer allocator.free(cached_segs);
-    const total_segs = try std.fmt.allocPrint(allocator, "{}", .{r.total_segments});
-    defer allocator.free(total_segs);
-    const elapsed = try std.fmt.allocPrint(allocator, "{}", .{r.elapsed_ms});
-    defer allocator.free(elapsed);
-
-    try out.appendSlice("{\"source_lang\":\"");
-    try escapeJsonString(r.source_lang.asText(), &out);
-    try out.appendSlice("\",\"target_lang\":\"");
-    try escapeJsonString(r.target_lang.asText(), &out);
-    try out.appendSlice("\",\"mode\":\"");
-    try escapeJsonString(r.mode.asText(), &out);
-    try out.appendSlice("\",\"model_id\":\"");
-    try escapeJsonString(r.model_id, &out);
-    try out.appendSlice("\",\"runtime\":\"");
-    try escapeJsonString(r.runtime, &out);
-    try out.appendSlice("\",\"cached\":");
-    try out.appendSlice(if (r.cached_segments == r.total_segments) "true" else "false");
-    try out.appendSlice(",\"cache_status\":\"");
-    try out.appendSlice(cacheStatus(r));
-    try out.appendSlice("\",\"cached_segments\":");
-    try out.appendSlice(cached_segs);
-    try out.appendSlice(",\"total_segments\":");
-    try out.appendSlice(total_segs);
-    try out.appendSlice(",\"translated_text\":\"");
-    try escapeJsonString(r.translated_text, &out);
-    try out.appendSlice("\",\"warnings\":[");
-    for (r.warnings, 0..) |warning, i| {
-        if (i > 0) try out.append(',');
-        try out.append('"');
-        try escapeJsonString(warning, &out);
-        try out.append('"');
-    }
-    try out.appendSlice("],\"elapsed_ms\":");
-    try out.appendSlice(elapsed);
+    try validateResultText(r, include_source);
     if (include_source) {
-        try out.appendSlice(",\"source_text\":\"");
-        try escapeJsonString(r.source_text orelse "", &out);
-        try out.append('"');
+        return jsonLineAlloc(allocator, .{
+            .source_lang = r.source_lang.asText(),
+            .target_lang = r.target_lang.asText(),
+            .mode = r.mode.asText(),
+            .model_id = r.model_id,
+            .runtime = r.runtime,
+            .cached = r.cached_segments == r.total_segments,
+            .cache_status = cacheStatus(r),
+            .cached_segments = r.cached_segments,
+            .total_segments = r.total_segments,
+            .translated_text = r.translated_text,
+            .warnings = r.warnings,
+            .elapsed_ms = r.elapsed_ms,
+            .source_text = r.source_text orelse "",
+        });
     }
-    try out.append('}');
-    try out.append('\n');
+    return jsonLineAlloc(allocator, .{
+        .source_lang = r.source_lang.asText(),
+        .target_lang = r.target_lang.asText(),
+        .mode = r.mode.asText(),
+        .model_id = r.model_id,
+        .runtime = r.runtime,
+        .cached = r.cached_segments == r.total_segments,
+        .cache_status = cacheStatus(r),
+        .cached_segments = r.cached_segments,
+        .total_segments = r.total_segments,
+        .translated_text = r.translated_text,
+        .warnings = r.warnings,
+        .elapsed_ms = r.elapsed_ms,
+    });
+}
 
+pub fn jsonLineAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &out.writer };
+    stringify.write(value) catch return error.OutOfMemory;
+    out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn escapeJsonString(s: []const u8, out: *std.array_list.Managed(u8)) !void {
-    try text.validate(s);
-    for (s) |c| {
-        switch (c) {
-            '"' => try out.appendSlice("\\\""),
-            '\\' => try out.appendSlice("\\\\"),
-            '\n' => try out.appendSlice("\\n"),
-            '\r' => try out.appendSlice("\\r"),
-            '\t' => try out.appendSlice("\\t"),
-            0...8, 11...12, 14...31 => {
-                const hex = "0123456789abcdef";
-                try out.appendSlice(&.{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] });
-            },
-            else => try out.append(c),
-        }
-    }
+fn validateResultText(r: Result, include_source: bool) !void {
+    try text.validate(r.model_id);
+    try text.validate(r.runtime);
+    try text.validate(r.translated_text);
+    for (r.warnings) |warning| try text.validate(warning);
+    if (include_source) try text.validate(r.source_text orelse "");
 }
 
 test "cacheStatus reports none partial full" {

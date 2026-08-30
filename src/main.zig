@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk cli.run(allocator, args) catch |err| err_blk: {
             const app_err = errors.fromError(err);
             if (cli.errorPrefersJson(args)) {
-                errors.writeJson(app_err);
+                errors.writeJson(app_err) catch {};
             } else {
                 errors.printHuman(app_err);
             }

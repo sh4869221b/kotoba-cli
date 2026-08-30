@@ -4,6 +4,7 @@ const errors = @import("errors.zig");
 const glossary = @import("glossary.zig");
 const memory = @import("memory.zig");
 const models = @import("models.zig");
+const output_module = @import("output.zig");
 const sys = @import("sys.zig");
 const xdg = @import("xdg.zig");
 
@@ -180,12 +181,9 @@ fn print(allocator: std.mem.Allocator, checks: []Check, ok: bool, json: bool) !u
             .code = check.code,
             .message = try diagnosticText(allocator, check.message),
         });
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
-        var stringify: std.json.Stringify = .{ .writer = &out.writer };
-        try stringify.write(.{ .ok = ok, .checks = rendered_checks.items });
-        try out.writer.writeByte('\n');
-        sys.stdoutWrite(out.written());
+        const out = try output_module.jsonLineAlloc(allocator, .{ .ok = ok, .checks = rendered_checks.items });
+        defer allocator.free(out);
+        sys.stdoutWrite(out);
     } else {
         for (checks) |check| {
             sys.stdoutPrint("{s}: {s}: ", .{ @tagName(check.status), check.name });
