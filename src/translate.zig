@@ -78,7 +78,7 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     var glossary_owner: ?glossary.OwnedGlossary = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else null;
     defer if (glossary_owner) |*owner| owner.deinit();
     const g = if (glossary_owner) |*owner| owner.view() else glossary.Glossary{ .terms = &.{} };
-    const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, source_text);
+    const pair = try lang.resolve(opts.source_lang, opts.adapter_source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, source_text);
     const mode = opts.mode orelse cfg.default_mode;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     defer warnings.deinit();
@@ -167,6 +167,25 @@ test "ownership/translation result survives reset" {
     try std.testing.expectEqualStrings("JA:Hello", independent.view().translated_text);
     try serializeOwnershipResults((&independent)[0..1]);
     std.debug.print("ownership/translation lifetime model_mutation=independent input_config=reset+reused+destroyed serialization=equal\n", .{});
+}
+
+test "translation resolves explicit and adapter source languages before configured defaults" {
+    if (!@import("build_options").test_backend) return;
+    const allocator = std.testing.allocator;
+    var cfg = config.default();
+    cfg.model_id = "fixture";
+    cfg.model_path = "unused-by-test-backend.gguf";
+    cfg.default_source_lang = .ja;
+
+    var explicit = try run(allocator, undefined, cfg, .{ .text = "?!", .source_lang = .en, .adapter_source_lang = .ja, .target_lang = .ja, .no_memory = true, .no_glossary = true });
+    defer explicit.deinit();
+    try std.testing.expectEqual(lang.Language.en, explicit.view().source_lang);
+    try std.testing.expectEqualStrings("JA:?!", explicit.view().translated_text);
+
+    var metadata = try run(allocator, undefined, cfg, .{ .text = "?!", .adapter_source_lang = .en, .target_lang = .ja, .no_memory = true, .no_glossary = true });
+    defer metadata.deinit();
+    try std.testing.expectEqual(lang.Language.en, metadata.view().source_lang);
+    try std.testing.expectEqualStrings("JA:?!", metadata.view().translated_text);
 }
 
 test "full cache metadata counts only two translatable paragraphs" {
