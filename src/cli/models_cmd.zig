@@ -22,7 +22,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         defer list_owner.deinit();
         const list = list_owner.view();
         for (list.models) |m| {
-            sys.stdoutPrint("{s}\t{s}\t{s}{s}{s}\n", .{ m.id, m.name, m.profile, if (m.recommended) "\trecommended" else "", if (std.mem.eql(u8, m.id, cfg.model_id)) "\tcurrent" else "" });
+            try sys.stdoutPrint("{s}\t{s}\t{s}{s}{s}\n", .{ m.id, m.name, m.profile, if (m.recommended) "\trecommended" else "", if (std.mem.eql(u8, m.id, cfg.model_id)) "\tcurrent" else "" });
         }
         return 0;
     }
@@ -52,7 +52,7 @@ fn printModelInfo(allocator: std.mem.Allocator, m: models.Model) !void {
     const source = if (m.source_url.len > 0) m.source_url else m.download_url;
     const source_url = try models.url.displayUrl(allocator, if (models.url.isRemote(source)) source else "");
     defer allocator.free(source_url);
-    sys.stdoutPrint("id: {s}\nname: {s}\nprofile: {s}\nformat: {s}\nquantization: {s}\ncontext_length: {d}\npath: {s}\ndownload_url: {s}\nsource_url: {s}\nchecksum: {s}\nlicense: {s}\nrecommended: {}\nnotes: {s}\n", .{
+    try sys.stdoutPrint("id: {s}\nname: {s}\nprofile: {s}\nformat: {s}\nquantization: {s}\ncontext_length: {d}\npath: {s}\ndownload_url: {s}\nsource_url: {s}\nchecksum: {s}\nlicense: {s}\nrecommended: {}\nnotes: {s}\n", .{
         m.id,
         m.name,
         m.profile,
@@ -122,7 +122,7 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
         .notes = "Imported local GGUF model.",
     });
     if (use_model) try selectModel(allocator, paths, id, dest_path);
-    sys.stdoutPrint("imported {s}\n", .{id});
+    try sys.stdoutPrint("imported {s}\n", .{id});
     return 0;
 }
 
@@ -236,7 +236,7 @@ fn runPullWithAcquirer(
     try models.verifyModel(allocator, m);
     try models.upsert(allocator, paths.models_file, m);
     if (use_model) try selectModel(allocator, paths, id, output_path);
-    sys.stdoutPrint("pulled {s}\n", .{id});
+    try sys.stdoutPrint("pulled {s}\n", .{id});
     return 0;
 }
 
@@ -251,7 +251,7 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
     try models.verifyModel(allocator, m);
     try xdg.ensureDirs(paths);
     try selectModel(allocator, paths, m.id, m.path);
-    sys.stdoutPrint("using {s}\n", .{m.id});
+    try sys.stdoutPrint("using {s}\n", .{m.id});
     return 0;
 }
 
@@ -273,7 +273,7 @@ fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
         m.path = cfg.model_path;
     }
     try models.verifyModel(allocator, m);
-    sys.stdoutPrint("verified {s}\n", .{id});
+    try sys.stdoutPrint("verified {s}\n", .{id});
     return 0;
 }
 
@@ -308,7 +308,7 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
         try cfg.setValue("model_path", "");
         try config.save(paths.config_file, cfg.view());
     }
-    sys.stdoutPrint("removed {s}\n", .{id});
+    try sys.stdoutPrint("removed {s}\n", .{id});
     return 0;
 }
 
@@ -571,12 +571,12 @@ test "secret URL pull stdout capture restores on error" {
         fn fail(file: std.Io.File) !void {
             var nested = try TestStdoutCapture.start(file);
             defer nested.restore();
-            sys.stdoutWrite("before error\n");
+            try sys.stdoutWrite("before error\n");
             return error.ExpectedFailure;
         }
     };
     try std.testing.expectError(error.ExpectedFailure, Fixture.fail(inner));
-    sys.stdoutWrite("restored\n");
+    try sys.stdoutWrite("restored\n");
     capture.restore();
     const outer_bytes = try tmp.dir.readFileAlloc(sys.io(), "outer", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(outer_bytes);

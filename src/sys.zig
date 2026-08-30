@@ -72,26 +72,30 @@ pub fn deleteFile(path: []const u8) void {
     filesystem.deleteFile(path) catch {};
 }
 
-pub fn stdoutWrite(bytes: []const u8) void {
+pub fn stdoutWrite(bytes: []const u8) !void {
     var writer = std.Io.File.stdout().writerStreaming(io(), &.{});
-    writeWriterAll(&writer.interface, bytes) catch {};
+    writeWriterAll(&writer.interface, bytes) catch |err| switch (err) {
+        error.WriteFailed => return writer.err orelse err,
+    };
 }
 
-pub fn stderrWrite(bytes: []const u8) void {
+pub fn stderrWrite(bytes: []const u8) !void {
     var writer = std.Io.File.stderr().writerStreaming(io(), &.{});
-    writeWriterAll(&writer.interface, bytes) catch {};
+    writeWriterAll(&writer.interface, bytes) catch |err| switch (err) {
+        error.WriteFailed => return writer.err orelse err,
+    };
 }
 
-pub fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
-    const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+pub fn stdoutPrint(comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
     defer std.heap.page_allocator.free(msg);
-    stdoutWrite(msg);
+    try stdoutWrite(msg);
 }
 
-pub fn stderrPrint(comptime fmt: []const u8, args: anytype) void {
-    const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+pub fn stderrPrint(comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
     defer std.heap.page_allocator.free(msg);
-    stderrWrite(msg);
+    try stderrWrite(msg);
 }
 
 pub fn readStdinAlloc(allocator: std.mem.Allocator, limit: usize) ![]u8 {

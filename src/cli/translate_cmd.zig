@@ -60,7 +60,8 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     defer owned_config.deinit();
     const cfg = owned_config.view();
     if (translate.diagnosticsEnabled(cfg, opts)) {
-        sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{});
+        // Debug notice delivery is auxiliary; primary command output remains fallible.
+        sys.stderrPrint("kotoba: debug: diagnostics enabled\n", .{}) catch {};
     }
     const kind = translate.readKindForOptions(opts.format, opts.file_path);
     var result_owner = try translate.run(original_allocator, paths, cfg, opts);

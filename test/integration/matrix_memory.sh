@@ -74,7 +74,7 @@ import json
 from pathlib import Path
 import sys
 text, cache, destination = sys.argv[1:]
-cached, status, hits, segments = {"none": (False, "none", 0, 1), "full": (True, "full", 1, 1), "partial": (False, "partial", 1, 3)}[cache]
+cached, status, hits, segments = {"none": (False, "none", 0, 1), "full": (True, "full", 1, 1), "partial": (False, "partial", 1, 2)}[cache]
 value = {"source_lang": "en", "target_lang": "ja", "mode": "default", "model_id": "matrix-memory", "runtime": "embedded",
          "cached": cached, "cache_status": status, "cached_segments": hits, "total_segments": segments,
          "translated_text": text, "warnings": []}
@@ -157,10 +157,37 @@ print(json.dumps(expected))
 PY
 }
 
+matrix_memory_broken_stdout_pipe() {
+  matrix_memory_fixture tm-broken-stdout-pipe healthy
+  printf 'kotoba: io_error: BrokenPipe\n' >"$CASE_DIR/expected.stderr"
+  matrix_run_broken_stdout_pipe translate 'Matrix broken stdout pipe' --from en --to ja
+  matrix_assert status 1
+  matrix_assert stdout "$CASE_DIR/empty"
+  matrix_assert stderr "$CASE_DIR/expected.stderr"
+  matrix_memory_rows '[]' '[["Matrix broken stdout pipe",0,"empty"]]'
+  matrix_assert custom closed-pipe-producer python3 - "$CASE_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+directory = Path(sys.argv[1])
+receipt = json.loads((directory / "receipt.json").read_text())
+assert receipt["level"] == "cli" and receipt["stdout_sink"] == "closed_pipe"
+assert receipt["closed_stdout_pipe"] == {"reader_closed_before_exec": True, "producer_returncode": 1, "producer_status": 1}
+assert (directory / "stdout").read_bytes() == b""
+assert (directory / "stderr").read_bytes() == b"kotoba: io_error: BrokenPipe\n"
+after = json.loads((directory / "db-after.json").read_text())
+assert after["row_count"] == 1 and after["rows"][0][1:3] == ["Matrix broken stdout pipe", "JA:Matrix broken stdout pipe"]
+print(json.dumps({"producer_status": receipt["closed_stdout_pipe"]["producer_status"], "tm_row_count": after["row_count"]}))
+PY
+  matrix_finish
+}
+
 matrix_memory() {
   local id kind source translated cache before after error_code error_message
   local -a flags
   matrix_memory_text_contract
+  matrix_memory_broken_stdout_pipe
   for id in tm-miss tm-full-hit tm-partial-hit tm-disabled-flag tm-disabled-config \
     tm-directory-open-failure tm-corrupt-open-failure tm-statement-failure \
     glossary-prefer glossary-protect glossary-hash-change glossary-disabled-flag glossary-disabled-config \
@@ -189,7 +216,8 @@ matrix_memory() {
         fi ;;
       tm-disabled-flag) flags=(--no-memory) ;;
       tm-disabled-config) printf 'memory_enabled = false\n' >>"$XDG_CONFIG_HOME/kotoba/config.toml" ;;
-      tm-statement-failure) error_code=sqlite_failed; error_message='SQLite translation memory operation failed.' ;;
+      tm-directory-open-failure|tm-corrupt-open-failure|tm-statement-failure)
+        error_code=sqlite_failed; error_message='SQLite translation memory operation failed.' ;;
       glossary-prefer) matrix_memory_glossary prefer 'command line' ;;
       glossary-protect) matrix_memory_glossary protect 'command line'; after='[["Matrix glossary CLI",0,"protect"]]' ;;
       glossary-hash-change|glossary-disabled-flag|glossary-disabled-config)

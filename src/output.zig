@@ -2,7 +2,6 @@ const std = @import("std");
 const config = @import("config.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
-const text = @import("text.zig");
 
 /// Borrowed serializer view; its slices remain valid only while their owner lives.
 pub const Result = struct {
@@ -67,88 +66,79 @@ pub const OwnedResult = struct {
 
 pub fn cacheStatus(r: Result) []const u8 {
     if (r.cached_segments == 0) return "none";
-    if (r.cached_segments == r.total_segments) return "full";
+    if (isFullyCached(r)) return "full";
     return "partial";
+}
+
+fn isFullyCached(r: Result) bool {
+    return r.total_segments > 0 and r.cached_segments == r.total_segments;
 }
 
 pub fn write(fmt: config.OutputFormat, r: Result, include_source: bool) !void {
     switch (fmt) {
-        .plain, .markdown => sys.stdoutPrint("{s}\n", .{r.translated_text}),
+        .plain, .markdown => try sys.stdoutPrint("{s}\n", .{r.translated_text}),
         .json => {
             const json = try renderJson(std.heap.page_allocator, r, include_source);
             defer std.heap.page_allocator.free(json);
-            sys.stdoutWrite(json);
+            try sys.stdoutWrite(json);
         },
     }
 }
 
 fn renderJson(allocator: std.mem.Allocator, r: Result, include_source: bool) ![]u8 {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-
-    const cached_segs = try std.fmt.allocPrint(allocator, "{}", .{r.cached_segments});
-    defer allocator.free(cached_segs);
-    const total_segs = try std.fmt.allocPrint(allocator, "{}", .{r.total_segments});
-    defer allocator.free(total_segs);
-    const elapsed = try std.fmt.allocPrint(allocator, "{}", .{r.elapsed_ms});
-    defer allocator.free(elapsed);
-
-    try out.appendSlice("{\"source_lang\":\"");
-    try escapeJsonString(r.source_lang.asText(), &out);
-    try out.appendSlice("\",\"target_lang\":\"");
-    try escapeJsonString(r.target_lang.asText(), &out);
-    try out.appendSlice("\",\"mode\":\"");
-    try escapeJsonString(r.mode.asText(), &out);
-    try out.appendSlice("\",\"model_id\":\"");
-    try escapeJsonString(r.model_id, &out);
-    try out.appendSlice("\",\"runtime\":\"");
-    try escapeJsonString(r.runtime, &out);
-    try out.appendSlice("\",\"cached\":");
-    try out.appendSlice(if (r.cached_segments == r.total_segments) "true" else "false");
-    try out.appendSlice(",\"cache_status\":\"");
-    try out.appendSlice(cacheStatus(r));
-    try out.appendSlice("\",\"cached_segments\":");
-    try out.appendSlice(cached_segs);
-    try out.appendSlice(",\"total_segments\":");
-    try out.appendSlice(total_segs);
-    try out.appendSlice(",\"translated_text\":\"");
-    try escapeJsonString(r.translated_text, &out);
-    try out.appendSlice("\",\"warnings\":[");
-    for (r.warnings, 0..) |warning, i| {
-        if (i > 0) try out.append(',');
-        try out.append('"');
-        try escapeJsonString(warning, &out);
-        try out.append('"');
-    }
-    try out.appendSlice("],\"elapsed_ms\":");
-    try out.appendSlice(elapsed);
+    try validateResultText(r, include_source);
     if (include_source) {
-        try out.appendSlice(",\"source_text\":\"");
-        try escapeJsonString(r.source_text orelse "", &out);
-        try out.append('"');
+        return jsonLineAlloc(allocator, .{
+            .source_lang = r.source_lang.asText(),
+            .target_lang = r.target_lang.asText(),
+            .mode = r.mode.asText(),
+            .model_id = r.model_id,
+            .runtime = r.runtime,
+            .cached = isFullyCached(r),
+            .cache_status = cacheStatus(r),
+            .cached_segments = r.cached_segments,
+            .total_segments = r.total_segments,
+            .translated_text = r.translated_text,
+            .warnings = r.warnings,
+            .elapsed_ms = r.elapsed_ms,
+            .source_text = r.source_text orelse "",
+        });
     }
-    try out.append('}');
-    try out.append('\n');
+    return jsonLineAlloc(allocator, .{
+        .source_lang = r.source_lang.asText(),
+        .target_lang = r.target_lang.asText(),
+        .mode = r.mode.asText(),
+        .model_id = r.model_id,
+        .runtime = r.runtime,
+        .cached = isFullyCached(r),
+        .cache_status = cacheStatus(r),
+        .cached_segments = r.cached_segments,
+        .total_segments = r.total_segments,
+        .translated_text = r.translated_text,
+        .warnings = r.warnings,
+        .elapsed_ms = r.elapsed_ms,
+    });
+}
 
+pub fn jsonLineAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &out.writer };
+    stringify.write(value) catch return error.OutOfMemory;
+    out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn escapeJsonString(s: []const u8, out: *std.array_list.Managed(u8)) !void {
-    try text.validate(s);
-    for (s) |c| {
-        switch (c) {
-            '"' => try out.appendSlice("\\\""),
-            '\\' => try out.appendSlice("\\\\"),
-            '\n' => try out.appendSlice("\\n"),
-            '\r' => try out.appendSlice("\\r"),
-            '\t' => try out.appendSlice("\\t"),
-            0...8, 11...12, 14...31 => {
-                const hex = "0123456789abcdef";
-                try out.appendSlice(&.{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] });
-            },
-            else => try out.append(c),
-        }
-    }
+fn validateResultText(r: Result, include_source: bool) !void {
+    try validateJsonString(r.model_id);
+    try validateJsonString(r.runtime);
+    try validateJsonString(r.translated_text);
+    for (r.warnings) |warning| try validateJsonString(warning);
+    if (include_source) try validateJsonString(r.source_text orelse "");
+}
+
+pub fn validateJsonString(value: []const u8) error{InvalidUtf8}!void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
 }
 
 test "cacheStatus reports none partial full" {
@@ -172,6 +162,28 @@ test "cacheStatus reports none partial full" {
     var full = base;
     full.cached_segments = 3;
     try std.testing.expectEqualStrings("full", cacheStatus(full));
+}
+
+test "zero translatable JSON is not cached" {
+    const r: Result = .{
+        .source_lang = .en,
+        .target_lang = .ja,
+        .mode = .default,
+        .model_id = "m",
+        .runtime = "embedded",
+        .cached_segments = 0,
+        .total_segments = 0,
+        .translated_text = "KOTOBA_PROTECT_000001",
+        .elapsed_ms = 0,
+    };
+    const json = try renderJson(std.testing.allocator, r, false);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("cached").?.bool);
+    try std.testing.expectEqualStrings("none", parsed.value.object.get("cache_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("cached_segments").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("total_segments").?.integer);
 }
 
 test "renderJson escapes quotes backslashes and control characters" {
@@ -216,7 +228,7 @@ test "renderJson omits source_text when include_source is false" {
     try std.testing.expectEqualStrings("{\"source_lang\":\"en\",\"target_lang\":\"ja\",\"mode\":\"technical\",\"model_id\":\"m\",\"runtime\":\"embedded\",\"cached\":true,\"cache_status\":\"full\",\"cached_segments\":1,\"total_segments\":1,\"translated_text\":\"translated\",\"warnings\":[],\"elapsed_ms\":0}\n", json);
 }
 
-const json_text_fixture = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\"\\日本語e\u{301}😀\u{FEFF}";
+const json_text_fixture = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\"\\日本語e\u{301}😀\u{FEFF}";
 
 fn jsonTextResult() Result {
     return .{
@@ -248,7 +260,7 @@ fn expectJsonTextRoundTrip(r: Result, include_source: bool, json: []const u8) !v
     inline for (.{ "model_id", "runtime", "translated_text" }) |field| {
         try std.testing.expectEqualStrings(@field(r, field), object.get(field).?.string);
     }
-    try std.testing.expectEqual(r.cached_segments == r.total_segments, object.get("cached").?.bool);
+    try std.testing.expectEqual(isFullyCached(r), object.get("cached").?.bool);
     try std.testing.expectEqualStrings(cacheStatus(r), object.get("cache_status").?.string);
     try std.testing.expectEqual(@as(i64, @intCast(r.cached_segments)), object.get("cached_segments").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(r.total_segments)), object.get("total_segments").?.integer);
@@ -285,7 +297,6 @@ test "JSON text contract round trips every emitted variable field" {
 test "JSON text contract rejects invalid emitted fields" {
     const cases = [_]struct { bytes: []const u8, expected: anyerror }{
         .{ .bytes = "A\xFFB", .expected = error.InvalidUtf8 },
-        .{ .bytes = "A\x00B", .expected = error.EmbeddedNul },
         .{ .bytes = "\x00\xFF", .expected = error.InvalidUtf8 },
         .{ .bytes = "\xE3\x81", .expected = error.InvalidUtf8 },
     };

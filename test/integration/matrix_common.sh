@@ -63,6 +63,16 @@ matrix_run() {
   return "$status"
 }
 
+matrix_run_broken_stdout_pipe() {
+  [[ ! -e "$CASE_DIR/receipt.json" ]] || return 2
+  matrix_python capture-closed-stdout-pipe "$@" &
+  MATRIX_CAPTURE_PID=$!
+  local status=0
+  wait "$MATRIX_CAPTURE_PID" || status=$?
+  MATRIX_CAPTURE_PID=""
+  return "$status"
+}
+
 # status N; stdout/stderr EXPECTED_FILE; fs-equal; db-equal;
 # json success|success-source|error|doctor; json-values JSON_OBJECT;
 # file ACTUAL EXPECTED; custom LABEL COMMAND [ARG...].
@@ -186,13 +196,13 @@ def schema(value, kind: str) -> None:
             assert type(value["cached"]) is bool
             assert type(value["warnings"]) is list and all(type(item) is str for item in value["warnings"])
             cached, total = value["cached_segments"], value["total_segments"]
-            assert cached <= total and value["cached"] == (cached == total)
+            assert cached <= total and value["cached"] == (total > 0 and cached == total)
             assert value["cache_status"] == ("none" if cached == 0 else "full" if cached == total else "partial")
         case _:
             raise AssertionError("unknown JSON schema")
 
 
-def capture(args: list[str]) -> None:
+def capture(args: list[str], closed_stdout_pipe: bool = False) -> None:
     directory = Path(os.environ["CASE_DIR"])
     root, database = Path(os.environ["CASE_ROOT"]), Path(os.environ["CASE_DB"])
     executable = os.environ["CASE_BIN"]
@@ -220,7 +230,8 @@ def capture(args: list[str]) -> None:
                "executable": executable, "executable_sha256": digest(Path(executable)), "argv": [executable, *args],
                "stdin_sha256": digest(directory / "stdin"), "cwd": str(Path.cwd()), "fixture_root": str(root),
                "environment_classes": environment_classes,
-               "stdout": "stdout", "stderr": "stderr", "fs_before": "fs-before.json", "fs_after": "fs-after.json",
+               "stdout": "stdout", "stderr": "stderr", "stdout_sink": "closed_pipe" if closed_stdout_pipe else "file",
+               "fs_before": "fs-before.json", "fs_after": "fs-after.json",
                "db_before": "db-before.json", "db_after": "db-after.json", "verdict": "pending", "assertions": [],
                "timeout_seconds": 120, "harness_timeout": False, "file_size_limit_bytes": file_size_limit}
     snapshot(root, database, directory, "before")
@@ -257,9 +268,21 @@ def capture(args: list[str]) -> None:
                                      "execution_mode": stat.S_IMODE(denied.stat().st_mode), "restored": False}
             assert receipt["permission"]["execution_mode"] == 0 and not os.access(denied, os.R_OK)
             dump(directory / "receipt.json", receipt)
-        with (directory / "stdin").open("rb") as stdin, (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
-            process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, env=child_environment, start_new_session=True,
-                                       preexec_fn=limit_child if file_size_limit is not None else None)
+        with (directory / "stdin").open("rb") as stdin, (directory / "stderr").open("wb") as stderr:
+            if closed_stdout_pipe:
+                reader, writer = os.pipe()
+                os.close(reader)
+                receipt["closed_stdout_pipe"] = {"reader_closed_before_exec": True}
+                try:
+                    process = subprocess.Popen([executable, *args], stdin=stdin, stdout=writer, stderr=stderr, env=child_environment, start_new_session=True,
+                                               preexec_fn=limit_child if file_size_limit is not None else None)
+                finally:
+                    os.close(writer)
+                (directory / "stdout").write_bytes(b"")
+            else:
+                with (directory / "stdout").open("wb") as stdout:
+                    process = subprocess.Popen([executable, *args], stdin=stdin, stdout=stdout, stderr=stderr, env=child_environment, start_new_session=True,
+                                               preexec_fn=limit_child if file_size_limit is not None else None)
             try:
                 process.wait(timeout=120)
             except subprocess.TimeoutExpired:
@@ -272,6 +295,8 @@ def capture(args: list[str]) -> None:
             receipt["permission"]["restored"] = stat.S_IMODE(denied.stat().st_mode) == original_mode
             dump(directory / "receipt.json", receipt)
     receipt["status"] = process.returncode if process.returncode >= 0 else 128 - process.returncode
+    if closed_stdout_pipe:
+        receipt["closed_stdout_pipe"].update(producer_returncode=process.returncode, producer_status=receipt["status"])
     receipt["signal"] = interrupted
     (directory / "status").write_text(str(receipt["status"]) + "\n")
     snapshot(root, database, directory, "after")
@@ -309,6 +334,8 @@ directory = Path(os.environ["CASE_DIR"])
 match command:
     case "capture":
         capture(arguments)
+    case "capture-closed-stdout-pipe":
+        capture(arguments, closed_stdout_pipe=True)
     case "check":
         check(directory, arguments)
     case "snapshot":

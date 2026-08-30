@@ -38,8 +38,8 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     defer list_owner.deinit();
     const list = list_owner.view();
     if (!yes and model_id.len == 0 and model_path.len == 0) {
-        printInitChoices(list);
-        sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{});
+        try printInitChoices(list);
+        sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{}) catch {};
         return errors.Error.InvalidArguments;
     }
     var selected_registry_model: ?models.Model = null;
@@ -49,7 +49,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             if (m.path.len > 0 and sys.exists(m.path)) {
                 model_path = m.path;
             } else {
-                sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{});
+                sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{}) catch {};
                 return errors.Error.ModelMissing;
             }
         } else return errors.Error.InvalidArguments;
@@ -84,7 +84,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
-    sys.stdoutPrint("initialized\n", .{});
+    try sys.stdoutPrint("initialized\n", .{});
     return 0;
 }
 
@@ -105,13 +105,51 @@ test "init validates selections before creating XDG state" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "kotoba", .{}));
 }
 
-fn printInitChoices(list: models.List) void {
-    sys.stdoutPrint("Model choices:\n", .{});
-    for (list.models) |m| {
-        if (m.recommended and m.download_url.len > 0 and m.checksum.len > 0) {
-            sys.stdoutPrint("- {s}: {s} (requires `models pull` first)\n", .{ m.id, m.name });
+test "init retains typed errors when pre-return diagnostic stderr fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var paths: xdg.Paths = undefined;
+    paths.models_file = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    const null_file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer null_file.close(std.testing.io);
+    const full = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/full", .{ .mode = .write_only });
+    defer full.close(std.testing.io);
+    const saved_stdout = std.c.dup(std.posix.STDOUT_FILENO);
+    if (saved_stdout < 0) return error.StdoutDuplicateFailed;
+    defer _ = std.c.close(saved_stdout);
+    const saved_stderr = std.c.dup(std.posix.STDERR_FILENO);
+    if (saved_stderr < 0) return error.StderrDuplicateFailed;
+    defer _ = std.c.close(saved_stderr);
+    if (std.c.dup2(null_file.handle, std.posix.STDOUT_FILENO) < 0) return error.StdoutCaptureFailed;
+    defer if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
+    if (std.c.dup2(full.handle, std.posix.STDERR_FILENO) < 0) return error.StderrCaptureFailed;
+    defer if (std.c.dup2(saved_stderr, std.posix.STDERR_FILENO) < 0) @panic("stderr restore failed");
+
+    const cases = [_]struct { cmd_args: []const []const u8, expected: anyerror }{
+        .{ .cmd_args = &.{}, .expected = errors.Error.InvalidArguments },
+        .{ .cmd_args = &.{ "--model-id", "custom" }, .expected = errors.Error.ModelMissing },
+    };
+    inline for (cases) |case| {
+        const result = run(allocator, paths, case.cmd_args);
+        if (result) |_| {
+            return error.ExpectedError;
+        } else |err| {
+            try std.testing.expectEqual(case.expected, err);
         }
     }
-    sys.stdoutPrint("- custom: provide --model-path PATH\n", .{});
-    sys.stdoutPrint("- later: use --yes to configure model_path later\n", .{});
+}
+
+fn printInitChoices(list: models.List) !void {
+    try sys.stdoutPrint("Model choices:\n", .{});
+    for (list.models) |m| {
+        if (m.recommended and m.download_url.len > 0 and m.checksum.len > 0) {
+            try sys.stdoutPrint("- {s}: {s} (requires `models pull` first)\n", .{ m.id, m.name });
+        }
+    }
+    try sys.stdoutPrint("- custom: provide --model-path PATH\n", .{});
+    try sys.stdoutPrint("- later: use --yes to configure model_path later\n", .{});
 }

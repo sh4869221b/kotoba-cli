@@ -1,4 +1,5 @@
 const std = @import("std");
+const output = @import("output.zig");
 const sys = @import("sys.zig");
 
 pub const Code = enum {
@@ -151,12 +152,37 @@ test "text encoding error mapping" {
     }
 }
 
-pub fn printHuman(app_err: AppError) void {
-    sys.stderrPrint("kotoba: {s}: {s}\n", .{ app_err.code.asText(), app_err.message });
+pub fn printHuman(app_err: AppError) !void {
+    try sys.stderrPrint("kotoba: {s}: {s}\n", .{ app_err.code.asText(), app_err.message });
 }
 
-pub fn writeJson(app_err: AppError) void {
-    sys.stdoutPrint("{{\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}\n", .{ app_err.code.asText(), app_err.message });
+pub fn writeJson(app_err: AppError) !void {
+    try output.validateJsonString(app_err.message);
+    const rendered = try output.jsonLineAlloc(std.heap.page_allocator, .{ .@"error" = .{ .code = app_err.code.asText(), .message = app_err.message } });
+    defer std.heap.page_allocator.free(rendered);
+    try sys.stdoutWrite(rendered);
+}
+
+test "error JSON safely round trips every variable text byte" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const captured = try tmp.dir.createFile(std.testing.io, "stdout", .{});
+    defer captured.close(std.testing.io);
+    const saved_stdout = std.c.dup(std.posix.STDOUT_FILENO);
+    if (saved_stdout < 0) return error.StdoutDuplicateFailed;
+    defer _ = std.c.close(saved_stdout);
+    if (std.c.dup2(captured.handle, std.posix.STDOUT_FILENO) < 0) return error.StdoutCaptureFailed;
+    defer if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) @panic("stdout restore failed");
+
+    const message = "control:\x00\x01 quote:\" slash:\\ unicode:日本語😀";
+    try @as(anyerror!void, writeJson(.{ .code = .io_error, .message = message }));
+    if (std.c.dup2(saved_stdout, std.posix.STDOUT_FILENO) < 0) return error.StdoutRestoreFailed;
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "stdout", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("io_error", parsed.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expectEqualStrings(message, parsed.value.object.get("error").?.object.get("message").?.string);
 }
 
 test "secret URL missing source and invalid arguments error mapping" {
