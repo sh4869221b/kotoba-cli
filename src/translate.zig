@@ -78,7 +78,7 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     var glossary_owner: ?glossary.OwnedGlossary = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else null;
     defer if (glossary_owner) |*owner| owner.deinit();
     const g = if (glossary_owner) |*owner| owner.view() else glossary.Glossary{ .terms = &.{} };
-    const pair = try lang.resolve(opts.source_lang, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, source_text);
+    const pair = try lang.resolve(opts.source_lang, null, opts.target_lang, cfg.default_source_lang, cfg.default_target_lang, source_text);
     const mode = opts.mode orelse cfg.default_mode;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     defer warnings.deinit();
