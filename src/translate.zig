@@ -24,6 +24,8 @@ pub const Options = struct {
     input_kind: input.InputKind = .auto,
     output_renderer: ?config.OutputRenderer = null,
     adapter_id: ?input.AdapterId = null,
+    /// Optional authoritative source language attached to borrowed Adapter metadata.
+    adapter_source_lang: ?lang.Language = null,
     include_source: bool = false,
     output_path: ?[]const u8 = null,
     overwrite: bool = false,
@@ -383,6 +385,22 @@ test "input output and adapter contracts are distinct types" {
     const adapter = input.AdapterId{ .value = "fixture" };
     try std.testing.expect(@TypeOf(input_kind) != @TypeOf(renderer));
     try std.testing.expect(@TypeOf(adapter) != @TypeOf(renderer));
+}
+
+test "adapter metadata keeps an optional authoritative source language seam" {
+    const opts = Options{
+        .input_kind = .adapter,
+        .output_renderer = .markdown,
+        .adapter_id = .{ .value = "fixture" },
+        .adapter_source_lang = .ja,
+    };
+
+    try std.testing.expectEqualStrings("fixture", opts.adapter_id.?.value);
+    try std.testing.expectEqual(lang.Language.ja, opts.adapter_source_lang.?);
+    try std.testing.expect(opts.source_lang == null);
+    try std.testing.expect(@TypeOf(opts.adapter_source_lang.?) != @TypeOf(opts.input_kind));
+    try std.testing.expect(@TypeOf(opts.adapter_source_lang.?) != @TypeOf(opts.output_renderer.?));
+    try std.testing.expect((Options{}).adapter_source_lang == null);
 }
 
 test "explicit input kind overrides extension and auto is deterministic" {
