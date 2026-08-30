@@ -21,7 +21,9 @@ pub const Options = struct {
     source_lang: ?lang.Language = null,
     target_lang: ?lang.Language = null,
     mode: ?config.Mode = null,
-    format: ?config.OutputFormat = null,
+    input_kind: input.InputKind = .auto,
+    output_renderer: ?config.OutputRenderer = null,
+    adapter_id: ?input.AdapterId = null,
     include_source: bool = false,
     output_path: ?[]const u8 = null,
     overwrite: bool = false,
@@ -70,7 +72,7 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
 
     const source_text = try input.read(allocator, opts.text, opts.file_path);
     defer allocator.free(source_text);
-    const read_kind = readKindForOptions(opts.format, opts.file_path);
+    const read_kind = resolveInputKind(opts.input_kind, opts.file_path);
     var glossary_owner: ?glossary.OwnedGlossary = if (!opts.no_glossary and cfg.glossary_enabled) try glossary.load(allocator, paths.glossary_file) else null;
     defer if (glossary_owner) |*owner| owner.deinit();
     const g = if (glossary_owner) |*owner| owner.view() else glossary.Glossary{ .terms = &.{} };
@@ -241,7 +243,7 @@ test "stdout failure after accepted row performs no compensating memory statemen
     try std.testing.expectEqual(@as(usize, 1), try db.count());
 }
 
-pub fn protectMarkdown(allocator: std.mem.Allocator, source_text: []const u8, read_kind: input.Kind) !ProtectedSource {
+pub fn protectMarkdown(allocator: std.mem.Allocator, source_text: []const u8, read_kind: input.InputKind) !ProtectedSource {
     if (read_kind == .markdown) {
         const doc = try markdown.protect(allocator, source_text);
         return .{ .text = doc.text, .doc = doc };
@@ -339,25 +341,26 @@ fn consumeResult(allocator: std.mem.Allocator, result: contract.Result, translat
     try translated.appendSlice(result.text);
 }
 
-pub fn readKindForOptions(format: ?config.OutputFormat, file_path: ?[]const u8) input.Kind {
-    if (format) |fmt| {
-        if (fmt == .markdown) return .markdown;
-    }
-    if (file_path) |p| {
-        if (input.isMarkdown(p)) return .markdown;
-    }
-    return .text;
+pub fn resolveInputKind(requested: input.InputKind, file_path: ?[]const u8) input.InputKind {
+    return switch (requested) {
+        .text, .markdown => requested,
+        .adapter => .text,
+        .auto => if (file_path) |path|
+            if (input.isMarkdown(path)) .markdown else .text
+        else
+            .text,
+    };
 }
 
 pub fn diagnosticsEnabled(cfg: config.Config, opts: Options) bool {
     return opts.debug or std.mem.eql(u8, cfg.log_level, "debug");
 }
 
-pub fn writeOutput(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
+pub fn writeOutput(allocator: std.mem.Allocator, res: output.Result, read_kind: input.InputKind, file_path: ?[]const u8, explicit_output: ?[]const u8, overwrite: bool) !bool {
     return writeOutputWithOptions(allocator, res, read_kind, file_path, explicit_output, .{ .mode = if (overwrite) .replace else .no_replace });
 }
 
-fn writeOutputWithOptions(allocator: std.mem.Allocator, res: output.Result, read_kind: input.Kind, file_path: ?[]const u8, explicit_output: ?[]const u8, options: sys.StagedFileOptions) !bool {
+fn writeOutputWithOptions(allocator: std.mem.Allocator, res: output.Result, read_kind: input.InputKind, file_path: ?[]const u8, explicit_output: ?[]const u8, options: sys.StagedFileOptions) !bool {
     const owned_path = if (explicit_output == null and read_kind == .markdown and file_path != null) try input.defaultMarkdownOutput(allocator, file_path.?, res.target_lang.asText()) else null;
     defer if (owned_path) |path| allocator.free(path);
     const target_path = explicit_output orelse owned_path orelse return false;
@@ -427,7 +430,7 @@ test "translate rejects missing model before segment filtering" {
         \\| --- |
         \\| b |
         ,
-        .format = .markdown,
+        .input_kind = .markdown,
         .no_memory = true,
         .no_glossary = true,
     }));
@@ -999,7 +1002,7 @@ test "ownership/translation bounded batches" {
     defer for (owners[0..initialized]) |*owner| owner.deinit();
     // Prime both persisted cache fixtures; measured cache-enabled calls are all hits.
     for (sources, 0..) |source, i| {
-        var seed = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, ownershipConfig(), .{ .text = source, .source_lang = .en, .target_lang = .ja, .format = if (i == 1) .markdown else .plain, .no_glossary = true });
+        var seed = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, ownershipConfig(), .{ .text = source, .source_lang = .en, .target_lang = .ja, .input_kind = if (i == 1) .markdown else .text, .no_glossary = true });
         seed.deinit();
     }
     for (owners, 0..) |*owner, i| {
@@ -1013,7 +1016,7 @@ test "ownership/translation bounded batches" {
             cfg.model_id = try inputs.allocator().dupe(u8, "owned-model");
             cfg.model_path = try inputs.allocator().dupe(u8, "unused.gguf");
             const source = try inputs.allocator().dupe(u8, sources[kind]);
-            owner.* = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, cfg, .{ .text = source, .source_lang = .en, .target_lang = .ja, .format = if (kind == 1) .markdown else .plain, .no_memory = fixture < 2, .no_glossary = true });
+            owner.* = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, cfg, .{ .text = source, .source_lang = .en, .target_lang = .ja, .input_kind = if (kind == 1) .markdown else .text, .no_memory = fixture < 2, .no_glossary = true });
             initialized += 1;
             try std.testing.expect(inputs.reset(.retain_capacity));
             @memset(try inputs.allocator().alloc(u8, 4096), 'x');
@@ -1107,7 +1110,7 @@ fn exerciseTranslationOwnership(a: std.mem.Allocator, domain: enum { result, scr
     runs.* += 1;
     const result_allocator = if (domain == .result) a else std.testing.allocator;
     const scratch_allocator = if (domain == .scratch) a else std.testing.allocator;
-    var owner = try runWithAllocators(result_allocator, scratch_allocator, std.testing.allocator, undefined, ownershipConfig(), .{ .text = if (markdown_input) "Hello `code`\n\nworld [link](https://example.invalid)\n\n" else "Hello\n\nworld\n\n", .source_lang = .en, .target_lang = .ja, .format = if (markdown_input) .markdown else .plain, .no_glossary = true, .no_memory = true });
+    var owner = try runWithAllocators(result_allocator, scratch_allocator, std.testing.allocator, undefined, ownershipConfig(), .{ .text = if (markdown_input) "Hello `code`\n\nworld [link](https://example.invalid)\n\n" else "Hello\n\nworld\n\n", .source_lang = .en, .target_lang = .ja, .input_kind = if (markdown_input) .markdown else .text, .no_glossary = true, .no_memory = true });
     defer owner.deinit();
     try std.testing.expectEqualStrings(if (markdown_input) "JA:Hello `code`\n\nJA:world [link](https://example.invalid)\n\n" else "JA:Hello\n\nJA:world\n\n", owner.view().translated_text);
 }

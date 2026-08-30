@@ -3,7 +3,12 @@ const errors = @import("errors.zig");
 const sys = @import("sys.zig");
 const text = @import("text.zig");
 
-pub const Kind = enum { text, markdown };
+pub const InputKind = enum { auto, text, markdown, adapter };
+
+/// Borrowed Adapter identity; `value` must outlive every option that references it.
+pub const AdapterId = struct {
+    value: []const u8,
+};
 
 pub fn read(allocator: std.mem.Allocator, direct_text: ?[]const u8, file_path: ?[]const u8) ![]u8 {
     if (direct_text != null and file_path != null) return errors.Error.InvalidArguments;

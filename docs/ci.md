@@ -96,8 +96,8 @@ They distinguish configured workload from an observed receipt, and the build
 contract compares build and installed/copied stdin-closed `kotoba-tests` runs.
 
 The full CLI matrix is unconditional and rejects absent/empty groups or missing
-passing receipts. Current exact-SHA receipts record 365 cases: translate 46,
-commands 251, memory 23, files 45. Its standalone command is:
+passing receipts. The current exact-SHA counts are recorded from the matrix
+`summary.json`. Its standalone command is:
 
 ```bash
 mise exec -- bash test/integration/cli_matrix.sh --evidence-dir "$PWD/.omo/evidence/cli-matrix"
@@ -107,12 +107,12 @@ mise exec -- bash test/integration/parallel.sh --rounds 3 --evidence-dir "$PWD/.
 `integration` accepts `--suite all|smoke|matrix|parallel`; its default is
 `all`, and its default parallel setting is two rounds. The workflow runs the
 three child jobs concurrently. `smoke` observes one common self-test and one
-smoke run; `matrix` observes one common self-test and the 365-case matrix.
+smoke run; `matrix` observes one common self-test and the full CLI matrix.
 Each parallel round has nine children (four unit, two smoke, one benchmark,
 two full matrices) and derives four unit logs, one benchmark, 15 benchmark
 measurements, and two matrix receipts. Thus a two-round run observes 18
-children, eight unit logs, two benchmarks, 30 measurements, 2,480 unit-test
-executions, and four 365-case matrix receipts. Pull requests configure one
+children, eight unit logs, two benchmarks, 30 measurements, the unit-test
+executions recorded by its receipt, and four full matrix receipts. Pull requests configure one
 parallel round; `master` pushes and manual dispatch configure two. These are
 configuration and local-receipt facts, not evidence of a hosted schedule or
 completed remote run. See [test-harness.md](test-harness.md#cli-contract-matrix)
