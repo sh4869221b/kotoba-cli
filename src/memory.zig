@@ -9,6 +9,16 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+fn sqliteLength(len: usize) !c_int {
+    return std.math.cast(c_int, len) orelse errors.Error.SqliteFailed;
+}
+
+fn duplicateSqliteText(allocator: std.mem.Allocator, ptr: [*c]const u8, len: c_int) ![]u8 {
+    const bytes = ptr orelse return errors.Error.SqliteFailed;
+    const byte_len = std.math.cast(usize, len) orelse return errors.Error.SqliteFailed;
+    return allocator.dupe(u8, bytes[0..byte_len]);
+}
+
 pub const Key = struct {
     source_text: []const u8,
     source_lang: lang.Language,
@@ -67,18 +77,21 @@ pub const Stmt = struct {
     handle: *c.sqlite3_stmt,
     allocator: std.mem.Allocator,
     faults: ?*Faults = null,
+    finalized: bool = false,
     pub fn prepare(db: *Db, sql: []const u8) !Stmt {
         var handle: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &handle, null) != c.SQLITE_OK) return errors.Error.SqliteFailed;
+        if (c.sqlite3_prepare_v2(db.handle, sql.ptr, try sqliteLength(sql.len), &handle, null) != c.SQLITE_OK) return errors.Error.SqliteFailed;
         return .{ .handle = handle orelse return errors.Error.SqliteFailed, .allocator = db.allocator, .faults = db.faults };
     }
 
     pub fn deinit(self: *Stmt) void {
+        if (self.finalized) return;
+        self.finalized = true;
         _ = c.sqlite3_finalize(self.handle);
     }
 
     pub fn bindText(self: *Stmt, idx: c_int, text: []const u8) !void {
-        if (c.sqlite3_bind_text(self.handle, idx, text.ptr, @intCast(text.len), c.SQLITE_TRANSIENT) != c.SQLITE_OK) return errors.Error.SqliteFailed;
+        if (c.sqlite3_bind_text(self.handle, idx, text.ptr, try sqliteLength(text.len), c.SQLITE_TRANSIENT) != c.SQLITE_OK) return errors.Error.SqliteFailed;
     }
 
     pub fn step(self: *Stmt) !c_int {
@@ -91,9 +104,7 @@ pub const Stmt = struct {
     }
 
     pub fn columnTextDup(self: *Stmt, idx: c_int) ![]u8 {
-        const ptr = c.sqlite3_column_text(self.handle, idx) orelse return errors.Error.SqliteFailed;
-        const len: usize = @intCast(c.sqlite3_column_bytes(self.handle, idx));
-        return self.allocator.dupe(u8, ptr[0..len]);
+        return duplicateSqliteText(self.allocator, c.sqlite3_column_text(self.handle, idx), c.sqlite3_column_bytes(self.handle, idx));
     }
 };
 
@@ -101,9 +112,12 @@ pub const Db = struct {
     handle: *c.sqlite3,
     allocator: std.mem.Allocator,
     faults: ?*Faults = null,
+    closed: bool = false,
 
     pub fn close(self: *Db) void {
-        _ = c.sqlite3_close(self.handle);
+        if (self.closed) return;
+        self.closed = true;
+        _ = c.sqlite3_close_v2(self.handle);
     }
 
     pub fn initSchema(self: *Db) !void {
@@ -226,6 +240,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
 }
 
 pub fn openWithFaults(allocator: std.mem.Allocator, path: []const u8, faults: ?*Faults) !Db {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return errors.Error.EmbeddedNul;
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -240,6 +255,7 @@ pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) !Db {
 }
 
 pub fn openReadOnlyWithFaults(allocator: std.mem.Allocator, path: []const u8, faults: ?*Faults) !Db {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return errors.Error.EmbeddedNul;
     const path_z = sys.realPathAlloc(allocator, path) catch return errors.Error.SqliteFailed;
     defer allocator.free(path_z);
     try checkReadOnlyFiles(allocator, path_z);
@@ -373,6 +389,42 @@ test "sqlite statement wrapper binds and duplicates text" {
     try std.testing.expectEqualStrings("translated", translated);
 }
 
+test "sqlite text binding rejects lengths beyond c int" {
+    var db = try open(std.testing.allocator, ":memory:");
+    defer db.close();
+    var stmt = try Stmt.prepare(&db, "SELECT ?");
+    defer stmt.deinit();
+    const text_ptr: [*]const u8 = "value\x00".ptr;
+    const too_long = text_ptr[0 .. @as(usize, @intCast(std.math.maxInt(c_int))) + 1];
+    try std.testing.expectError(error.SqliteFailed, stmt.bindText(1, too_long));
+}
+
+test "sqlite statement preparation rejects lengths beyond c int" {
+    var db = try open(std.testing.allocator, ":memory:");
+    defer db.close();
+    const sql_ptr: [*]const u8 = "SELECT 1\x00".ptr;
+    const too_long = sql_ptr[0 .. @as(usize, @intCast(std.math.maxInt(c_int))) + 1];
+    try std.testing.expectError(error.SqliteFailed, Stmt.prepare(&db, too_long));
+}
+
+test "sqlite statement teardown consumes ownership once" {
+    var db = try open(std.testing.allocator, ":memory:");
+    defer db.close();
+    var stmt = try Stmt.prepare(&db, "SELECT 1");
+    stmt.deinit();
+    try std.testing.expect(stmt.finalized);
+    stmt.deinit();
+    try std.testing.expect(stmt.finalized);
+}
+
+test "sqlite database teardown consumes ownership once" {
+    var db = try open(std.testing.allocator, ":memory:");
+    db.close();
+    try std.testing.expect(db.closed);
+    db.close();
+    try std.testing.expect(db.closed);
+}
+
 fn hitCount(db: *Db, key: Key) !usize {
     const hash_text = try sourceHash(std.testing.allocator, key.source_text);
     defer std.testing.allocator.free(hash_text);
@@ -451,6 +503,25 @@ test "fault sqlite failure injected open has no file side effect" {
     try std.testing.expectEqual(@as(usize, 1), faults.count(.open));
     try std.testing.expectEqual(@as(usize, 0), faults.count(.step));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "absent.sqlite3", .{}));
+}
+
+test "sqlite rejects embedded NUL in database paths before the C call" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const prefix = try std.fs.path.join(std.testing.allocator, &.{ root, "prefix.sqlite3" });
+    defer std.testing.allocator.free(prefix);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}\x00ignored.sqlite3", .{prefix});
+    defer std.testing.allocator.free(path);
+
+    const result = open(std.testing.allocator, path);
+    if (result) |value| {
+        var unexpected = value;
+        unexpected.close();
+    } else |_| {}
+    try std.testing.expectError(error.EmbeddedNul, result);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, prefix, .{}));
 }
 
 const TestDatabaseFile = struct {
@@ -762,6 +833,26 @@ test "sqlite column text copies exact byte lengths" {
         try std.testing.expectEqualSlices(u8, expected, actual);
     }
     try std.testing.expectError(error.SqliteFailed, stmt.columnTextDup(4));
+}
+
+test "sqlite column copy rejects negative C lengths" {
+    const bytes = [_]u8{'x'};
+    try std.testing.expectError(error.SqliteFailed, duplicateSqliteText(std.testing.allocator, bytes[0..].ptr, -1));
+}
+
+test "sqlite column copy rejects null and positive length mismatch" {
+    try std.testing.expectError(error.SqliteFailed, duplicateSqliteText(std.testing.allocator, null, 1));
+}
+
+test "sqlite column cleanup preserves allocation failure as primary error" {
+    var db = try open(std.testing.allocator, ":memory:");
+    defer db.close();
+    var stmt = try Stmt.prepare(&db, "SELECT 'owned'");
+    defer stmt.deinit();
+    try std.testing.expectEqual(c.SQLITE_ROW, try stmt.step());
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    stmt.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, stmt.columnTextDup(0));
 }
 
 // Hex and BLOB lengths inspect legacy bytes independently of TEXT transport.
