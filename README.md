@@ -187,7 +187,8 @@ Model installs reject an output referenced by another registered or selected
 model, including paths that refer to the output through symlinks. A relative
 reference from another ID blocks replacement of an existing output when its
 base directory is unknown. Model installation requires a readable, valid
-config when one exists, including a config reached through a symbolic link.
+config when one exists. A symbolic link to the settings file stays in place
+when Kotoba updates its target. A dangling config link causes an error.
 `config set model_path PATH` records an explicit override in config with
 `model_path_explicit = true`. `models use ID` and `--use` select the registered
 path and clear that marker. Installs keep recorded overrides that name a
@@ -195,7 +196,8 @@ different path. A selection that names its registered path follows the
 registration when the name changes. If an older config could represent
 either a registry selection or an override, Kotoba asks for an explicit
 choice before publishing the model. Older releases with strict config
-parsing reject the override marker when present.
+parsing reject the override marker when present. See the
+[configuration compatibility and recovery steps](docs/strict-toml.md#configuration).
 
 ## Command side effects
 

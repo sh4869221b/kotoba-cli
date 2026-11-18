@@ -916,6 +916,49 @@ PYTHON
     fi
   done
 
+  for variant in move refresh selected; do
+    matrix_case "commands-models-pull-legacy-distinct-paths-$variant"
+    commands_fixture
+    local old_model="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+    # An earlier CLI could register this copy with a pull without --use,
+    # keeping the selection created by the first pull with --use.
+    cp "$old_model" intermediate.gguf
+    sed -i -e "s|^path = .*|path = \"$PWD/intermediate.gguf\"|" \
+      -e "s|^download_url = .*|download_url = \"file://$old_model\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+    local output
+    case "$variant" in
+      move) output="$PWD/moved.gguf" ;;
+      refresh) output="$PWD/intermediate.gguf" ;;
+      selected) output="$old_model" ;;
+    esac
+    matrix_run models pull fixture --output "$output"
+    commands_error model_reselection_required
+    commands_state '' '' ''
+  done
+
+  matrix_case commands-models-pull-follow-updates-linked-config
+  commands_fixture
+  local old_model="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  sed -i "s|^download_url = .*|download_url = \"file://$old_model\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  mv "$XDG_CONFIG_HOME/kotoba/config.toml" shared.toml
+  ln -s ../../work/shared.toml "$XDG_CONFIG_HOME/kotoba/config.toml"
+  ln -s shared.toml observer.toml
+  matrix_run models pull fixture --output "$PWD/moved.gguf"
+  commands_streams 0 $'pulled fixture\n'
+  matrix_assert custom preserved-link test "$(readlink "$XDG_CONFIG_HOME/kotoba/config.toml")" = ../../work/shared.toml
+  matrix_assert custom shared-selection python3 -c 'import sys, tomllib; assert tomllib.load(open(sys.argv[1], "rb"))["model_path"] == sys.argv[2]' "$PWD/observer.toml" "$PWD/moved.gguf"
+  commands_state work/moved.gguf config/kotoba/models.toml,work/shared.toml ''
+
+  matrix_case commands-models-pull-output-linked-config-target
+  commands_fixture
+  local old_model="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  sed -i "s|^download_url = .*|download_url = \"file://$old_model\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  mv "$XDG_CONFIG_HOME/kotoba/config.toml" shared.gguf
+  ln -s ../../work/shared.gguf "$XDG_CONFIG_HOME/kotoba/config.toml"
+  matrix_run models pull fixture --output "$PWD/shared.gguf" --use
+  commands_error
+  commands_state '' '' ''
+
   local destination
   for variant in selected-via-parent registered-via-link selected-via-dangling-link selected-via-40-links; do
     matrix_case "commands-models-pull-output-referenced-$variant"

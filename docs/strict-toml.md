@@ -10,8 +10,8 @@ full TOML conformance. The supported files remain unversioned. No `version`,
 
 ### Configuration
 
-`config.toml` has these 16 supported keys. Omitted keys retain the listed
-defaults. An empty or comment-only file is therefore a valid default-valued
+`config.toml` supports 16 user-settable keys and one optional selection
+marker. Omitted keys retain the listed defaults. An empty or comment-only file is therefore a valid default-valued
 configuration. Configuration has no table headers.
 
 | Key | Type | Default / accepted values |
@@ -22,6 +22,7 @@ configuration. Configuration has no table headers.
 | `default_output` | enum string | `plain`, `json`, `markdown`; default `plain` |
 | `model_id` | string | any permitted UTF-8 string; default empty |
 | `model_path` | string | any permitted UTF-8 string; default empty |
+| `model_path_explicit` | boolean | exactly `true` or `false`. Default `false`. Written only when `true`. |
 | `gpu_layers` | signed decimal integer | i32; default `-1` |
 | `context_length` | unsigned decimal integer | u32; default `4096` |
 | `threads` | unsigned decimal integer | u32; default `0` |
@@ -36,6 +37,25 @@ configuration. Configuration has no table headers.
 The three arbitrary strings do not acquire new path, enum, or positivity
 restrictions in this contract. Existing command validation still applies when
 a value is set through the CLI.
+
+`config set model_path PATH` records `model_path_explicit = true` for a
+nonempty path. The marker is managed by Kotoba and stays out of `config list`.
+`models use ID` and a successful install with `--use` select the registered
+path and clear the marker. Installs preserve recorded overrides that name a
+different path. If the selection names its previous registered path, it
+follows changes to that name. If a nonempty selection for the active ID
+differs from the current registration and carries no marker, an install
+returns `model_reselection_required` before publishing. An older pull may
+have left that mismatch even when both paths refer to different files.
+
+Older releases with strict config parsing reject `model_path_explicit` as
+an unknown key and report `config_invalid`. To return to the registered
+path before a downgrade, run `kotoba models use ID` with the newer CLI.
+To retain an override on downgrade, back up the settings file, then remove
+only the `model_path_explicit` line and keep `model_path` as written. For a
+linked config, edit the file reached through the link. This manual edit
+discards the record of why the path was chosen. After upgrading, use
+`kotoba config set model_path PATH` to record the override again.
 
 This is a valid complete configuration example. It demonstrates a basic
 string escape, a literal Windows path, a comment, and an exponent number:
@@ -236,11 +256,14 @@ blank-line placement, quote style, key order, line endings, and other layout
 choices are not preserved. A successful write emits canonical field order,
 basic strings, LF endings, and registry language order. Each configuration or
 registry file is published independently through a complete exclusive sibling
-stage in its parent directory: the stage is flushed, synced, checked closed,
-and then atomically replaces the destination entry. This is bounded per-file
-publication only. It does not fsync the parent directory, promise power-loss
-durability or recovery, coordinate config and registry as one transaction,
-provide rollback, or provide inter-process locking.
+stage in the destination's parent directory. Kotoba flushes, syncs, and
+closes the stage before atomically replacing the destination. For a linked
+config, that destination is the resolved settings file and the symbolic link
+stays in place. A dangling link causes an error. The config and registry
+writes are separate per-file operations. Kotoba writers sharing an XDG
+config directory use a common lock. The lock scope is the config directory,
+and publication does not fsync the parent directory or provide cross-file
+rollback or power-loss recovery.
 
 For a canonical supported model `M`, the invariant is:
 
@@ -282,11 +305,12 @@ There are four persistence error categories, plus absence:
 The human messages for invalid state are `config.toml is invalid.` and
 `models.toml is invalid.`. Schema messages are `config.toml uses an
 unsupported schema or version.` and `models.toml uses an unsupported schema or
-version.`. Native failures retain their native error name. Only
-`FileNotFound` means absent at the loader boundary. AccessDenied, IsDir,
-StreamTooLong, other I/O errors, and allocation failures are not converted to
-invalid or missing state. The existing size limits remain 1 MiB for config and
-2 MiB for the registry.
+version.`. Native failures retain their native error name. A missing
+`config.toml` directory entry is absent. A dangling `config.toml` symlink
+reports `FileNotFound` as a native error. Registry loading uses
+`FileNotFound` for its absence check. AccessDenied, IsDir, StreamTooLong,
+other I/O errors, and allocation failures keep their native names. The
+existing size limits remain 1 MiB for config and 2 MiB for the registry.
 
 `ensure` validates an existing registry without writing and creates the default
 template only when the registry is actually absent. Its creation publication is
@@ -298,13 +322,12 @@ absent registry state.
 Before a state-changing operation, valid configuration and registry state is
 loaded before directories are created, files are copied or downloaded, files
 are deleted, or the registry is changed. This preflight applies to `init`,
-model selection, removal, `models import --use`, and `models pull --use`;
-registry validation precedes every acquisition or mutation, including direct
-URL and Hugging Face pulls. A non-use import or pull need not load unrelated
-configuration. Argument-shape validation still has precedence. Successful
-preflight does not provide a transaction or rollback guarantee: a later
-operation can still fail partway through and leave partial cross-resource
-state.
+model selection, removal, and all `models import` and `models pull`
+operations. Registry validation precedes every acquisition or mutation,
+including direct URL and Hugging Face pulls. Installs also recheck
+configuration under the writer lock before publication. Argument-shape
+validation still has precedence. A later failure can leave partial
+cross-resource state because the files are published independently.
 
 ## Design choice
 

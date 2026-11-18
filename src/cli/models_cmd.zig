@@ -324,6 +324,9 @@ fn commitInstall(
     defer cfg.deinit();
     const destination = (try installEntryPath(allocator, m.path)) orelse return errors.Error.PathResolutionFailed;
     defer allocator.free(destination);
+    // A linked config target can have any extension. It must remain
+    // readable even when a caller chooses its name as a model output.
+    if (try referencesInstallEntry(allocator, paths.config_file, destination)) return errors.Error.InvalidArguments;
     const dest_stat = sys.cwd().statFile(sys.io(), destination, .{}) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -351,29 +354,17 @@ fn commitInstall(
 
 fn followsMovingRegistration(settings: config.Config, current: ?models.Model, output: []const u8) !bool {
     const selected = settings.model_path;
-    if (selected.len == 0 or sameStoredPath(selected, output)) return false;
+    if (selected.len == 0) return false;
+    if (current) |registered| {
+        // Identical names share the same reference even in legacy config.
+        // Re-anchor selection together with registration on a name change.
+        if (sameStoredPath(selected, registered.path)) return !sameStoredPath(selected, output);
+    }
+    if (settings.model_path_explicit) return false;
 
-    const previous = (current orelse {
-        if (settings.model_path_explicit) return false;
-        return errors.Error.ModelReselectionRequired;
-    }).path;
-    // Identical names share the same reference even in legacy config. Keep
-    // selection and registration together when changing from a symlink to
-    // its referent too, so a subsequent move can still follow the registry.
-    if (sameStoredPath(selected, previous)) return true;
-    if (settings.model_path_explicit or sameStoredPath(previous, output)) return false;
-
-    // Older configs recorded no explicit override. Different absolute paths
-    // to distinct files identify an override. An alias, unknown base, or
-    // missing file could instead be a registration that previously drifted.
-    if (!std.fs.path.isAbsolute(selected) or !std.fs.path.isAbsolute(previous))
-        return errors.Error.ModelReselectionRequired;
-    const active = try models.InstallSource.open(selected) orelse return errors.Error.ModelReselectionRequired;
-    defer active.close();
-    const registered = try models.InstallSource.open(previous) orelse return errors.Error.ModelReselectionRequired;
-    defer registered.close();
-    if (active.sameFile(registered)) return errors.Error.ModelReselectionRequired;
-    return false;
+    // Older pulls could move the registration without moving the selection.
+    // Even two distinct files do not establish an explicit override.
+    return errors.Error.ModelReselectionRequired;
 }
 
 fn conflictsWithInstall(allocator: std.mem.Allocator, reference: []const u8, destination: []const u8, replacing: bool) !bool {

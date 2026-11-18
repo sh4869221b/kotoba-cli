@@ -86,10 +86,11 @@ existing canonical URL exception and the preflight boundary for state-changing
 commands. Each `config.toml` and `models.toml` file is published independently
 by same-parent per-file atomic replacement: Kotoba writes a complete exclusive
 sibling stage, flushes it, syncs the file, closes it with checked errors, and
-then replaces the destination entry. This does not fsync the parent directory
-or promise power-loss durability or recovery. The two files are not one
-cross-file transaction: no rollback is attempted, and no inter-process locking
-is provided.
+then replaces the destination entry. When the config is a symbolic link,
+Kotoba updates its resolved target and keeps the link. A dangling config
+link causes an error. Kotoba writers sharing the XDG config directory
+serialize their commits with a common lock. Publication does not fsync the
+parent directory or provide cross-file rollback or power-loss recovery.
 Translation output files use the separate staged-publication contract below.
 
 Read-only memory and doctor checks preflight databases without concurrent

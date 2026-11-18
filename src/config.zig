@@ -381,7 +381,14 @@ fn saveWithOptions(path: []const u8, cfg: Config, options: sys.StagedFileOptions
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ConfigInvalid,
     };
-    try sys.atomicWriteFile(std.heap.page_allocator, path, out.items, options);
+    const allocator = std.heap.page_allocator;
+    const linked_target = switch (try sys.pathState(path)) {
+        .not_found => null,
+        .present => |stat| if (stat.kind == .sym_link) try sys.realPathAlloc(allocator, path) else null,
+    };
+    defer if (linked_target) |target| allocator.free(target);
+    const destination: []const u8 = if (linked_target) |target| target else path;
+    try sys.atomicWriteFile(allocator, destination, out.items, options);
 }
 
 fn appendConfig(out: *strict.Buffer, cfg: Config) !void {
@@ -442,6 +449,43 @@ fn testExpectOnlyConfigEntries(dir: std.Io.Dir, existing: bool) !void {
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, if (existing) 2 else 1), count);
+}
+
+test "atomic config save follows an existing link and preserves its entries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    defer allocator.free(path);
+    try tmp.dir.createDir(io, "shared", .default_dir);
+    const original = "threads = 3\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared/settings.toml", .data = original });
+    try tmp.dir.setFilePermissions(io, "shared/settings.toml", .fromMode(0o640), .{});
+    try tmp.dir.symLink(io, "shared/settings.toml", "target.toml", .{});
+    try tmp.dir.symLink(io, "target.toml", "config.toml", .{});
+
+    var faults: staged_output.Faults = .{};
+    try faults.arm(.rename, 1, error.InputOutput);
+    try std.testing.expectError(error.InputOutput, saveWithOptions(path, .{ .threads = 7 }, .{ .faults = &faults }));
+    const unchanged = try tmp.dir.readFileAlloc(io, "shared/settings.toml", allocator, .limited(128));
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(original, unchanged);
+
+    try save(path, .{ .threads = 7 });
+    var loaded = try load(allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 7), loaded.view().threads);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), (try tmp.dir.statFile(io, "shared/settings.toml", .{})).permissions.toMode() & 0o777);
+    try tmp.dir.deleteFile(io, "shared/settings.toml");
+    try std.testing.expectError(error.FileNotFound, save(path, .{ .threads = 9 }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "shared/settings.toml", .{}));
+
+    var link: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("target.toml", link[0..try tmp.dir.readLink(io, "config.toml", &link)]);
+    try std.testing.expectEqualStrings("shared/settings.toml", link[0..try tmp.dir.readLink(io, "target.toml", &link)]);
 }
 
 test "atomic config save preserves destination through every publication boundary" {
