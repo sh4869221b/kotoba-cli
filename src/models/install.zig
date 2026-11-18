@@ -14,49 +14,97 @@ pub const AcquireOptions = struct {
     managed: bool = false,
 };
 
-pub fn acquire(allocator: std.mem.Allocator, m: types.Model, dest_path: []const u8, options: AcquireOptions) !void {
-    return acquireWithDownloader(allocator, m, dest_path, options, downloadHttps);
+pub fn stagePull(allocator: std.mem.Allocator, m: types.Model, dest: []const u8, options: AcquireOptions) !?StagedModel {
+    return stageWithDownloader(allocator, m, dest, options, downloadHttps);
 }
 
-pub fn acquireWithDownloader(
+fn acquire(allocator: std.mem.Allocator, m: types.Model, dest: []const u8, options: AcquireOptions) !void {
+    try acquireWithDownloader(allocator, m, dest, options, downloadHttps);
+}
+
+fn acquireWithDownloader(
     allocator: std.mem.Allocator,
     m: types.Model,
-    dest_path: []const u8,
+    dest: []const u8,
     options: AcquireOptions,
     downloader: Downloader,
 ) !void {
-    if (options.skip_download or m.download_url.len == 0) return;
-    if (dest_path.len == 0) return errors.Error.InvalidArguments;
+    var stage = try stageWithDownloader(allocator, m, dest, options, downloader) orelse return;
+    defer stage.deinit();
+    try stage.publish(dest);
+}
+
+pub fn stageWithDownloader(
+    allocator: std.mem.Allocator,
+    m: types.Model,
+    dest: []const u8,
+    options: AcquireOptions,
+    downloader: Downloader,
+) !?StagedModel {
+    if (options.skip_download or m.download_url.len == 0) return null;
+    if (dest.len == 0) return errors.Error.InvalidArguments;
     const request = if (url_policy.isRemote(m.download_url)) blk: {
         const uri = try url_policy.parseRemote(m.download_url);
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
         break :blk try url_policy.requestUrl(m.download_url);
     } else null;
-    const temp_path = try tempPath(allocator, dest_path);
-    defer allocator.free(temp_path);
-    errdefer sys.deleteFile(temp_path);
-    if (std.fs.path.dirname(temp_path)) |dir| try sys.makePath(dir);
+
+    var stage = try StagedModel.begin(allocator, dest);
+    errdefer stage.deinit();
     if (request) |remote| {
-        try downloader(allocator, remote, temp_path);
+        try downloader(allocator, remote, stage.path);
     } else if (std.mem.startsWith(u8, m.download_url, "file://")) {
-        try copyFile(m.download_url["file://".len..], temp_path);
+        try sys.copyFile(m.download_url["file://".len..], stage.path);
     } else {
-        try copyFile(m.download_url, temp_path);
+        try sys.copyFile(m.download_url, stage.path);
     }
-    if (options.managed) verity.prepareLargeCopy(temp_path);
-    if (m.checksum.len > 0) try checksum.verifySha256(temp_path, m.checksum);
-    try sys.renameFile(temp_path, dest_path);
+    try stage.verify(m.checksum, options.managed);
+    return stage;
 }
 
 pub const StagedModel = struct {
     allocator: std.mem.Allocator,
+    directory: []const u8,
     path: []const u8,
     published: bool = false,
 
+    pub fn begin(allocator: std.mem.Allocator, dest: []const u8) !StagedModel {
+        // An exclusive private directory reserves the stage for both local
+        // copying and the downloader, while keeping publish on the same FS.
+        const parent = std.fs.path.dirname(dest) orelse ".";
+        try sys.makePath(parent);
+        const io = sys.io();
+        for (0..32) |_| {
+            var random: [16]u8 = undefined;
+            try std.Io.randomSecure(io, &random);
+            const hex = std.fmt.bytesToHex(random, .lower);
+            const directory = try std.fmt.allocPrint(allocator, "{s}/.kotoba-model.tmp-{s}", .{ parent, &hex });
+            errdefer allocator.free(directory);
+            sys.cwd().createDir(io, directory, .fromMode(0o700)) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(directory);
+                    continue;
+                },
+                else => return err,
+            };
+            errdefer sys.cwd().deleteDir(io, directory) catch {};
+            const path = try std.fs.path.join(allocator, &.{ directory, "model.gguf" });
+            return .{ .allocator = allocator, .directory = directory, .path = path };
+        }
+        return error.PathAlreadyExists;
+    }
+
     pub fn deinit(self: *StagedModel) void {
         if (!self.published) sys.deleteFile(self.path);
+        sys.cwd().deleteDir(sys.io(), self.directory) catch {};
         self.allocator.free(self.path);
+        self.allocator.free(self.directory);
         self.* = undefined;
+    }
+
+    pub fn verify(self: StagedModel, expected_checksum: []const u8, managed: bool) !void {
+        if (managed) verity.prepareLargeCopy(self.path);
+        try checksum.verifyModel(.{ .path = self.path, .checksum = expected_checksum });
     }
 
     pub fn publish(self: *StagedModel, dest: []const u8) !void {
@@ -66,28 +114,11 @@ pub const StagedModel = struct {
 };
 
 pub fn stageLocalFile(allocator: std.mem.Allocator, src: []const u8, dest: []const u8, expected_checksum: []const u8) !StagedModel {
-    var staged: StagedModel = .{ .allocator = allocator, .path = try tempPath(allocator, dest) };
-    errdefer staged.deinit();
-    try sys.copyFile(src, staged.path);
-    verity.prepareLargeCopy(staged.path);
-    if (expected_checksum.len > 0) try checksum.verifySha256(staged.path, expected_checksum);
-    return staged;
-}
-
-fn copyFile(src: []const u8, dest: []const u8) !void {
-    try sys.copyFile(src, dest);
-}
-
-pub fn installedPath(allocator: std.mem.Allocator, models_dir: []const u8, id: []const u8) ![]const u8 {
-    const filename = try std.fmt.allocPrint(allocator, "{s}.gguf", .{id});
-    defer allocator.free(filename);
-    return std.fs.path.join(allocator, &.{ models_dir, filename });
-}
-
-fn tempPath(allocator: std.mem.Allocator, dest_path: []const u8) ![]const u8 {
-    var bytes: [8]u8 = undefined;
-    const nonce = if (std.Io.randomSecure(sys.io(), &bytes)) |_| std.mem.readInt(u64, &bytes, .little) else |_| sys.millis();
-    return std.fmt.allocPrint(allocator, "{s}.tmp-{x}", .{ dest_path, nonce });
+    var stage = try StagedModel.begin(allocator, dest);
+    errdefer stage.deinit();
+    try sys.copyFile(src, stage.path);
+    try stage.verify(expected_checksum, true);
+    return stage;
 }
 
 fn downloadHttps(allocator: std.mem.Allocator, url: []const u8, dest: []const u8) !void {

@@ -199,14 +199,21 @@ pub fn installedPath(allocator: std.mem.Allocator, models_dir: []const u8, id: [
     return std.fs.path.join(allocator, &.{ models_dir, filename });
 }
 
-/// Serialize model registry and selection writes using the stable directory
-/// inode. Atomic replacement would invalidate a lock on the TOML file itself.
+const write_lock_name = ".state.lock";
+
+/// Use a known filename so the directory only needs write and search access.
+/// The lock file is unlinked before releasing the lock. Waiters check its
+/// identity after flock so a waiter on the retired inode cannot enter.
 pub const Writer = struct {
     directory: std.Io.Dir,
+    lock_file: std.Io.File,
     path: []const u8,
 
     pub fn close(self: Writer) void {
-        self.directory.close(sys.io());
+        const io = sys.io();
+        self.directory.deleteFile(io, write_lock_name) catch {};
+        self.lock_file.close(io);
+        self.directory.close(io);
     }
 
     pub fn upsert(self: Writer, allocator: std.mem.Allocator, model: Model) !void {
@@ -216,15 +223,19 @@ pub const Writer = struct {
         try saveUpsert(allocator, self.path, &list, model);
     }
 
+    pub fn requireCurrent(self: Writer, allocator: std.mem.Allocator, expected: Model) !void {
+        var list = try load(allocator, self.path);
+        defer list.deinit();
+        try checkCurrent(find(list.view(), expected.id), expected);
+    }
+
     /// A selection verifies its input before taking the lock. Compare all
     /// fields again under the lock and keep the lock through config save.
     pub fn replaceIfUnchanged(self: Writer, allocator: std.mem.Allocator, expected: ?Model, model: Model) !void {
         var list = try load(allocator, self.path);
         defer list.deinit();
         const current = find(list.view(), model.id);
-        if (expected) |old| {
-            if (current == null or !equalModels(old, current.?)) return errors.Error.ModelSelectionChanged;
-        } else if (current != null) return errors.Error.ModelSelectionChanged;
+        try checkCurrent(current, expected);
         if (current) |old| {
             if (equalModels(old, model)) return;
         }
@@ -238,13 +249,46 @@ pub const Writer = struct {
 
 pub fn beginWrite(path: []const u8) !Writer {
     const io = sys.io();
-    const directory = sys.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{ .iterate = true }) catch |err| switch (err) {
+    const directory = sys.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{}) catch |err| switch (err) {
         error.FileNotFound => return errors.Error.NotInitialized,
         else => return err,
     };
     errdefer directory.close(io);
-    try (std.Io.File{ .handle = directory.handle, .flags = .{ .nonblocking = false } }).lock(io, .exclusive);
-    return .{ .directory = directory, .path = path };
+    while (true) {
+        const lock_file = directory.createFile(io, write_lock_name, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => directory.openFile(io, write_lock_name, .{
+                .mode = .read_write,
+                .follow_symlinks = false,
+                .allow_directory = false,
+            }) catch |open_err| switch (open_err) {
+                error.FileNotFound => continue,
+                else => return open_err,
+            },
+            else => return err,
+        };
+        errdefer lock_file.close(io);
+        const opened = try lock_file.stat(io);
+        if (opened.kind != .file) return error.AccessDenied;
+        try lock_file.lock(io, .exclusive);
+        const named = directory.statFile(io, write_lock_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (named != null and named.?.kind == .file and named.?.inode == opened.inode) {
+            return .{ .directory = directory, .lock_file = lock_file, .path = path };
+        }
+        lock_file.close(io);
+    }
+}
+
+fn checkCurrent(current: ?Model, expected: ?Model) !void {
+    if (expected) |old| {
+        if (current == null or !equalModels(old, current.?)) return errors.Error.ModelSelectionChanged;
+    } else if (current != null) return errors.Error.ModelSelectionChanged;
 }
 
 fn equalModels(a: Model, b: Model) bool {
@@ -810,20 +854,19 @@ test "registry writer serializes commits and rejects stale legacy path migration
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "registry.toml", .data = "[[models]]\nid = \"toy\"\npath = \"old.gguf\"\n" });
 
     const io = sys.io();
-    const observer_dir = try sys.cwd().openDir(io, root, .{ .iterate = true });
-    defer observer_dir.close(io);
-    const observer: std.Io.File = .{ .handle = observer_dir.handle, .flags = .{ .nonblocking = false } };
     const imported: Model = .{ .id = "toy", .path = "/models/toy.gguf", .checksum = "new" };
     {
         const writer = try beginWrite(path);
         defer writer.close();
+        const observer = try tmp.dir.openFile(io, write_lock_name, .{ .mode = .read_write });
+        defer observer.close(io);
         try std.testing.expect(!try observer.tryLock(io, .exclusive));
         try writer.upsert(allocator, imported);
         var migrated = legacy;
         migrated.path = "/work/old.gguf";
         try std.testing.expectError(errors.Error.ModelSelectionChanged, writer.replaceIfUnchanged(allocator, legacy, migrated));
     }
-    try std.testing.expect(try observer.tryLock(io, .exclusive));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, write_lock_name, .{}));
     var persisted = try load(allocator, path);
     defer persisted.deinit();
     try std.testing.expect(equalModels(imported, find(persisted.view(), "toy").?));

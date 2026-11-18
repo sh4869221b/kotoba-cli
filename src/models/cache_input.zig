@@ -23,20 +23,7 @@ pub const CacheInput = struct {
         if (builtin.os.tag != .linux) return null;
         if (validation.isSplitGgufFilename(model_path)) return errors.Error.SplitModelUnsupported;
         const io = sys.io();
-
-        // Pin the resolved source before opening for reads. O_PATH also avoids
-        // blocking if a concurrent replacement turns the path into a FIFO.
-        const handle = sys.cwd().openFile(io, model_path, .{ .path_only = true }) catch |err| switch (err) {
-            error.FileNotFound => return errors.Error.ModelMissing,
-            else => return err,
-        };
-        defer handle.close(io);
-        if ((try handle.stat(io)).kind != .file) return errors.Error.ModelLoadFailed;
-        var handle_path: [64]u8 = undefined;
-        const source = sys.cwd().openFile(io, fdPath(handle, &handle_path), .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return null,
-            else => return err,
-        };
+        const source = try openSource(model_path) orelse return null;
         var source_transferred = false;
         defer if (!source_transferred) source.close(io);
 
@@ -89,6 +76,41 @@ pub const CacheInput = struct {
         self.file.close(sys.io());
     }
 };
+
+pub const LargeModelMemoryLimitation = enum { verity_not_enabled, verity_unavailable };
+
+/// Inspect the same descriptor and size limit as translation without
+/// copying model bytes, parsing GGUF metadata, or opening the database.
+pub fn largeModelMemoryLimitation(model_path: []const u8) !?LargeModelMemoryLimitation {
+    if (builtin.os.tag != .linux or validation.isSplitGgufFilename(model_path)) return null;
+    const source = try openSource(model_path) orelse return null;
+    const io = sys.io();
+    defer source.close(io);
+    if ((try source.stat(io)).size <= verity.mutable_snapshot_limit) return null;
+    return switch (verity.inspect(source)) {
+        .digest => null,
+        .not_enabled => .verity_not_enabled,
+        .unavailable => .verity_unavailable,
+    };
+}
+
+fn openSource(model_path: []const u8) !?std.Io.File {
+    const io = sys.io();
+
+    // Pin the resolved source before opening for reads. O_PATH also avoids
+    // blocking if a concurrent replacement turns the path into a FIFO.
+    const handle = sys.cwd().openFile(io, model_path, .{ .path_only = true }) catch |err| switch (err) {
+        error.FileNotFound => return errors.Error.ModelMissing,
+        else => return err,
+    };
+    defer handle.close(io);
+    if ((try handle.stat(io)).kind != .file) return errors.Error.ModelLoadFailed;
+    var handle_path: [64]u8 = undefined;
+    return sys.cwd().openFile(io, fdPath(handle, &handle_path), .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+}
 
 fn fdPath(file: std.Io.File, buffer: []u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buffer, "/proc/self/fd/{d}", .{file.handle}) catch unreachable;

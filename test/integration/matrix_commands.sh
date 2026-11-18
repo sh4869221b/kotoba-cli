@@ -1170,6 +1170,25 @@ PY
     else commands_error embedded_nul; fi
     commands_unchanged
   done
+  matrix_case commands-doctor-large-model-memory
+  commands_fixture
+  sed -i 's/^checksum = .*/checksum = ""/' "$XDG_CONFIG_HOME/kotoba/models.toml"
+  truncate -s 134217729 "$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  matrix_run doctor --format json
+  matrix_assert status 0
+  matrix_assert json doctor
+  matrix_assert custom memory-bypass-explained python3 - "$CASE_DIR/stdout" <<'PYTHON'
+import json, sys
+from pathlib import Path
+result = json.loads(Path(sys.argv[1]).read_text())
+assert result["ok"] is True
+warnings = [check for check in result["checks"] if check["name"] == "model_translation_memory"]
+assert len(warnings) == 1
+assert warnings[0]["status"] == "warn" and warnings[0]["code"] == "model_memory_bypassed"
+assert "128 MiB" in warnings[0]["message"] and "fs-verity" in warnings[0]["message"]
+PYTHON
+  commands_unchanged
+
   for variant in ready absent invalid-data invalid-header invalid-quote oversized directory; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi

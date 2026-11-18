@@ -96,7 +96,7 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     }
     try validateCommandId(id);
     try models.validateGgufPath(source_path);
-    try models.verifyModel(.{ .path = source_path, .checksum = checksum });
+    try models.verifyModel(.{ .path = source_path });
     const dest_path = try models.installedPath(allocator, paths.models_dir, id);
     {
         var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
@@ -104,36 +104,28 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     }
     if (use_model) try validateConfigLoad(allocator, paths.config_file);
     try xdg.ensureDirs(paths);
-    var staged = if (!std.mem.eql(u8, source_path, dest_path))
-        try models.stageLocalFile(allocator, source_path, dest_path, checksum)
-    else
-        null;
-    defer if (staged) |*file| file.deinit();
-    {
-        const writer = try models.beginRegistryWrite(paths.models_file);
-        defer writer.close();
-        try models.ensure(paths.models_file);
-        if (staged) |*file| try file.publish(dest_path);
-        const display_name = if (name.len > 0) name else id;
-        try writer.upsert(allocator, .{
-            .id = id,
-            .name = display_name,
-            .profile = "local",
-            .languages_en = true,
-            .languages_ja = true,
-            .format = "gguf",
-            .path = dest_path,
-            .checksum = checksum,
-            .notes = "Imported local GGUF model.",
-        });
-        if (use_model) try selectModel(allocator, paths, id, dest_path);
-    }
+    var staged = try models.stageLocalFile(allocator, source_path, dest_path, checksum);
+    defer staged.deinit();
+    const display_name = if (name.len > 0) name else id;
+    const model: models.Model = .{
+        .id = id,
+        .name = display_name,
+        .profile = "local",
+        .languages_en = true,
+        .languages_ja = true,
+        .format = "gguf",
+        .path = dest_path,
+        .checksum = checksum,
+        .notes = "Imported local GGUF model.",
+    };
+    try models.validateModel(model);
+    try commitInstall(allocator, paths, &staged, model, null, use_model);
     try sys.stdoutPrint("imported {s}\n", .{id});
     return 0;
 }
 
 fn runPull(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
-    return runPullWithAcquirer(allocator, paths, cmd_args, models.acquire);
+    return runPullWithAcquirer(allocator, paths, cmd_args, models.stagePull);
 }
 
 /// `allocator` is the public adapter's invocation arena; no command graph escapes this call.
@@ -141,7 +133,7 @@ fn runPullWithAcquirer(
     allocator: std.mem.Allocator,
     paths: xdg.Paths,
     cmd_args: []const []const u8,
-    acquirer: *const fn (std.mem.Allocator, models.Model, []const u8, models.AcquireOptions) anyerror!void,
+    acquirer: *const fn (std.mem.Allocator, models.Model, []const u8, models.AcquireOptions) anyerror!?models.StagedModel,
 ) !u8 {
     var cursor = args.ArgCursor.init(cmd_args);
     var id: []const u8 = "";
@@ -185,6 +177,7 @@ fn runPullWithAcquirer(
         try models.validateStoredPath(output_path);
     }
     var m: models.Model = .{};
+    var expected: ?models.Model = null;
     var pull_owner: ?models.OwnedList = null;
     defer if (pull_owner) |*owner| owner.deinit();
     if (hf_repo.len > 0) {
@@ -222,6 +215,7 @@ fn runPullWithAcquirer(
         pull_owner = try models.load(allocator, paths.models_file);
         const list = pull_owner.?.view();
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
+        expected = m;
         if (models.url.isRemote(m.download_url)) {
             const uri = try models.url.parseRemote(m.download_url);
             if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return errors.Error.InvalidArguments;
@@ -245,17 +239,44 @@ fn runPullWithAcquirer(
     defer allocator.free(managed_path);
     const managed = std.mem.eql(u8, output_path, managed_path);
     try xdg.ensureDirs(paths);
-    try models.ensure(paths.models_file);
-    try acquirer(allocator, request_model, output_path, .{ .managed = managed });
-    try models.verifyModel(m);
-    {
-        const writer = try models.beginRegistryWrite(paths.models_file);
-        defer writer.close();
-        try writer.upsert(allocator, m);
-        if (use_model) try selectModel(allocator, paths, id, output_path);
-    }
+    var staged = try acquirer(allocator, request_model, output_path, .{ .managed = managed }) orelse return errors.Error.ModelSourceRequired;
+    defer staged.deinit();
+    try commitInstall(allocator, paths, &staged, m, expected, use_model);
     try sys.stdoutPrint("pulled {s}\n", .{id});
     return 0;
+}
+
+fn commitInstall(
+    allocator: std.mem.Allocator,
+    paths: xdg.Paths,
+    stage: *models.StagedModel,
+    m: models.Model,
+    expected: ?models.Model,
+    use_model: bool,
+) !void {
+    const writer = try models.beginRegistryWrite(paths.models_file);
+    defer writer.close();
+    try models.ensure(paths.models_file);
+    if (expected) |previous| try writer.requireCurrent(allocator, previous);
+
+    // A replacement of the active ID must keep the selected path coherent,
+    // even if the user did not request activation of an inactive model.
+    var cfg: ?config.OwnedConfig = loadConfigOrDefault(allocator, paths.config_file) catch |err| switch (err) {
+        error.ConfigInvalid, error.ConfigSchemaUnsupported => if (use_model) return err else null,
+        else => return err,
+    };
+    defer if (cfg) |*owner| owner.deinit();
+    const update_selection = if (cfg) |*owner|
+        use_model or (std.mem.eql(u8, owner.view().model_id, m.id) and !std.mem.eql(u8, owner.view().model_path, m.path))
+    else
+        false;
+    if (update_selection) {
+        try cfg.?.setValue("model_id", m.id);
+        try cfg.?.setValue("model_path", m.path);
+    }
+    try stage.publish(m.path);
+    try writer.upsert(allocator, m);
+    if (update_selection) try config.save(paths.config_file, cfg.?.view());
 }
 
 fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
@@ -274,6 +295,7 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
     {
         const writer = try models.beginRegistryWrite(paths.models_file);
         defer writer.close();
+        try models.verifyModel(.{ .path = m.path });
         try writer.replaceIfUnchanged(allocator, expected, m);
         try selectModel(allocator, paths, m.id, m.path);
     }
@@ -313,15 +335,16 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
     try validateCommandId(id);
+    try validateConfigLoad(allocator, paths.config_file);
+    try requireRemovalTarget(allocator, paths.models_file, id);
     {
         const writer = try models.beginRegistryWrite(paths.models_file);
         defer writer.close();
         var cfg = try loadConfigOrDefault(allocator, paths.config_file);
         defer cfg.deinit();
-        var list_owner = try models.load(allocator, paths.models_file);
-        defer list_owner.deinit();
-        const list = list_owner.view();
-        _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
+        // Re-check after waiting. The preflight only keeps invalid requests
+        // from touching the config directory's metadata.
+        try requireRemovalTarget(allocator, paths.models_file, id);
         try xdg.ensureDirs(paths);
         var removed_owner = try writer.removeById(allocator, id);
         defer removed_owner.deinit();
@@ -342,6 +365,12 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     }
     try sys.stdoutPrint("removed {s}\n", .{id});
     return 0;
+}
+
+fn requireRemovalTarget(allocator: std.mem.Allocator, path: []const u8, id: []const u8) !void {
+    var list = try models.load(allocator, path);
+    defer list.deinit();
+    _ = models.find(list.view(), id) orelse return errors.Error.ModelRegistryInvalid;
 }
 
 fn validateCommandId(id: []const u8) !void {
@@ -496,10 +525,10 @@ test "secret URL pull pipeline keeps request transient" {
             try std.testing.expectEqualStrings(expected, value);
             try sys.writeFile(dest, bytes);
         }
-        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, options: models.AcquireOptions) !void {
+        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, options: models.AcquireOptions) !?models.StagedModel {
             try std.testing.expectEqualStrings(expected, m.download_url);
             try std.testing.expect(!options.skip_download);
-            try @import("../models/install.zig").acquireWithDownloader(a, m, dest, options, download);
+            return @import("../models/install.zig").stageWithDownloader(a, m, dest, options, download);
         }
     };
     Fixture.calls = 0;
@@ -562,7 +591,7 @@ test "secret URL pull without reusable source fails before acquirer" {
     defer capture.restore();
     const Fixture = struct {
         var calls: usize = 0;
-        fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !void {
+        fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !?models.StagedModel {
             calls += 1;
             return error.UnexpectedAcquirerCall;
         }
@@ -718,7 +747,7 @@ fn testPreflight(command: PreflightCommand, registry_failure: bool) !void {
         defer capture.restore();
         const Fixture = struct {
             var calls: usize = 0;
-            fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !void {
+            fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !?models.StagedModel {
                 calls += 1;
                 return error.UnexpectedAcquirerCall;
             }
@@ -801,9 +830,13 @@ test "model mutations retain valid and absent config semantics" {
             defer capture.restore();
             const Fixture = struct {
                 var calls: usize = 0;
-                fn acquire(_: std.mem.Allocator, _: models.Model, path: []const u8, _: models.AcquireOptions) !void {
+                fn acquire(a: std.mem.Allocator, m: models.Model, path: []const u8, options: models.AcquireOptions) !?models.StagedModel {
                     calls += 1;
-                    try sys.writeFile(path, "downloaded fixture");
+                    var stage = try models.StagedModel.begin(a, path);
+                    errdefer stage.deinit();
+                    try sys.writeFile(stage.path, "downloaded fixture");
+                    try stage.verify(m.checksum, options.managed);
+                    return stage;
                 }
             };
             Fixture.calls = 0;
@@ -1015,4 +1048,84 @@ test "models remove strict remaining reference realpath failure" {
 
 test "models remove strict injected deletion failure" {
     try testRemoveFailure(.delete);
+}
+
+test "a positional pull cannot publish after the model is removed during preparation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(sys.io(), ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    const dest = try models.installedPath(allocator, root, "same");
+    const old_checksum = try sys.hexSha256(allocator, "old file");
+    const new_checksum = try sys.hexSha256(allocator, "staged file");
+    try sys.writeFile(dest, "old file");
+    var entries = [_]models.Model{.{
+        .id = "same",
+        .path = dest,
+        .download_url = "https://example.invalid/same.gguf",
+        .checksum = old_checksum,
+    }};
+    try models.save(paths.models_file, .{ .models = &entries });
+    try config.save(paths.config_file, .{ .model_id = "same", .model_path = dest });
+    const output = try tmp.dir.createFile(sys.io(), "stdout", .{});
+    defer output.close(sys.io());
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    const Fixture = struct {
+        var state: xdg.Paths = undefined;
+        fn acquire(a: std.mem.Allocator, m: models.Model, path: []const u8, options: models.AcquireOptions) !?models.StagedModel {
+            var stage = try models.StagedModel.begin(a, path);
+            errdefer stage.deinit();
+            try sys.writeFile(stage.path, "staged file");
+            try stage.verify(m.checksum, options.managed);
+            try std.testing.expectEqualStrings("old file", try sys.readFileAlloc(a, path, 1024));
+            try std.testing.expectEqual(@as(u8, 0), try runRemove(a, state, &.{ "same", "--yes" }));
+            return stage;
+        }
+    };
+    Fixture.state = paths;
+    try std.testing.expectError(error.ModelSelectionChanged, runPullWithAcquirer(allocator, paths, &.{ "same", "--checksum", new_checksum, "--use" }, Fixture.acquire));
+    try std.testing.expect(!sys.exists(dest));
+    var registry = try models.load(allocator, paths.models_file);
+    defer registry.deinit();
+    try std.testing.expect(models.find(registry.view(), "same") == null);
+    var cfg = try config.load(allocator, paths.config_file);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("", cfg.view().model_id);
+    try std.testing.expectEqualStrings("", cfg.view().model_path);
+}
+
+test "import of its own installed path publishes the verified stage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    const dest = try models.installedPath(allocator, root, "same");
+    try sys.writeFile(dest, "installed bytes");
+    const checksum = try sys.hexSha256(allocator, "installed bytes");
+    const previous = try sys.cwd().openFile(io, dest, .{});
+    defer previous.close(io);
+    const output = try tmp.dir.createFile(io, "stdout", .{});
+    defer output.close(io);
+    var capture = try TestStdoutCapture.start(output);
+    defer capture.restore();
+
+    try std.testing.expectEqual(@as(u8, 0), try runImport(allocator, paths, &.{ "--id", "same", "--path", dest, "--checksum", checksum, "--use" }));
+    const current = try sys.cwd().statFile(io, dest, .{});
+    try std.testing.expect(current.inode != (try previous.stat(io)).inode);
+    try models.verifySha256(dest, checksum);
+    var registry = try models.load(allocator, paths.models_file);
+    defer registry.deinit();
+    try std.testing.expectEqualStrings(checksum, models.find(registry.view(), "same").?.checksum);
+    var cfg = try config.load(allocator, paths.config_file);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings(dest, cfg.view().model_path);
 }

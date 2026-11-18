@@ -144,6 +144,18 @@ fn appendModelChecks(list_opt: ?models.List, cfg: config.Config, checks: *std.ar
             ok.* = false;
         }
     }
+    if (cfg.memory_enabled) {
+        const limitation = models.largeModelMemoryLimitation(cfg.model_path) catch null;
+        if (limitation) |reason| try checks.append(.{
+            .name = "model_translation_memory",
+            .status = .warn,
+            .code = "model_memory_bypassed",
+            .message = switch (reason) {
+                .verity_not_enabled => "Selected model exceeds the 128 MiB snapshot limit and fs-verity is not enabled. Re-import a fresh managed copy to enable Translation Memory.",
+                .verity_unavailable => "Selected model exceeds the 128 MiB snapshot limit and SHA-256 fs-verity is unavailable. Import or pull a managed copy on a filesystem with fs-verity support to use Translation Memory.",
+            },
+        });
+    }
 }
 
 fn continueAfterModelCheck(allocator: std.mem.Allocator, paths: xdg.Paths, cfg: config.Config, checks: *std.array_list.Managed(Check), ok_in: bool, json: bool) !u8 {

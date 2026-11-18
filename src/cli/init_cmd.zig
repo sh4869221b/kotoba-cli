@@ -85,6 +85,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         try cfg.setValue("model_path", model_path);
         try models.ensure(paths.models_file);
         if (selected_registry_model) |registry_model| {
+            try models.verifyModel(.{ .path = registry_model.path });
             try writer.replaceIfUnchanged(allocator, expected, registry_model);
         }
         try glossary.ensure(paths.glossary_file);

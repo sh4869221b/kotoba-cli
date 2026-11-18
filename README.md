@@ -393,8 +393,9 @@ from a separate file or pull it again to the managed path.
 
 Other files up to 128 MiB can use a sealed in-memory copy. The key and llama.cpp
 load refer to the same open immutable file. If an immutable input is
-unavailable, translation proceeds with memory bypassed. Multi-file GGUF names
-and split metadata are rejected on the cache path. Existing rows remain in the
+unavailable, translation proceeds with memory bypassed. `kotoba doctor`
+reports when a selected model over 128 MiB lacks a usable fs-verity digest.
+Multi-file GGUF names and split metadata are rejected on the cache path. Existing rows remain in the
 database and miss lookups under the new key.
 
 Configuration follows XDG paths:

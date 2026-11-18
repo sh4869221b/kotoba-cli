@@ -31,12 +31,29 @@ pub fn prepareLargeCopy(path: []const u8) void {
     _ = linux.ioctl(file.handle, linux.IOCTL.IOW('f', 133, Enable), @intFromPtr(&args));
 }
 
-pub fn measure(file: std.Io.File) ?[32]u8 {
+pub const Measurement = union(enum) {
+    digest: [32]u8,
+    not_enabled,
+    unavailable,
+};
+
+pub fn inspect(file: std.Io.File) Measurement {
     // FS_IOC_MEASURE_VERITY encodes the fixed header size only.
     const Header = extern struct { algorithm: u16 = 0, size: u16 = 64 };
     const Digest = extern struct { header: Header = .{}, bytes: [64]u8 = undefined };
     var data: Digest = .{};
-    if (linux.ioctl(file.handle, linux.IOCTL.IOWR('f', 134, Header), @intFromPtr(&data)) != 0) return null;
-    if (data.header.algorithm != sha256_algorithm or data.header.size != 32) return null;
-    return data.bytes[0..32].*;
+    switch (linux.errno(linux.ioctl(file.handle, linux.IOCTL.IOWR('f', 134, Header), @intFromPtr(&data)))) {
+        .SUCCESS => {},
+        .NODATA => return .not_enabled,
+        else => return .unavailable,
+    }
+    if (data.header.algorithm != sha256_algorithm or data.header.size != 32) return .unavailable;
+    return .{ .digest = data.bytes[0..32].* };
+}
+
+pub fn measure(file: std.Io.File) ?[32]u8 {
+    return switch (inspect(file)) {
+        .digest => |digest| digest,
+        .not_enabled, .unavailable => null,
+    };
 }

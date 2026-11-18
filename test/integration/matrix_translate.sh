@@ -213,6 +213,8 @@ PY
   matrix_translate_plain_extra markdown-frontmatter-yaml-end $'---\r\ntitle: Hello\r\n...\r\nBody' $'---\r\ntitle: Hello\r\n...\r\nJA:Body' markdown
   matrix_translate_plain_extra markdown-quoted-table $'> | A | B |\r\n> | - | - |\r\n> Cell\r\n\r\nBody' $'> | A | B |\r\n> | - | - |\r\n> Cell\r\n\r\nJA:Body' markdown
   matrix_translate_plain_extra markdown-table-inline-html $'Action | Effect\n- | -\n<kbd>Esc</kbd> | Cancel\n\nBody' $'Action | Effect\n- | -\n<kbd>Esc</kbd> | Cancel\n\nJA:Body' markdown
+  matrix_translate_plain_extra markdown-table-list-item $'- | A | B |\n  | - | - |\n  | Left | Right |\n\nAfterward' $'- | A | B |\n  | - | - |\n  | Left | Right |\n\nJA:Afterward' markdown
+  matrix_translate_plain_extra markdown-table-textarea-boundary $'| A | B |\n| - | - |\n<textarea>\nLiteral text\n</textarea>\nAfterward' $'| A | B |\n| - | - |\n<textarea>\nLiteral text\n</textarea>\nJA:Afterward' markdown
   matrix_translate_plain_extra markdown-pipe-less-table-row $'| A | B |\n| - | - |\nCell\n# Heading' $'| A | B |\n| - | - |\nCell\nJA:# Heading' markdown
   matrix_translate_plain_extra paragraphs-whitespace-crlf $'First\r\n \t\r\nSecond' $'JA:First\r\n \t\r\nJA:Second' plain
 

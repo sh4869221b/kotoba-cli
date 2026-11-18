@@ -30,7 +30,8 @@ pub const validateStoredPath = validation.validateStoredPath;
 pub const validateSingleHfGgufFilename = validation.validateSingleHfGgufFilename;
 
 pub const verifyModel = checksum_module.verifyModel;
-pub const acquire = install.acquire;
+pub const stagePull = install.stagePull;
+pub const StagedModel = install.StagedModel;
 pub const stageLocalFile = install.stageLocalFile;
 pub const AcquireOptions = install.AcquireOptions;
 
@@ -41,6 +42,7 @@ pub const resolveHfFile = huggingface.resolveHfFile;
 
 pub const verifySha256 = checksum_module.verifySha256;
 pub const CacheInput = cache_input.CacheInput;
+pub const largeModelMemoryLimitation = cache_input.largeModelMemoryLimitation;
 
 test {
     _ = cache_input;

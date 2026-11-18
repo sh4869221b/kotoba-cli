@@ -26,6 +26,10 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     if (std.mem.eql(u8, cmd_args[0], "set")) {
         if (cmd_args.len != 3) return errors.Error.InvalidArguments;
         try validateConfigSet(allocator, cmd_args[1], cmd_args[2]);
+        {
+            var preflight = try config.load(allocator, paths.config_file);
+            preflight.deinit();
+        }
         const writer = try models.beginRegistryWrite(paths.config_file);
         defer writer.close();
         var cfg = try config.load(allocator, paths.config_file);
@@ -74,4 +78,29 @@ test "config validates invalid commands before loading configuration" {
     }
     try std.testing.expectError(errors.Error.NotInitialized, run(std.testing.allocator, paths, &.{ "set", "model_id", "test" }));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+}
+
+test "config set works without directory read permission" {
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var paths: xdg.Paths = undefined;
+    paths.config_file = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    defer allocator.free(paths.config_file);
+    try config.save(paths.config_file, config.default());
+
+    const directory = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer directory.close(io);
+    try directory.setPermissions(io, .fromMode(0o300));
+    defer directory.setPermissions(io, .fromMode(0o700)) catch unreachable;
+    try std.testing.expectError(error.AccessDenied, sys.cwd().openDir(io, root, .{ .iterate = true }));
+    try std.testing.expectEqual(@as(u8, 0), try run(allocator, paths, &.{ "set", "threads", "3" }));
+    var saved = try config.load(allocator, paths.config_file);
+    defer saved.deinit();
+    try std.testing.expectEqual(@as(u32, 3), saved.view().threads);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".state.lock", .{}));
 }
