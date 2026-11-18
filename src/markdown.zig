@@ -221,8 +221,7 @@ fn startsTableEndingBlock(line: []const u8) bool {
     if (trimmed.len == 0 or openingFence(line) != null) return true;
     const first = trimmed[0];
     const rest = trimmed[1..];
-    if (first == '<' and rest.len > 0 and
-        (std.ascii.isAlphabetic(rest[0]) or rest[0] == '!' or rest[0] == '/' or rest[0] == '?')) return true;
+    if (startsInterruptingHtmlBlock(line)) return true;
     if (first == '#') {
         const end = runEnd(trimmed, 0);
         if (end <= 6 and (end == trimmed.len or std.ascii.isWhitespace(trimmed[end]))) return true;
@@ -240,6 +239,41 @@ fn startsTableEndingBlock(line: []const u8) bool {
     return digits > 0 and digits <= 9 and digits < trimmed.len and
         (trimmed[digits] == '.' or trimmed[digits] == ')') and
         (digits + 1 == trimmed.len or std.ascii.isWhitespace(trimmed[digits + 1]));
+}
+
+/// GFM HTML block types 1–6 can interrupt a table. A generic inline tag
+/// followed by text is not an HTML block start.
+fn startsInterruptingHtmlBlock(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " ");
+    if (line.len - trimmed.len > 3 or !std.mem.startsWith(u8, trimmed, "<")) return false;
+    if (std.mem.startsWith(u8, trimmed, "<!--") or std.mem.startsWith(u8, trimmed, "<?") or
+        std.mem.startsWith(u8, trimmed, "<![CDATA[")) return true;
+    if (trimmed.len > 2 and trimmed[1] == '!' and std.ascii.isUpper(trimmed[2])) return true;
+
+    const closing = trimmed.len > 1 and trimmed[1] == '/';
+    const start: usize = if (closing) 2 else 1;
+    var end = start;
+    while (end < trimmed.len and (std.ascii.isAlphanumeric(trimmed[end]) or trimmed[end] == '-')) end += 1;
+    if (start == end) return false;
+    const tag = trimmed[start..end];
+    const tail = trimmed[end..];
+    const standard_end = tail.len == 0 or std.ascii.isWhitespace(tail[0]) or tail[0] == '>';
+    if (standard_end and !closing and
+        (std.ascii.eqlIgnoreCase(tag, "script") or std.ascii.eqlIgnoreCase(tag, "pre") or
+            std.ascii.eqlIgnoreCase(tag, "style"))) return true;
+    if (!standard_end and !std.mem.startsWith(u8, tail, "/>")) return false;
+
+    var block_tags = std.mem.splitScalar(
+        u8,
+        "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt " ++
+            "fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link " ++
+            "main menu menuitem nav noframes ol optgroup option p param section source summary table tbody td tfoot th thead title tr track ul",
+        ' ',
+    );
+    while (block_tags.next()) |name| {
+        if (std.ascii.eqlIgnoreCase(name, tag)) return true;
+    }
+    return false;
 }
 
 /// Count cells separated by unescaped pipes outside matched inline code.
@@ -542,4 +576,14 @@ test "quoted tables keep single-cell rows and stop at a new block or quote depth
     try std.testing.expectEqual(@as(usize, 3), doc.protected.len);
     try std.testing.expectEqualStrings("> > Cell", doc.protected[2]);
     try std.testing.expect(std.mem.endsWith(u8, doc.text, "\r\n> > # Heading\r\n> Outside\r\n"));
+}
+
+test "inline HTML at the start of a table row keeps the whole row protected" {
+    const allocator = std.testing.allocator;
+    const source = "| Key | Action |\n| - | - |\n<kbd>Esc</kbd> | Cancel\n| Enter | Run |\n<DIV>Block</DIV>\nProse";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqualStrings("<kbd>Esc</kbd> | Cancel", doc.protected[2]);
+    try std.testing.expectEqualStrings("| Enter | Run |", doc.protected[3]);
+    try std.testing.expectEqualStrings("<DIV>", doc.protected[4]);
 }

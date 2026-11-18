@@ -52,9 +52,20 @@ fn freeTerm(allocator: std.mem.Allocator, term: Term) void {
 }
 
 fn replaceString(allocator: std.mem.Allocator, field: *[]const u8, value: []const u8) !void {
-    const next = try allocator.dupe(u8, value);
+    const next = try decodeValue(allocator, value);
     allocator.free(field.*);
     field.* = next;
+}
+
+fn decodeValue(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const trimmed = toml.trim(value);
+    if (trimmed.len > 0 and (trimmed[0] == '"' or trimmed[0] == '\'')) {
+        return strict.parseString(allocator, trimmed) catch |err| switch (err) {
+            error.Invalid => errors.Error.GlossaryInvalid,
+            error.OutOfMemory => err,
+        };
+    }
+    return allocator.dupe(u8, toml.trim(toml.stripComment(trimmed)));
 }
 
 pub fn defaultTemplate() []const u8 {
@@ -110,10 +121,11 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedGlossary {
         };
         if (current == null) return errors.Error.GlossaryInvalid;
         const t = &current.?;
-        const val = toml.unquote(toml.trim(toml.stripComment(p.value)));
-        if (std.mem.eql(u8, p.key, "source")) try replaceString(allocator, &t.source, val) else if (std.mem.eql(u8, p.key, "target")) try replaceString(allocator, &t.target, val) else if (std.mem.eql(u8, p.key, "mode")) {
+        if (std.mem.eql(u8, p.key, "source")) try replaceString(allocator, &t.source, p.value) else if (std.mem.eql(u8, p.key, "target")) try replaceString(allocator, &t.target, p.value) else if (std.mem.eql(u8, p.key, "mode")) {
+            const val = try decodeValue(allocator, p.value);
+            defer allocator.free(val);
             if (std.mem.eql(u8, val, "prefer")) t.mode = .prefer else if (std.mem.eql(u8, val, "protect")) t.mode = .protect else return errors.Error.GlossaryInvalid;
-        } else if (std.mem.eql(u8, p.key, "comment")) try replaceString(allocator, &t.comment, val);
+        } else if (std.mem.eql(u8, p.key, "comment")) try replaceString(allocator, &t.comment, p.value);
     }
     if (current) |t| {
         try terms.append(t);
@@ -330,4 +342,19 @@ test "glossary validates array headers and allows spacing and comments" {
     var glossary = try parse(allocator, " [[ terms ]] # term\r\nsource = \"CLI\" # kept\r\n");
     defer glossary.deinit();
     try std.testing.expectEqualStrings("CLI", glossary.view().terms[0].source);
+}
+
+test "glossary requires quoted values to end and keeps quoted comment characters" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "\"CLI", "'CLI", "\"CLI\" extra", "\"trailing\\\"" }) |value| {
+        const document = try std.fmt.allocPrint(allocator, "[[terms]]\nsource={s}\ntarget=\"tool\"\n", .{value});
+        defer allocator.free(document);
+        try std.testing.expectError(error.GlossaryInvalid, parse(allocator, document));
+    }
+    var owner = try parse(allocator, "[[terms]]\nsource=\"C\\\"LI#\" # comment\ntarget='tool#'\nmode=prefer\n");
+    defer owner.deinit();
+    const term = owner.view().terms[0];
+    try std.testing.expectEqualStrings("C\"LI#", term.source);
+    try std.testing.expectEqualStrings("tool#", term.target);
+    try std.testing.expectEqual(TermMode.prefer, term.mode);
 }

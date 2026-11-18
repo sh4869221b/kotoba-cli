@@ -1170,12 +1170,13 @@ PY
     else commands_error embedded_nul; fi
     commands_unchanged
   done
-  for variant in ready absent invalid-data invalid-header oversized directory; do
+  for variant in ready absent invalid-data invalid-header invalid-quote oversized directory; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi
     case "$variant" in
       invalid-data) printf '[[terms]]\nmode = "bogus"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
       invalid-header) printf '[[terms]\nsource = "CLI"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+      invalid-quote) printf '[[terms]]\nsource="CLI\ntarget="tool"\nmode="prefer"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
       oversized) truncate -s 1048577 "$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
       directory)
         rm "$XDG_CONFIG_HOME/kotoba/glossary.toml"
@@ -1183,7 +1184,7 @@ PY
     esac
     matrix_run glossary validate
     case "$variant" in
-      invalid-data|invalid-header) commands_error glossary_invalid ;;
+      invalid-data|invalid-header|invalid-quote) commands_error glossary_invalid ;;
       oversized) commands_error io_error StreamTooLong ;;
       directory) commands_error io_error IsDir ;;
       *) commands_streams 0 $'terms: 0\nhash: 97a50f251a2c9ee4b6198d8cd4a2f58ba29d6edc12c0962588f0adb8d3dca7c1\n' ;;

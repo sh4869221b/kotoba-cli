@@ -308,11 +308,28 @@ PYTHON
 }
 
 matrix_memory_unsafe_models() {
+  local single
   matrix_memory_fixture tm-large-mutable-model-bypasses-db sentinel
   truncate -s 134217729 "$CASE_ROOT/model.gguf"
   matrix_run translate Hello --from en --to ja --format json
   matrix_memory_success 'JA:Hello' none
   matrix_memory_preserved
+  matrix_finish
+
+  matrix_memory_fixture tm-single-shard-name healthy
+  single="$CASE_ROOT/model-00001-of-00001.gguf"
+  python3 - "$single" <<'PYTHON'
+from pathlib import Path
+import struct, sys
+key = b'split.count'
+data = b'GGUF' + struct.pack('<IQQQ', 3, 0, 1, len(key)) + key + struct.pack('<IH', 2, 1)
+Path(sys.argv[1]).write_bytes(data)
+PYTHON
+  matrix_setup config set model_path "$single"
+  matrix_memory_prime Hello
+  matrix_run translate Hello --from en --to ja --format json
+  matrix_memory_success 'JA:Hello' full
+  matrix_memory_rows '[["Hello",0,"single"]]' '[["Hello",1,"single"]]'
   matrix_finish
 
   matrix_memory_fixture tm-split-model-before-db sentinel

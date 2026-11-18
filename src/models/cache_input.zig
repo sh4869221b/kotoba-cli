@@ -6,8 +6,7 @@ const errors = @import("../errors.zig");
 const sys = @import("../sys.zig");
 const validation = @import("validation.zig");
 const llama = @import("../llama.zig");
-
-const snapshot_limit = 128 * 1024 * 1024;
+const verity = @import("verity.zig");
 
 /// The file stays open until the inference session has been destroyed.
 pub const CacheInput = struct {
@@ -41,7 +40,7 @@ pub const CacheInput = struct {
         var source_transferred = false;
         defer if (!source_transferred) source.close(io);
 
-        if (verityDigest(source)) |digest| {
+        if (verity.measure(source)) |digest| {
             try requireSingleFile(source, diagnostics_enabled);
             source_transferred = true;
             return .{ .file = source, .identity = .{ .kind = .verity_sha256, .digest = digest } };
@@ -52,7 +51,7 @@ pub const CacheInput = struct {
     fn fromMutableFile(source: std.Io.File, diagnostics_enabled: bool) !?CacheInput {
         const io = sys.io();
         const before = try source.stat(io);
-        if (before.size > snapshot_limit) return null;
+        if (before.size > verity.mutable_snapshot_limit) return null;
         const fd = linux.memfd_create("kotoba-model", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
         if (linux.errno(fd) != .SUCCESS) return null;
         const snapshot: std.Io.File = .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
@@ -93,17 +92,6 @@ pub const CacheInput = struct {
 
 fn fdPath(file: std.Io.File, buffer: []u8) [:0]const u8 {
     return std.fmt.bufPrintZ(buffer, "/proc/self/fd/{d}", .{file.handle}) catch unreachable;
-}
-
-fn verityDigest(file: std.Io.File) ?[32]u8 {
-    // linux/fsverity.h's FS_IOC_MEASURE_VERITY encodes only the fixed header size.
-    const Header = extern struct { algorithm: u16 = 0, size: u16 = 64 };
-    const Digest = extern struct { header: Header = .{}, bytes: [64]u8 = undefined };
-    const request = linux.IOCTL.IOWR('f', 134, Header);
-    var data: Digest = .{};
-    if (linux.ioctl(file.handle, request, @intFromPtr(&data)) != 0) return null;
-    if (data.header.algorithm != 1 or data.header.size != 32) return null; // FS_VERITY_HASH_ALG_SHA256
-    return data.bytes[0..32].*;
 }
 
 fn requireSingleFile(file: std.Io.File, diagnostics_enabled: bool) !void {

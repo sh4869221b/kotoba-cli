@@ -21,7 +21,7 @@ pub const find = registry.find;
 pub const installedPath = registry.installedPath;
 pub const upsert = registry.upsert;
 pub const validateModel = registry.validateModel;
-pub const removeById = registry.removeById;
+pub const beginRegistryWrite = registry.beginWrite;
 pub const save = registry.save;
 
 pub const validateId = validation.validateId;
@@ -31,7 +31,8 @@ pub const validateSingleHfGgufFilename = validation.validateSingleHfGgufFilename
 
 pub const verifyModel = checksum_module.verifyModel;
 pub const acquire = install.acquire;
-pub const installLocalFile = install.installLocalFile;
+pub const stageLocalFile = install.stageLocalFile;
+pub const AcquireOptions = install.AcquireOptions;
 
 pub const parseHfRepo = huggingface.parseHfRepo;
 pub const defaultIdFromHf = huggingface.defaultIdFromHf;

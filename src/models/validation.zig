@@ -45,7 +45,8 @@ pub fn isSplitGgufFilename(path: []const u8) bool {
     while (part_start > 0 and std.ascii.isDigit(stem[part_start - 1])) : (part_start -= 1) {}
     if (part_start == of_idx) return false;
     if (part_start == 0 or stem[part_start - 1] != '-') return false;
-    return true;
+    const count = std.fmt.parseUnsigned(usize, total, 10) catch return true;
+    return count > 1;
 }
 
 fn allDigits(text: []const u8) bool {
@@ -59,4 +60,10 @@ test "model ids reject path separators" {
     try validateId("local-ja_q4.0");
     try std.testing.expectError(errors.Error.InvalidArguments, validateId("../model"));
     try std.testing.expectError(errors.Error.InvalidArguments, validateId("bad/id"));
+}
+
+test "an of-one filename is not a multi-file shard" {
+    try std.testing.expect(!isSplitGgufFilename("model-00001-of-00001.gguf"));
+    try validateSingleHfGgufFilename("quant/model-00001-of-00001.gguf");
+    try std.testing.expect(isSplitGgufFilename("model-00001-of-00002.gguf"));
 }

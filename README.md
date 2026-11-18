@@ -372,8 +372,8 @@ prints a skip message and exits successfully.
 Markdown translation protects code spans, backtick and tilde code fences,
 URLs, YAML front matter closed by `---` or `...`, and tables with a header
 and delimiter row. Tables stay verbatim, including quoted tables and body
-rows with missing cells. Escaped pipes in prose stay in the translation
-input. Blank lines, including lines containing only spaces or tabs, split
+rows with missing cells or inline HTML. Escaped pipes in prose stay in the
+translation input. Blank lines, including lines containing only spaces or tabs, split
 paragraphs and retain their original LF or CRLF bytes.
 
 `kotoba glossary validate` prints a SHA-256 fingerprint of the glossary
@@ -383,12 +383,19 @@ parse errors in an existing glossary fail validation and translation.
 Translation Memory keys include an immutable model identity, the glossary
 fingerprint, the input format, and generation settings such as `max_tokens`.
 On Linux, a SHA-256 fs-verity file uses its kernel-provided digest without
-hashing the full model. Other files up to 128 MiB can use a sealed in-memory
-copy. The key and llama.cpp load refer to the same open immutable file.
-If an immutable input is unavailable, translation proceeds without accessing
-Translation Memory. Split GGUF names and split metadata are rejected on the
-cache path. Existing rows remain in the database and miss lookups under the
-new key.
+hashing the full model on each translation. New copies over 128 MiB created by
+`models import` or pulled to the default managed path try to enable fs-verity
+during installation. This requires kernel and filesystem support on the
+managed models directory. The original import source stays writable, and
+managed updates can replace the file atomically. To enable memory for a
+previously installed large writable model on a supported filesystem, import it
+from a separate file or pull it again to the managed path.
+
+Other files up to 128 MiB can use a sealed in-memory copy. The key and llama.cpp
+load refer to the same open immutable file. If an immutable input is
+unavailable, translation proceeds with memory bypassed. Multi-file GGUF names
+and split metadata are rejected on the cache path. Existing rows remain in the
+database and miss lookups under the new key.
 
 Configuration follows XDG paths:
 

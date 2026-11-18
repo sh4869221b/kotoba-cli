@@ -5,21 +5,27 @@ const sys = @import("../sys.zig");
 const checksum = @import("checksum.zig");
 const types = @import("types.zig");
 const url_policy = @import("../url.zig");
+const verity = @import("verity.zig");
 
 const Downloader = *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!void;
 
-pub fn acquire(allocator: std.mem.Allocator, m: types.Model, dest_path: []const u8, skip_download: bool) !void {
-    return acquireWithDownloader(allocator, m, dest_path, skip_download, downloadHttps);
+pub const AcquireOptions = struct {
+    skip_download: bool = false,
+    managed: bool = false,
+};
+
+pub fn acquire(allocator: std.mem.Allocator, m: types.Model, dest_path: []const u8, options: AcquireOptions) !void {
+    return acquireWithDownloader(allocator, m, dest_path, options, downloadHttps);
 }
 
 pub fn acquireWithDownloader(
     allocator: std.mem.Allocator,
     m: types.Model,
     dest_path: []const u8,
-    skip_download: bool,
+    options: AcquireOptions,
     downloader: Downloader,
 ) !void {
-    if (skip_download or m.download_url.len == 0) return;
+    if (options.skip_download or m.download_url.len == 0) return;
     if (dest_path.len == 0) return errors.Error.InvalidArguments;
     const request = if (url_policy.isRemote(m.download_url)) blk: {
         const uri = try url_policy.parseRemote(m.download_url);
@@ -37,17 +43,35 @@ pub fn acquireWithDownloader(
     } else {
         try copyFile(m.download_url, temp_path);
     }
+    if (options.managed) verity.prepareLargeCopy(temp_path);
     if (m.checksum.len > 0) try checksum.verifySha256(temp_path, m.checksum);
     try sys.renameFile(temp_path, dest_path);
 }
 
-pub fn installLocalFile(allocator: std.mem.Allocator, src: []const u8, dest: []const u8, expected_checksum: []const u8) !void {
-    const temp_path = try tempPath(allocator, dest);
-    defer allocator.free(temp_path);
-    errdefer sys.deleteFile(temp_path);
-    try sys.copyFile(src, temp_path);
-    if (expected_checksum.len > 0) try checksum.verifySha256(temp_path, expected_checksum);
-    try sys.renameFile(temp_path, dest);
+pub const StagedModel = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    published: bool = false,
+
+    pub fn deinit(self: *StagedModel) void {
+        if (!self.published) sys.deleteFile(self.path);
+        self.allocator.free(self.path);
+        self.* = undefined;
+    }
+
+    pub fn publish(self: *StagedModel, dest: []const u8) !void {
+        try sys.renameFile(self.path, dest);
+        self.published = true;
+    }
+};
+
+pub fn stageLocalFile(allocator: std.mem.Allocator, src: []const u8, dest: []const u8, expected_checksum: []const u8) !StagedModel {
+    var staged: StagedModel = .{ .allocator = allocator, .path = try tempPath(allocator, dest) };
+    errdefer staged.deinit();
+    try sys.copyFile(src, staged.path);
+    verity.prepareLargeCopy(staged.path);
+    if (expected_checksum.len > 0) try checksum.verifySha256(staged.path, expected_checksum);
+    return staged;
 }
 
 fn copyFile(src: []const u8, dest: []const u8) !void {
@@ -86,10 +110,54 @@ test "acquire local file verifies checksum" {
     defer std.testing.allocator.free(expected_checksum);
     const download_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{src});
     defer std.testing.allocator.free(download_url);
-    try acquire(std.testing.allocator, .{ .id = "local", .download_url = download_url, .checksum = expected_checksum }, dest, false);
+    try acquire(std.testing.allocator, .{ .id = "local", .download_url = download_url, .checksum = expected_checksum }, dest, .{});
     const copied = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings("model bytes", copied);
+}
+
+test "a large managed import protects only the staged copy when verity is supported" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source.gguf" });
+    defer allocator.free(source);
+    const probe = try std.fs.path.join(allocator, &.{ root, "probe.gguf" });
+    defer allocator.free(probe);
+    const dest = try std.fs.path.join(allocator, &.{ root, "installed.gguf" });
+    defer allocator.free(dest);
+
+    const header = "GGUF\x03\x00\x00\x00" ++ "\x00" ** 24;
+    for ([_][]const u8{ source, probe }) |path| {
+        const file = try sys.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        try file.writePositionalAll(io, header, 0);
+        try file.setLength(io, verity.mutable_snapshot_limit + 1);
+    }
+    verity.prepareLargeCopy(probe);
+    const probe_file = try sys.cwd().openFile(io, probe, .{});
+    defer probe_file.close(io);
+    const expected = verity.measure(probe_file);
+    var stage = try stageLocalFile(allocator, source, dest, "");
+    defer stage.deinit();
+    try stage.publish(dest);
+    const source_file = try sys.cwd().openFile(io, source, .{ .mode = .read_write });
+    defer source_file.close(io);
+    try std.testing.expectEqual(@as(?[32]u8, null), verity.measure(source_file));
+
+    const cache_input = try @import("cache_input.zig").CacheInput.open(dest, false);
+    if (expected) |digest| {
+        const input = cache_input orelse return error.TestUnexpectedResult;
+        defer input.close();
+        try std.testing.expectEqual(.verity_sha256, input.identity.kind);
+        try std.testing.expectEqual(digest, input.identity.digest);
+    } else {
+        try std.testing.expect(cache_input == null);
+    }
 }
 
 test "acquire local file rejects checksum mismatch" {
@@ -104,7 +172,7 @@ test "acquire local file rejects checksum mismatch" {
     try sys.writeFile(src, "model bytes");
     const download_url = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{src});
     defer std.testing.allocator.free(download_url);
-    try std.testing.expectError(errors.Error.ChecksumFailed, acquire(std.testing.allocator, .{ .id = "local", .download_url = download_url, .checksum = "deadbeef" }, dest, false));
+    try std.testing.expectError(errors.Error.ChecksumFailed, acquire(std.testing.allocator, .{ .id = "local", .download_url = download_url, .checksum = "deadbeef" }, dest, .{}));
 }
 
 fn fakeDownloader(_: std.mem.Allocator, _: []const u8, dest: []const u8) !void {
@@ -130,7 +198,7 @@ test "secret URL acquire rejects userinfo before downloader" {
     try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "https://KOTOBA_USER_36:KOTOBA_PASSWORD_36@models.example.invalid/model.gguf",
-    }, dest, false, forbiddenDownloader));
+    }, dest, .{}, forbiddenDownloader));
     const preserved = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("old model", preserved);
@@ -159,7 +227,7 @@ test "secret URL acquire preserves signed query and excludes fragment" {
         .id = "signed36",
         .download_url = "https://models.example.invalid/repo/model%2Bname.gguf?X-Signature=KOTOBA_QUERY_SECRET_36&x=a%2Bb&x=2#KOTOBA_FRAGMENT_SECRET_36",
         .checksum = expected_checksum,
-    }, dest, false, Recorder.download);
+    }, dest, .{}, Recorder.download);
     try std.testing.expectEqual(@as(usize, 1), Recorder.calls);
     const installed = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
     defer std.testing.allocator.free(installed);
@@ -192,7 +260,7 @@ test "secret URL invalid acquisition preserves filesystem before downloader" {
             try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
                 .id = "remote",
                 .download_url = value,
-            }, dest, false, forbiddenDownloader));
+            }, dest, .{}, forbiddenDownloader));
         }
     }
     for (0..128) |c| {
@@ -202,7 +270,7 @@ test "secret URL invalid acquisition preserves filesystem before downloader" {
         try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
             .id = "remote",
             .download_url = &value,
-        }, missing, false, forbiddenDownloader));
+        }, missing, .{}, forbiddenDownloader));
     }
     var oversize = [_]u8{'a'} ** (url_policy.max_length + 1);
     const prefix = "https://models.example.invalid/";
@@ -210,7 +278,7 @@ test "secret URL invalid acquisition preserves filesystem before downloader" {
     try std.testing.expectError(errors.Error.InvalidArguments, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = &oversize,
-    }, missing, false, forbiddenDownloader));
+    }, missing, .{}, forbiddenDownloader));
     try std.testing.expect(!sys.exists(missing_dir));
     const preserved = try sys.readFileAlloc(std.testing.allocator, existing, 1024);
     defer std.testing.allocator.free(preserved);
@@ -220,11 +288,11 @@ test "secret URL invalid acquisition preserves filesystem before downloader" {
     try acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "HTTPS://models.example.invalid/a#fragment",
-    }, existing, false, fakeDownloader);
+    }, existing, .{}, fakeDownloader);
     try acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = oversize[0..url_policy.max_length],
-    }, existing, false, fakeDownloader);
+    }, existing, .{}, fakeDownloader);
     try expectNoTempEntries(root);
 }
 
@@ -247,7 +315,7 @@ test "secret URL local paths preserve question and hash characters" {
             .id = "local",
             .download_url = value,
             .checksum = expected_checksum,
-        }, dest, false, forbiddenDownloader);
+        }, dest, .{}, forbiddenDownloader);
         const installed = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
         defer std.testing.allocator.free(installed);
         try std.testing.expectEqualStrings("local bytes", installed);
@@ -265,7 +333,7 @@ test "secret URL local paths preserve question and hash characters" {
     try acquireWithDownloader(std.testing.allocator, .{
         .id = "skip",
         .download_url = "https://user@invalid/a#bad\n",
-    }, "", true, forbiddenDownloader);
+    }, "", .{ .skip_download = true }, forbiddenDownloader);
 }
 
 test "acquire https streams through downloader and verifies checksum" {
@@ -281,7 +349,7 @@ test "acquire https streams through downloader and verifies checksum" {
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
         .checksum = expected_checksum,
-    }, dest, false, fakeDownloader);
+    }, dest, .{}, fakeDownloader);
     const copied = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings("remote bytes", copied);
@@ -297,12 +365,12 @@ test "acquire https failure does not leave final file" {
     try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
-    }, dest, false, failingDownloader));
+    }, dest, .{}, failingDownloader));
     try std.testing.expect(!sys.exists(dest));
 }
 
 test "acquire skip download does not require destination" {
-    try acquire(std.testing.allocator, .{ .id = "local", .download_url = "does-not-matter" }, "", true);
+    try acquire(std.testing.allocator, .{ .id = "local", .download_url = "does-not-matter" }, "", .{ .skip_download = true });
 }
 
 fn partialDownloader(_: std.mem.Allocator, _: []const u8, dest: []const u8) !void {
@@ -340,8 +408,8 @@ test "fault install happy matching checksum installs exact remote bytes in indep
         .checksum = expected_checksum,
     };
 
-    try acquireWithDownloader(std.testing.allocator, model, first_dest, false, fakeDownloader);
-    try acquireWithDownloader(std.testing.allocator, model, second_dest, false, fakeDownloader);
+    try acquireWithDownloader(std.testing.allocator, model, first_dest, .{}, fakeDownloader);
+    try acquireWithDownloader(std.testing.allocator, model, second_dest, .{}, fakeDownloader);
 
     const first_data = try sys.readFileAlloc(std.testing.allocator, first_dest, 1024);
     defer std.testing.allocator.free(first_data);
@@ -377,7 +445,7 @@ test "fault install failure mismatch and partial downloader preserve destination
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
         .checksum = wrong_checksum,
-    }, mismatch_dest, false, fakeDownloader));
+    }, mismatch_dest, .{}, fakeDownloader));
     const preserved = try sys.readFileAlloc(std.testing.allocator, mismatch_dest, 1024);
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("old model", preserved);
@@ -386,7 +454,7 @@ test "fault install failure mismatch and partial downloader preserve destination
     try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
-    }, partial_existing_dest, false, partialDownloader));
+    }, partial_existing_dest, .{}, partialDownloader));
     const partial_preserved = try sys.readFileAlloc(std.testing.allocator, partial_existing_dest, 1024);
     defer std.testing.allocator.free(partial_preserved);
     try std.testing.expectEqualStrings("old model", partial_preserved);
@@ -394,7 +462,7 @@ test "fault install failure mismatch and partial downloader preserve destination
     try std.testing.expectError(errors.Error.ModelRegistryInvalid, acquireWithDownloader(std.testing.allocator, .{
         .id = "remote",
         .download_url = "https://example.invalid/model.gguf",
-    }, partial_absent_dest, false, partialDownloader));
+    }, partial_absent_dest, .{}, partialDownloader));
     try std.testing.expect(!sys.exists(partial_absent_dest));
     try expectNoTempEntries(partial_root);
 }

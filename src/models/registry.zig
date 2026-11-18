@@ -199,10 +199,70 @@ pub fn installedPath(allocator: std.mem.Allocator, models_dir: []const u8, id: [
     return std.fs.path.join(allocator, &.{ models_dir, filename });
 }
 
+/// Serialize model registry and selection writes using the stable directory
+/// inode. Atomic replacement would invalidate a lock on the TOML file itself.
+pub const Writer = struct {
+    directory: std.Io.Dir,
+    path: []const u8,
+
+    pub fn close(self: Writer) void {
+        self.directory.close(sys.io());
+    }
+
+    pub fn upsert(self: Writer, allocator: std.mem.Allocator, model: Model) !void {
+        try validation.validateId(model.id);
+        var list = try load(allocator, self.path);
+        defer list.deinit();
+        try saveUpsert(allocator, self.path, &list, model);
+    }
+
+    /// A selection verifies its input before taking the lock. Compare all
+    /// fields again under the lock and keep the lock through config save.
+    pub fn replaceIfUnchanged(self: Writer, allocator: std.mem.Allocator, expected: ?Model, model: Model) !void {
+        var list = try load(allocator, self.path);
+        defer list.deinit();
+        const current = find(list.view(), model.id);
+        if (expected) |old| {
+            if (current == null or !equalModels(old, current.?)) return errors.Error.ModelSelectionChanged;
+        } else if (current != null) return errors.Error.ModelSelectionChanged;
+        if (current) |old| {
+            if (equalModels(old, model)) return;
+        }
+        try saveUpsert(allocator, self.path, &list, model);
+    }
+
+    pub fn removeById(self: Writer, allocator: std.mem.Allocator, id: []const u8) !OwnedModel {
+        return removeUnlocked(allocator, self.path, id);
+    }
+};
+
+pub fn beginWrite(path: []const u8) !Writer {
+    const io = sys.io();
+    const directory = sys.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return errors.Error.NotInitialized,
+        else => return err,
+    };
+    errdefer directory.close(io);
+    try (std.Io.File{ .handle = directory.handle, .flags = .{ .nonblocking = false } }).lock(io, .exclusive);
+    return .{ .directory = directory, .path = path };
+}
+
+fn equalModels(a: Model, b: Model) bool {
+    inline for (std.meta.fields(Model)) |field| {
+        if (field.type == []const u8) {
+            if (!std.mem.eql(u8, @field(a, field.name), @field(b, field.name))) return false;
+        } else if (@field(a, field.name) != @field(b, field.name)) return false;
+    }
+    return true;
+}
+
 pub fn upsert(allocator: std.mem.Allocator, registry_path: []const u8, model: Model) !void {
-    try validation.validateId(model.id);
-    var list = try load(allocator, registry_path);
-    defer list.deinit();
+    const writer = try beginWrite(registry_path);
+    defer writer.close();
+    try writer.upsert(allocator, model);
+}
+
+fn saveUpsert(allocator: std.mem.Allocator, registry_path: []const u8, list: *OwnedList, model: Model) !void {
     var replacement = try OwnedModel.clone(allocator, model);
     var transferred = false;
     defer if (!transferred) replacement.deinit();
@@ -229,7 +289,13 @@ pub fn upsert(allocator: std.mem.Allocator, registry_path: []const u8, model: Mo
 }
 
 /// Transfers an independent clone to the caller only after save succeeds.
-pub fn removeById(allocator: std.mem.Allocator, registry_path: []const u8, id: []const u8) !OwnedModel {
+fn removeById(allocator: std.mem.Allocator, registry_path: []const u8, id: []const u8) !OwnedModel {
+    const writer = try beginWrite(registry_path);
+    defer writer.close();
+    return writer.removeById(allocator, id);
+}
+
+fn removeUnlocked(allocator: std.mem.Allocator, registry_path: []const u8, id: []const u8) !OwnedModel {
     try validation.validateId(id);
     var list = try load(allocator, registry_path);
     defer list.deinit();
@@ -730,6 +796,37 @@ test "registry upsert replaces existing model fields" {
     const toy = find(list, "toy") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("Toy v2", toy.name);
     try std.testing.expectEqualStrings(second_model_path, toy.path);
+}
+
+test "registry writer serializes commits and rejects stale legacy path migration" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "registry.toml" });
+    defer allocator.free(path);
+    const legacy: Model = .{ .id = "toy", .path = "old.gguf" };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "registry.toml", .data = "[[models]]\nid = \"toy\"\npath = \"old.gguf\"\n" });
+
+    const io = sys.io();
+    const observer_dir = try sys.cwd().openDir(io, root, .{ .iterate = true });
+    defer observer_dir.close(io);
+    const observer: std.Io.File = .{ .handle = observer_dir.handle, .flags = .{ .nonblocking = false } };
+    const imported: Model = .{ .id = "toy", .path = "/models/toy.gguf", .checksum = "new" };
+    {
+        const writer = try beginWrite(path);
+        defer writer.close();
+        try std.testing.expect(!try observer.tryLock(io, .exclusive));
+        try writer.upsert(allocator, imported);
+        var migrated = legacy;
+        migrated.path = "/work/old.gguf";
+        try std.testing.expectError(errors.Error.ModelSelectionChanged, writer.replaceIfUnchanged(allocator, legacy, migrated));
+    }
+    try std.testing.expect(try observer.tryLock(io, .exclusive));
+    var persisted = try load(allocator, path);
+    defer persisted.deinit();
+    try std.testing.expect(equalModels(imported, find(persisted.view(), "toy").?));
 }
 
 test "registry upsert preserves missing registry errors" {

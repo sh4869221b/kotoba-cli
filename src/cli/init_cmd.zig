@@ -42,26 +42,25 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         sys.stderrPrint("kotoba: init requires --model-id ID or --model-path PATH, or rerun with --yes to configure later.\n", .{}) catch {};
         return errors.Error.InvalidArguments;
     }
+    const expected = if (model_id.len > 0) models.find(list, model_id) else null;
     var selected_registry_model: ?models.Model = null;
     if (model_path.len == 0 and model_id.len > 0) {
-        if (models.find(list, model_id)) |m| {
+        if (expected) |m| {
             models.verifyModel(m) catch |err| {
                 if (err != error.ModelMissing) return err;
                 sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{}) catch {};
                 return err;
             };
             model_path = try sys.absolutePathAlloc(allocator, m.path);
-            if (!std.fs.path.isAbsolute(m.path)) {
-                var anchored = m;
-                anchored.path = model_path;
-                try models.validateModel(anchored);
-                selected_registry_model = anchored;
-            }
+            var anchored = m;
+            anchored.path = model_path;
+            try models.validateModel(anchored);
+            selected_registry_model = anchored;
         } else return errors.Error.InvalidArguments;
     }
     if (explicit_model_path) {
         model_path = try sys.absolutePathAlloc(allocator, model_path);
-        var registry_model = models.find(list, model_id) orelse models.Model{
+        var registry_model = expected orelse models.Model{
             .id = model_id,
             .name = model_id,
             .profile = "local",
@@ -74,20 +73,23 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         try models.verifyModel(registry_model);
         selected_registry_model = registry_model;
     }
-    var cfg = config.load(allocator, paths.config_file) catch |err| switch (err) {
-        error.NotInitialized => try config.OwnedConfig.clone(allocator, config.default()),
-        else => return err,
-    };
-    defer cfg.deinit();
-    try cfg.setValue("model_id", model_id);
-    try cfg.setValue("model_path", model_path);
+    try models.validateStoredPath(model_path);
+    try models_cmd.validateConfigLoad(allocator, paths.config_file);
     try xdg.ensureDirs(paths);
-    try models.ensure(paths.models_file);
-    try glossary.ensure(paths.glossary_file);
-    if (selected_registry_model) |registry_model| {
-        try models.upsert(allocator, paths.models_file, registry_model);
+    {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        var cfg = try models_cmd.loadConfigOrDefault(allocator, paths.config_file);
+        defer cfg.deinit();
+        try cfg.setValue("model_id", model_id);
+        try cfg.setValue("model_path", model_path);
+        try models.ensure(paths.models_file);
+        if (selected_registry_model) |registry_model| {
+            try writer.replaceIfUnchanged(allocator, expected, registry_model);
+        }
+        try glossary.ensure(paths.glossary_file);
+        try config.save(paths.config_file, cfg.view());
     }
-    try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);
     db.close();
     try sys.stdoutPrint("initialized\n", .{});

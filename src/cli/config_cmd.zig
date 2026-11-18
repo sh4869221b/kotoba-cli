@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const errors = @import("../errors.zig");
+const models = @import("../models.zig");
 const sys = @import("../sys.zig");
 const xdg = @import("../xdg.zig");
 
@@ -25,6 +26,8 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     if (std.mem.eql(u8, cmd_args[0], "set")) {
         if (cmd_args.len != 3) return errors.Error.InvalidArguments;
         try validateConfigSet(allocator, cmd_args[1], cmd_args[2]);
+        const writer = try models.beginRegistryWrite(paths.config_file);
+        defer writer.close();
         var cfg = try config.load(allocator, paths.config_file);
         defer cfg.deinit();
         const value = if (std.mem.eql(u8, cmd_args[1], "model_path") and cmd_args[2].len > 0)

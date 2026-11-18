@@ -104,23 +104,30 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     }
     if (use_model) try validateConfigLoad(allocator, paths.config_file);
     try xdg.ensureDirs(paths);
-    try models.ensure(paths.models_file);
-    if (!std.mem.eql(u8, source_path, dest_path)) {
-        try models.installLocalFile(allocator, source_path, dest_path, checksum);
+    var staged = if (!std.mem.eql(u8, source_path, dest_path))
+        try models.stageLocalFile(allocator, source_path, dest_path, checksum)
+    else
+        null;
+    defer if (staged) |*file| file.deinit();
+    {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        try models.ensure(paths.models_file);
+        if (staged) |*file| try file.publish(dest_path);
+        const display_name = if (name.len > 0) name else id;
+        try writer.upsert(allocator, .{
+            .id = id,
+            .name = display_name,
+            .profile = "local",
+            .languages_en = true,
+            .languages_ja = true,
+            .format = "gguf",
+            .path = dest_path,
+            .checksum = checksum,
+            .notes = "Imported local GGUF model.",
+        });
+        if (use_model) try selectModel(allocator, paths, id, dest_path);
     }
-    const display_name = if (name.len > 0) name else id;
-    try models.upsert(allocator, paths.models_file, .{
-        .id = id,
-        .name = display_name,
-        .profile = "local",
-        .languages_en = true,
-        .languages_ja = true,
-        .format = "gguf",
-        .path = dest_path,
-        .checksum = checksum,
-        .notes = "Imported local GGUF model.",
-    });
-    if (use_model) try selectModel(allocator, paths, id, dest_path);
     try sys.stdoutPrint("imported {s}\n", .{id});
     return 0;
 }
@@ -134,7 +141,7 @@ fn runPullWithAcquirer(
     allocator: std.mem.Allocator,
     paths: xdg.Paths,
     cmd_args: []const []const u8,
-    acquirer: *const fn (std.mem.Allocator, models.Model, []const u8, bool) anyerror!void,
+    acquirer: *const fn (std.mem.Allocator, models.Model, []const u8, models.AcquireOptions) anyerror!void,
 ) !u8 {
     var cursor = args.ArgCursor.init(cmd_args);
     var id: []const u8 = "";
@@ -234,12 +241,19 @@ fn runPullWithAcquirer(
     }
     m.download_url = models.url.reusableUrl(m.download_url);
     try models.validateModel(m);
+    const managed_path = try models.installedPath(allocator, paths.models_dir, id);
+    defer allocator.free(managed_path);
+    const managed = std.mem.eql(u8, output_path, managed_path);
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
-    try acquirer(allocator, request_model, output_path, false);
+    try acquirer(allocator, request_model, output_path, .{ .managed = managed });
     try models.verifyModel(m);
-    try models.upsert(allocator, paths.models_file, m);
-    if (use_model) try selectModel(allocator, paths, id, output_path);
+    {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        try writer.upsert(allocator, m);
+        if (use_model) try selectModel(allocator, paths, id, output_path);
+    }
     try sys.stdoutPrint("pulled {s}\n", .{id});
     return 0;
 }
@@ -251,14 +265,18 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
     var list_owner = try models.load(allocator, paths.models_file);
     defer list_owner.deinit();
     const list = list_owner.view();
-    var m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
-    const legacy_path = m.path.len > 0 and !std.fs.path.isAbsolute(m.path);
-    if (legacy_path) m.path = try sys.absolutePathAlloc(allocator, m.path);
+    const expected = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
+    var m = expected;
+    if (m.path.len > 0 and !std.fs.path.isAbsolute(m.path)) m.path = try sys.absolutePathAlloc(allocator, m.path);
     try models.validateModel(m);
     try models.verifyModel(m);
     try xdg.ensureDirs(paths);
-    if (legacy_path) try models.upsert(allocator, paths.models_file, m);
-    try selectModel(allocator, paths, m.id, m.path);
+    {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        try writer.replaceIfUnchanged(allocator, expected, m);
+        try selectModel(allocator, paths, m.id, m.path);
+    }
     try sys.stdoutPrint("using {s}\n", .{m.id});
     return 0;
 }
@@ -295,28 +313,32 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
     try validateCommandId(id);
-    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
-    defer cfg.deinit();
-    var list_owner = try models.load(allocator, paths.models_file);
-    defer list_owner.deinit();
-    const list = list_owner.view();
-    _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
-    try xdg.ensureDirs(paths);
-    var removed_owner = try models.removeById(allocator, paths.models_file, id);
-    defer removed_owner.deinit();
-    const removed = removed_owner.view();
-    var remaining_owner = try reload(allocator, paths.models_file);
-    defer remaining_owner.deinit();
-    const remaining = remaining_owner.view();
-    const removing_selected = std.mem.eql(u8, cfg.view().model_id, id);
-    const active_path = if (removing_selected) "" else cfg.view().model_path;
-    if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, active_path, filesystem)) {
-        _ = try filesystem.removeFileIfExists(removed.path);
-    }
-    if (removing_selected) {
-        try cfg.setValue("model_id", "");
-        try cfg.setValue("model_path", "");
-        try config.save(paths.config_file, cfg.view());
+    {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        var cfg = try loadConfigOrDefault(allocator, paths.config_file);
+        defer cfg.deinit();
+        var list_owner = try models.load(allocator, paths.models_file);
+        defer list_owner.deinit();
+        const list = list_owner.view();
+        _ = models.find(list, id) orelse return errors.Error.ModelRegistryInvalid;
+        try xdg.ensureDirs(paths);
+        var removed_owner = try writer.removeById(allocator, id);
+        defer removed_owner.deinit();
+        const removed = removed_owner.view();
+        var remaining_owner = try reload(allocator, paths.models_file);
+        defer remaining_owner.deinit();
+        const remaining = remaining_owner.view();
+        const removing_selected = std.mem.eql(u8, cfg.view().model_id, id);
+        const active_path = if (removing_selected) "" else cfg.view().model_path;
+        if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, active_path, filesystem)) {
+            _ = try filesystem.removeFileIfExists(removed.path);
+        }
+        if (removing_selected) {
+            try cfg.setValue("model_id", "");
+            try cfg.setValue("model_path", "");
+            try config.save(paths.config_file, cfg.view());
+        }
     }
     try sys.stdoutPrint("removed {s}\n", .{id});
     return 0;
@@ -352,12 +374,12 @@ fn referencesModel(allocator: std.mem.Allocator, filesystem: *fs.FileSystem, pat
     return std.mem.eql(u8, real_model, resolved);
 }
 
-fn validateConfigLoad(allocator: std.mem.Allocator, path: []const u8) !void {
+pub fn validateConfigLoad(allocator: std.mem.Allocator, path: []const u8) !void {
     var cfg = try loadConfigOrDefault(allocator, path);
     defer cfg.deinit();
 }
 
-fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !config.OwnedConfig {
+pub fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !config.OwnedConfig {
     return config.load(allocator, path) catch |err| switch (err) {
         error.NotInitialized => config.OwnedConfig.clone(allocator, config.default()),
         else => return err,
@@ -474,10 +496,10 @@ test "secret URL pull pipeline keeps request transient" {
             try std.testing.expectEqualStrings(expected, value);
             try sys.writeFile(dest, bytes);
         }
-        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, skip: bool) !void {
+        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, options: models.AcquireOptions) !void {
             try std.testing.expectEqualStrings(expected, m.download_url);
-            try std.testing.expect(!skip);
-            try @import("../models/install.zig").acquireWithDownloader(a, m, dest, skip, download);
+            try std.testing.expect(!options.skip_download);
+            try @import("../models/install.zig").acquireWithDownloader(a, m, dest, options, download);
         }
     };
     Fixture.calls = 0;
@@ -540,7 +562,7 @@ test "secret URL pull without reusable source fails before acquirer" {
     defer capture.restore();
     const Fixture = struct {
         var calls: usize = 0;
-        fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: bool) !void {
+        fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !void {
             calls += 1;
             return error.UnexpectedAcquirerCall;
         }
@@ -696,7 +718,7 @@ fn testPreflight(command: PreflightCommand, registry_failure: bool) !void {
         defer capture.restore();
         const Fixture = struct {
             var calls: usize = 0;
-            fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: bool) !void {
+            fn acquire(_: std.mem.Allocator, _: models.Model, _: []const u8, _: models.AcquireOptions) !void {
                 calls += 1;
                 return error.UnexpectedAcquirerCall;
             }
@@ -779,7 +801,7 @@ test "model mutations retain valid and absent config semantics" {
             defer capture.restore();
             const Fixture = struct {
                 var calls: usize = 0;
-                fn acquire(_: std.mem.Allocator, _: models.Model, path: []const u8, _: bool) !void {
+                fn acquire(_: std.mem.Allocator, _: models.Model, path: []const u8, _: models.AcquireOptions) !void {
                     calls += 1;
                     try sys.writeFile(path, "downloaded fixture");
                 }
