@@ -106,6 +106,7 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
     var fence: ?struct { delimiter: Fence, depth: usize } = null;
     var table: ?Table = null;
     var raw_html_depth: ?usize = null;
+    var indented_code_depth: ?usize = null;
     var start: usize = 0;
     while (start < text.len) {
         const line = lineAt(text, start);
@@ -123,19 +124,28 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
                 if (leaf.continued < open_depth) raw_html_depth = null;
             }
 
+            if (indented_code_depth) |open_depth| {
+                if (leaf.continued < open_depth or depth != open_depth or (!leaf.blank and leaf.indent < 4))
+                    indented_code_depth = null;
+            }
+
             if (fence) |open| {
                 try protection.add(line.body);
-                if (fenceAt(leaf.text)) |close| {
+                if (leaf.fence()) |close| {
                     if (close.marker == open.delimiter.marker and close.len >= open.delimiter.len and close.rest.len == 0) fence = null;
                 }
             } else if (raw_html_depth != null) {
                 try protection.add(line.body);
                 if (endsRawHtml(leaf.text)) raw_html_depth = null;
-            } else if (openingFence(leaf.text)) |open| {
+            } else if (leaf.starts_indented_code or indented_code_depth != null) {
+                table = null;
+                indented_code_depth = depth;
+                try protection.add(line.body);
+            } else if (if (leaf.indent < 4) openingFence(leaf.text) else null) |open| {
                 table = null;
                 fence = .{ .delimiter = open, .depth = depth };
                 try protection.add(line.body);
-            } else if (startsRawHtml(leaf.text)) {
+            } else if (leaf.indent < 4 and startsRawHtml(leaf.text)) {
                 table = null;
                 if (!endsRawHtml(leaf.text)) raw_html_depth = depth;
                 try protection.add(line.body);
@@ -213,69 +223,94 @@ const Container = union(enum) {
 const Prefix = struct {
     text: []const u8,
     column: usize = 0,
+    tab_spaces: usize = 0,
+
+    fn blank(self: Prefix) bool {
+        return std.mem.trim(u8, self.text, " \t").len == 0;
+    }
+
+    /// A quote marker can consume just one column of a tab. Hold the
+    /// remaining virtual spaces for the next container or leaf.
+    fn takeIndent(self: *Prefix, limit: usize) usize {
+        const start = self.column;
+        const end = start + limit;
+        while (self.column < end) {
+            if (self.tab_spaces == 0) {
+                if (self.text.len == 0) break;
+                self.tab_spaces = switch (self.text[0]) {
+                    ' ' => 1,
+                    '\t' => 4 - self.column % 4,
+                    else => break,
+                };
+                self.text = self.text[1..];
+            }
+            const consumed = @min(end - self.column, self.tab_spaces);
+            self.tab_spaces -= consumed;
+            self.column += consumed;
+        }
+        return self.column - start;
+    }
 
     fn consume(self: *Prefix, container: Container) bool {
         switch (container) {
             .quote => self.* = self.quote() orelse return false,
             .list => |indent| {
-                if (std.mem.trim(u8, self.text, " \t").len == 0) {
-                    self.text = self.text[self.text.len..];
-                    self.column += indent;
-                    return true;
-                }
-                const end = self.column + indent;
-                var column = self.column;
-                var index: usize = 0;
-                while (column < end and index < self.text.len) : (index += 1) {
-                    column = switch (self.text[index]) {
-                        ' ' => column + 1,
-                        '\t' => nextTab(column),
-                        else => return false,
-                    };
-                }
-                if (column < end) return false;
-                self.* = .{ .text = self.text[index..], .column = column };
+                var next = self.*;
+                if (next.blank()) {
+                    next = .{ .text = next.text[next.text.len..], .column = next.column + indent };
+                } else if (next.takeIndent(indent) != indent) return false;
+                self.* = next;
             },
         }
         return true;
     }
 
     fn quote(self: Prefix) ?Prefix {
-        const trimmed = std.mem.trimStart(u8, self.text, " ");
-        const leading = self.text.len - trimmed.len;
-        if (leading > 3 or !std.mem.startsWith(u8, trimmed, ">")) return null;
-        const spaces: usize = @intFromBool(trimmed.len > 1 and trimmed[1] == ' ');
-        return .{ .text = trimmed[1 + spaces ..], .column = self.column + leading + 1 + spaces };
+        var next = self;
+        if (next.takeIndent(4) == 4 or !std.mem.startsWith(u8, next.text, ">")) return null;
+        next.text = next.text[1..];
+        next.column += 1;
+        _ = next.takeIndent(1);
+        return next;
     }
 
-    fn listItem(self: Prefix) ?Prefix {
-        const trimmed = std.mem.trimStart(u8, self.text, " ");
-        const leading = self.text.len - trimmed.len;
-        if (leading > 3 or trimmed.len == 0 or isThematicBreak(std.mem.trimEnd(u8, trimmed, " \t"))) return null;
-        const marker = listMarkerWidth(trimmed);
+    fn listItem(self: Prefix) ?struct { prefix: Prefix, starts_code: bool = false } {
+        var next = self;
+        if (next.takeIndent(4) == 4 or next.text.len == 0 or isThematicBreak(next.text)) return null;
+        const marker = listMarkerWidth(next.text);
         if (marker == 0) return null;
+        next.text = next.text[marker..];
+        next.column += marker;
+        if (next.blank()) return .{
+            .prefix = .{ .text = next.text[next.text.len..], .column = next.column + 1 },
+        };
 
-        var column = self.column + leading + marker;
-        const after_marker = column;
-        for (trimmed[marker..], marker..) |ch, index| {
-            switch (ch) {
-                ' ' => column += 1,
-                '\t' => column = nextTab(column),
-                else => {
-                    if (column == after_marker or column - after_marker > 4) return null;
-                    return .{ .text = trimmed[index..], .column = column };
-                },
-            }
+        var after_padding = next;
+        switch (after_padding.takeIndent(5)) {
+            0 => return null,
+            5 => {
+                // One column belongs to the list, leaving at least four
+                // columns for its first indented code block.
+                _ = next.takeIndent(1);
+                return .{ .prefix = next, .starts_code = true };
+            },
+            else => return .{ .prefix = after_padding },
         }
-        return .{ .text = trimmed[trimmed.len..], .column = after_marker + 1 };
     }
 };
 
-fn nextTab(column: usize) usize {
-    return (column / 4 + 1) * 4;
-}
+const Leaf = struct {
+    text: []const u8,
+    continued: usize,
+    indent: usize,
+    blank: bool,
+    starts_indented_code: bool,
 
-const Leaf = struct { text: []const u8, continued: usize };
+    fn fence(self: Leaf) ?Fence {
+        return if (self.indent < 4) fenceAt(self.text) else null;
+    }
+};
+
 const Table = struct { depth: usize, delimiter_pending: bool = true };
 
 fn advanceContainers(stack: *std.array_list.Managed(Container), body: []const u8, literal_depth: ?usize) !Leaf {
@@ -287,19 +322,26 @@ fn advanceContainers(stack: *std.array_list.Managed(Container), body: []const u8
     }
     stack.shrinkRetainingCapacity(continued);
 
+    var starts_indented_code = false;
     // Literal lines keep any further list or quote markers as content.
     if (literal_depth == null or continued < literal_depth.?) {
         while (true) {
             if (prefix.quote()) |next| {
                 try stack.append(.quote);
                 prefix = next;
-            } else if (prefix.listItem()) |next| {
-                try stack.append(.{ .list = next.column - prefix.column });
-                prefix = next;
+            } else if (prefix.listItem()) |item| {
+                try stack.append(.{ .list = item.prefix.column - prefix.column });
+                prefix = item.prefix;
+                if (item.starts_code) {
+                    starts_indented_code = true;
+                    break;
+                }
             } else break;
         }
     }
-    return .{ .text = prefix.text, .continued = continued };
+    const blank = prefix.blank();
+    const indent = prefix.takeIndent(4);
+    return .{ .text = prefix.text, .continued = continued, .indent = indent, .blank = blank, .starts_indented_code = starts_indented_code };
 }
 
 fn listMarkerWidth(line: []const u8) usize {
@@ -317,17 +359,17 @@ fn isTableLine(text: []const u8, leaf: Leaf, next: usize, containers: []const Co
                 active.delimiter_pending = false;
                 return true;
             }
-            if (!startsTableEndingBlock(leaf.text)) return true;
+            if (!leaf.blank and (leaf.indent == 4 or !startsTableEndingBlock(leaf.text))) return true;
         }
         table.* = null;
     }
-    if (next == text.len or startsTableEndingBlock(leaf.text)) return false;
+    if (next == text.len or leaf.indent == 4 or startsTableEndingBlock(leaf.text)) return false;
     const cells = tableCells(leaf.text, false) orelse return false;
     var delimiter: Prefix = .{ .text = lineAt(text, next).body };
     for (containers) |container| {
         if (!delimiter.consume(container)) return false;
     }
-    if (tableCells(delimiter.text, true) != cells) return false;
+    if (delimiter.takeIndent(4) == 4 or tableCells(delimiter.text, true) != cells) return false;
     table.* = .{ .depth = containers.len };
     return true;
 }
@@ -772,4 +814,37 @@ test "unclosed raw HTML in a continued list item ends at the outdent or sibling"
     try std.testing.expectEqualStrings("- > <pre>", doc.protected[3]);
     try std.testing.expect(std.mem.indexOf(u8, doc.text, "\n\n- Sibling\nOutside\n\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, doc.text, "\n  Back in list"));
+}
+
+test "a tab after a quote marker supplies padding to the enclosed list and table" {
+    const allocator = std.testing.allocator;
+    const source = ">\t- | A | B |\r\n>\t  | - | - |\r\n>\t  | Left | Right |\r\n\r\nAfterward";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), doc.protected.len);
+    try std.testing.expectEqualStrings(">\t- | A | B |", doc.protected[0]);
+    try std.testing.expectEqualStrings(">\t  | Left | Right |", doc.protected[2]);
+    try std.testing.expect(std.mem.endsWith(u8, doc.text, "\r\n\r\nAfterward"));
+}
+
+test "five columns after a list marker start code and preserve later pre scope" {
+    const allocator = std.testing.allocator;
+    {
+        const source = "-     <pre>\n      literal code\n  Still in item\n\nOutside";
+        const doc = try protect(allocator, source);
+        defer doc.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), doc.protected.len);
+        try std.testing.expectEqualStrings("-     <pre>", doc.protected[0]);
+        try std.testing.expectEqualStrings("      literal code", doc.protected[1]);
+        try std.testing.expect(std.mem.endsWith(u8, doc.text, "\n  Still in item\n\nOutside"));
+    }
+    {
+        const source = "-     first code\n  <pre>\n  still raw\nOutside";
+        const doc = try protect(allocator, source);
+        defer doc.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), doc.protected.len);
+        try std.testing.expectEqualStrings("-     first code", doc.protected[0]);
+        try std.testing.expectEqualStrings("  still raw", doc.protected[2]);
+        try std.testing.expect(std.mem.endsWith(u8, doc.text, "\nOutside"));
+    }
 }

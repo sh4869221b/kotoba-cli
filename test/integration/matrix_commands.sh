@@ -829,6 +829,16 @@ PYTHON
   matrix_case commands-models-pull-follows-moved-registration
   commands_fixture
   sed -i "s|^download_url = .*|download_url = \"file://$XDG_DATA_HOME/kotoba/models/fixture.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_setup models pull fixture --output "$XDG_DATA_HOME/kotoba/models/./fixture.gguf"
+  python3 - "$CASE_ROOT" <<'PYTHON'
+from pathlib import Path
+import sys, tomllib
+root = Path(sys.argv[1])
+config, registry = (tomllib.loads((root / 'config/kotoba' / name).read_text()) for name in ('config.toml', 'models.toml'))
+parent = root / 'data/kotoba/models'
+assert config['model_path'] == str(parent / 'fixture.gguf')
+assert registry['models'][0]['path'] == str(parent) + '/./fixture.gguf'
+PYTHON
   matrix_run models pull fixture --output ./moved.gguf
   commands_streams 0 $'pulled fixture\n'
   matrix_assert custom follows-moved-path python3 - "$CASE_ROOT" <<'PYTHON'
@@ -841,8 +851,18 @@ assert Path(config['model_path']) == Path(registry['models'][0]['path']) == root
 PYTHON
   commands_state work/moved.gguf config/kotoba/config.toml,config/kotoba/models.toml ''
 
+  matrix_case commands-models-pull-move-preserves-explicit-parent-symlink
+  commands_fixture
+  ln -s "$XDG_DATA_HOME/kotoba/models" parent
+  matrix_setup config set model_path "$PWD/parent/fixture.gguf"
+  sed -i "s|^download_url = .*|download_url = \"file://$XDG_DATA_HOME/kotoba/models/fixture.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_run models pull fixture --output ./moved.gguf
+  commands_streams 0 $'pulled fixture\n'
+  matrix_assert file "$PWD/moved.gguf" "$PWD/parent/fixture.gguf"
+  commands_state work/moved.gguf config/kotoba/models.toml ''
+
   local destination
-  for variant in selected-via-parent registered-via-link selected-via-dangling-link; do
+  for variant in selected-via-parent registered-via-link selected-via-dangling-link selected-via-40-links; do
     matrix_case "commands-models-pull-output-referenced-$variant"
     commands_fixture
     printf 'different remote model\n' > replacement.gguf
@@ -872,11 +892,67 @@ TOML
         ln -s missing.gguf selected.gguf
         matrix_setup config set model_path "$PWD/selected.gguf"
         destination="$PWD/missing.gguf" ;;
+      selected-via-40-links)
+        printf 'explicit selected model\n' > selected.gguf
+        python3 - <<'PYTHON'
+from pathlib import Path
+for index in range(40):
+    target = "selected.gguf" if index == 39 else f"hop-{index + 1}.gguf"
+    Path(f"hop-{index}.gguf").symlink_to(target)
+assert Path("hop-0.gguf").read_bytes() == b"explicit selected model\n"
+PYTHON
+        matrix_setup config set model_path "$PWD/hop-0.gguf"
+        destination="$PWD/selected.gguf" ;;
     esac
     matrix_run models pull incoming --output "$destination" --use
     commands_error model_path_in_use
     commands_state '' '' ''
   done
+
+  for variant in existing dangling new; do
+    matrix_case "commands-models-pull-output-legacy-relative-$variant"
+    commands_fixture
+    matrix_setup config set model_id ''
+    matrix_setup config set model_path ''
+    sed -i 's|^path = .*|path = "fixture.gguf"|' "$XDG_CONFIG_HOME/kotoba/models.toml"
+    printf 'different remote model\n' > replacement.gguf
+    cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "incoming"
+download_url = "file://$PWD/replacement.gguf"
+TOML
+    case "$variant" in
+      existing) destination="$XDG_DATA_HOME/kotoba/models/fixture.gguf" ;;
+      dangling)
+        ln -s missing.gguf dangling.gguf
+        destination="$PWD/dangling.gguf" ;;
+      new) destination="$PWD/new.gguf" ;;
+    esac
+    matrix_run models pull incoming --output "$destination"
+    if [[ "$variant" == new ]]; then
+      commands_streams 0 $'pulled incoming\n'
+      matrix_assert file "$destination" "$PWD/replacement.gguf"
+      commands_state work/new.gguf config/kotoba/models.toml ''
+    else
+      commands_error model_path_in_use
+      commands_state '' '' ''
+    fi
+  done
+
+  matrix_case commands-models-pull-invalid-selection-config-no-use
+  commands_fixture
+  printf 'explicit selected model\n' > selected.gguf
+  printf 'different remote model\n' > replacement.gguf
+  matrix_setup config set model_path "$PWD/selected.gguf"
+  printf 'unknown_key = true\n' >>"$XDG_CONFIG_HOME/kotoba/config.toml"
+  cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "incoming"
+download_url = "file://$PWD/replacement.gguf"
+TOML
+  matrix_run models pull incoming --output "$PWD/selected.gguf"
+  commands_error config_invalid
+  commands_unchanged
 
   for selector in use init active-config; do
     matrix_case "commands-models-remove-active-alias-$selector"

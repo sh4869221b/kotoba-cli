@@ -184,7 +184,10 @@ kotoba version
 ```
 
 Model installs reject an output referenced by another registered or selected
-model, including paths that refer to the output through symlinks.
+model, including paths that refer to the output through symlinks. A relative
+reference from another ID blocks replacement of an existing output when its
+base directory is unknown. Model installation requires a readable, valid
+config when one exists.
 `models import` and `models pull` preserve an explicitly configured
 `model_path` unless invoked with `--use`. If the active path follows the
 previous registration and that registration moves, the active path follows it.

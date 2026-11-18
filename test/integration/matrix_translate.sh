@@ -218,6 +218,9 @@ PY
   matrix_translate_plain_extra markdown-table-nested-list $'- - | A | B |\n    | - | - |\n    | Left | Right |\n\nAfterward' $'- - | A | B |\n    | - | - |\n    | Left | Right |\n\nJA:Afterward' markdown
   matrix_translate_plain_extra markdown-table-quote-in-list $'- > | A | B |\r\n  > | - | - |\r\n  > | Left | Right |\r\n\r\nAfterward' $'- > | A | B |\r\n  > | - | - |\r\n  > | Left | Right |\r\n\r\nJA:Afterward' markdown
   matrix_translate_plain_extra markdown-unclosed-pre-in-list $'1. Item\n   <pre>\n   Literal\nOutside' $'JA:1. Item\n   <pre>\n   Literal\nJA:Outside' markdown
+  matrix_translate_plain_extra markdown-table-tab-after-quote $'>\t- | A | B |\r\n>\t  | - | - |\r\n>\t  | Left | Right |\r\n\r\nAfterward' $'>\t- | A | B |\r\n>\t  | - | - |\r\n>\t  | Left | Right |\r\n\r\nJA:Afterward' markdown
+  matrix_translate_plain_extra markdown-pre-after-list-indented-code $'-     first code\n  <pre>\n  still raw\nOutside' $'-     first code\n  <pre>\n  still raw\nJA:Outside' markdown
+  matrix_translate_plain_extra markdown-pre-in-list-indented-code $'-     <pre>\n      literal code\n\nOutside' $'-     <pre>\n      literal code\n\nJA:Outside' markdown
   matrix_translate_plain_extra markdown-pipe-less-table-row $'| A | B |\n| - | - |\nCell\n# Heading' $'| A | B |\n| - | - |\nCell\nJA:# Heading' markdown
   matrix_translate_plain_extra paragraphs-whitespace-crlf $'First\r\n \t\r\nSecond' $'JA:First\r\n \t\r\nJA:Second' plain
 

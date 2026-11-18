@@ -111,7 +111,7 @@ fn runImportWithStager(
         var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
         defer validation_owner.deinit();
     }
-    if (use_model) try validateConfigLoad(allocator, paths.config_file);
+    try validateConfigLoad(allocator, paths.config_file);
     const display_name = if (name.len > 0) name else id;
     const model: models.Model = .{
         .id = id,
@@ -229,7 +229,7 @@ fn runPullWithAcquirer(
             var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
             defer validation_owner.deinit();
         }
-        if (use_model) try validateConfigLoad(allocator, paths.config_file);
+        try validateConfigLoad(allocator, paths.config_file);
         const file = try models.resolveHfFile(allocator, hf, hf_file);
         const url = try models.hfDownloadUrl(allocator, hf.repo, file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
@@ -244,13 +244,13 @@ fn runPullWithAcquirer(
             var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
             defer validation_owner.deinit();
         }
-        if (use_model) try validateConfigLoad(allocator, paths.config_file);
+        try validateConfigLoad(allocator, paths.config_file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
         m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
     } else {
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
         try validateCommandId(positional_id);
-        if (use_model) try validateConfigLoad(allocator, paths.config_file);
+        try validateConfigLoad(allocator, paths.config_file);
         pull_owner = try models.load(allocator, paths.models_file);
         const list = pull_owner.?.view();
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
@@ -318,11 +318,10 @@ fn commitInstall(
         },
     }
 
-    var cfg: ?config.OwnedConfig = loadConfigOrDefault(allocator, paths.config_file) catch |err| switch (err) {
-        error.ConfigInvalid, error.ConfigSchemaUnsupported => if (use_model) return err else null,
-        else => return err,
-    };
-    defer if (cfg) |*owner| owner.deinit();
+    // Recheck after staging under the same lock used for publication. An
+    // unreadable configuration cannot rule out a selected-model reference.
+    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
+    defer cfg.deinit();
     const destination = (try installEntryPath(allocator, m.path)) orelse return errors.Error.PathResolutionFailed;
     defer allocator.free(destination);
     const dest_stat = sys.cwd().statFile(sys.io(), destination, .{}) catch |err| switch (err) {
@@ -332,29 +331,55 @@ fn commitInstall(
     // Replacing a link to a directory could break references to models
     // below it even if their final components differ from the output.
     if (dest_stat != null and dest_stat.?.kind == .directory) return error.IsDir;
+    const replacing = dest_stat != null or (try sys.pathState(destination)) == .present;
     for (entries.view().models) |other| {
-        if (!std.mem.eql(u8, other.id, m.id) and try referencesInstallEntry(allocator, other.path, destination))
+        if (!std.mem.eql(u8, other.id, m.id) and try conflictsWithInstall(allocator, other.path, destination, replacing))
             return errors.Error.ModelPathInUse;
     }
-    const update_selection = if (cfg) |*owner| update: {
-        const settings = owner.view();
-        const active_id = std.mem.eql(u8, settings.model_id, m.id);
-        if (!active_id and try referencesInstallEntry(allocator, settings.model_path, destination))
-            return errors.Error.ModelPathInUse;
-        if (use_model) break :update true;
-        const previous = current orelse break :update false;
-        break :update active_id and settings.model_path.len != 0 and
-            std.mem.eql(u8, settings.model_path, previous.path) and
-            !try referencesInstallEntry(allocator, previous.path, destination);
-    } else false;
+
+    const settings = cfg.view();
+    const active_id = std.mem.eql(u8, settings.model_id, m.id);
+    if (!active_id and try conflictsWithInstall(allocator, settings.model_path, destination, replacing))
+        return errors.Error.ModelPathInUse;
+    const update_selection = use_model or (active_id and current != null and
+        sameStoredPath(settings.model_path, current.?.path) and
+        !try referencesInstallEntry(allocator, current.?.path, destination));
     if (update_selection) {
-        try cfg.?.setValue("model_id", m.id);
-        try cfg.?.setValue("model_path", m.path);
+        try cfg.setValue("model_id", m.id);
+        try cfg.setValue("model_path", m.path);
     }
     try models.ensure(paths.models_file);
     try stage.publish(m.path);
     try writer.upsert(allocator, m);
-    if (update_selection) try config.save(paths.config_file, cfg.?.view());
+    if (update_selection) try config.save(paths.config_file, cfg.view());
+}
+
+fn conflictsWithInstall(allocator: std.mem.Allocator, reference: []const u8, destination: []const u8, replacing: bool) !bool {
+    if (reference.len == 0) return false;
+    // Legacy paths have no saved working directory. The installer's current
+    // working directory cannot tell us whether an existing entry is shared.
+    if (!std.fs.path.isAbsolute(reference)) return replacing;
+    return referencesInstallEntry(allocator, reference, destination);
+}
+
+/// Ignore spelling differences that do not traverse a different directory
+/// entry. Keep symlink names and ".." because they may encode an override.
+fn sameStoredPath(selected: []const u8, registered: []const u8) bool {
+    if (!std.fs.path.isAbsolute(selected) or !std.fs.path.isAbsolute(registered)) return false;
+    var left = std.mem.tokenizeScalar(u8, selected, '/');
+    var right = std.mem.tokenizeScalar(u8, registered, '/');
+    while (true) {
+        const a = nextNamedComponent(&left) orelse return nextNamedComponent(&right) == null;
+        const b = nextNamedComponent(&right) orelse return false;
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+}
+
+fn nextNamedComponent(parts: *std.mem.TokenIterator(u8, .scalar)) ?[]const u8 {
+    while (parts.next()) |component| {
+        if (!std.mem.eql(u8, component, ".")) return component;
+    }
+    return null;
 }
 
 /// Resolve the directory entry that rename will replace, without following
@@ -374,10 +399,14 @@ fn referencesInstallEntry(allocator: std.mem.Allocator, path: []const u8, destin
     if (path.len == 0) return false;
     var current = try allocator.dupe(u8, path);
     defer allocator.free(current);
-    for (0..40) |_| {
+    const max_links = 40;
+    for (0..max_links + 1) |followed| {
         const entry = (try installEntryPath(allocator, current)) orelse return false;
         defer allocator.free(entry);
         if (std.mem.eql(u8, entry, destination)) return true;
+        // Linux permits 40 link hops. The terminal entry must be checked
+        // after the last hop, even when no more links may be read.
+        if (followed == max_links) return false;
 
         var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const count = sys.cwd().readLink(sys.io(), entry, &target_buffer) catch |err| switch (err) {
@@ -1324,4 +1353,55 @@ test "self import refuses a staged copy after registry or source changes" {
             try std.testing.expectEqualStrings("", cfg.view().model_path);
         }
     }
+}
+
+test "pull rechecks the configuration after staging even without use" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    const selected = try std.fs.path.join(allocator, &.{ root, "selected.gguf" });
+    try sys.writeFile(selected, "selected model");
+    try config.save(paths.config_file, .{ .model_id = "selected", .model_path = selected });
+    try models.ensure(paths.models_file);
+
+    const Fixture = struct {
+        var config_path: []const u8 = undefined;
+        const invalid = "unknown_key = true\n";
+        const bytes = "incoming bytes";
+
+        fn acquire(a: std.mem.Allocator, m: models.Model, dest: []const u8, options: models.AcquireOptions) !?models.StagedModel {
+            var staged = try models.StagedModel.begin(a, dest);
+            errdefer staged.deinit();
+            try sys.writeFile(staged.path, bytes);
+            try staged.verify(m.checksum, options.managed);
+            try sys.writeFile(config_path, invalid);
+            return staged;
+        }
+    };
+    Fixture.config_path = paths.config_file;
+    const checksum = try sys.hexSha256(allocator, Fixture.bytes);
+    try std.testing.expectError(error.ConfigInvalid, runPullWithAcquirer(
+        allocator,
+        paths,
+        &.{ "--model-url", "https://example.invalid/incoming.gguf", "--id", "incoming", "--checksum", checksum, "--output", selected },
+        Fixture.acquire,
+    ));
+    try std.testing.expectEqualStrings("selected model", try sys.readFileAlloc(allocator, selected, 1024));
+    try std.testing.expectEqualStrings(Fixture.invalid, try sys.readFileAlloc(allocator, paths.config_file, 1024));
+    var registry = try models.load(allocator, paths.models_file);
+    defer registry.deinit();
+    try std.testing.expect(models.find(registry.view(), "incoming") == null);
+}
+
+test "stored-path spelling retains distinct symlink and parent components" {
+    try std.testing.expect(sameStoredPath("/X/current.gguf", "/X/./current.gguf"));
+    try std.testing.expect(sameStoredPath("/X//current.gguf", "/./X/current.gguf"));
+    try std.testing.expect(!sameStoredPath("/X/link/current.gguf", "/X/current.gguf"));
+    try std.testing.expect(!sameStoredPath("/X/link/../current.gguf", "/X/current.gguf"));
+    try std.testing.expect(!sameStoredPath("current.gguf", "current.gguf"));
 }
