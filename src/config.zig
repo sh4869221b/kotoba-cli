@@ -387,12 +387,26 @@ pub const WriteTarget = struct {
     }
 
     pub fn begin(self: WriteTarget) !Writer {
+        return self.beginForInstall(false);
+    }
+
+    pub fn beginForInstall(self: WriteTarget, allow_read_only: bool) !Writer {
         const basename = std.fs.path.basename(self.path);
         if (std.mem.eql(u8, basename, sys.StateLock.config_name) or std.mem.eql(u8, basename, sys.StateLock.registry_name))
             return errors.Error.InvalidArguments;
-        const lock = try sys.StateLock.acquire(std.fs.path.dirname(self.path) orelse ".", sys.StateLock.config_name);
-        errdefer lock.close();
-        const writer: Writer = .{ .target = self, .lock = lock, .basename = basename };
+        const parent = std.fs.path.dirname(self.path) orelse ".";
+        const access: Writer.Access = if (sys.StateLock.acquire(parent, sys.StateLock.config_name)) |lock|
+            .{ .locked = lock }
+        else |err| fallback: {
+            if (!allow_read_only) return err;
+            switch (err) {
+                error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => {},
+                else => return err,
+            }
+            break :fallback .{ .read_only = .{ .dir = try sys.cwd().openDir(sys.io(), parent, .{}), .cause = err } };
+        };
+        const writer: Writer = .{ .target = self, .access = access, .basename = basename };
+        errdefer writer.close();
         try writer.requireTarget();
         return writer;
     }
@@ -441,17 +455,39 @@ test "a future config is anchored through a linked XDG parent" {
 
 pub const Writer = struct {
     target: WriteTarget,
-    lock: sys.StateLock,
+    access: Access,
     basename: []const u8,
     snapshot: fs.PathState = .not_found,
 
+    const Access = union(enum) {
+        locked: sys.StateLock,
+        read_only: struct { dir: std.Io.Dir, cause: anyerror },
+    };
+
     pub fn close(self: Writer) void {
-        self.lock.close();
+        switch (self.access) {
+            .locked => |lock| lock.close(),
+            .read_only => |access| access.dir.close(sys.io()),
+        }
+    }
+
+    fn directory(self: Writer) std.Io.Dir {
+        return switch (self.access) {
+            .locked => |lock| lock.directory,
+            .read_only => |access| access.dir,
+        };
+    }
+
+    pub fn lockError(self: Writer) ?anyerror {
+        return switch (self.access) {
+            .locked => null,
+            .read_only => |access| access.cause,
+        };
     }
 
     pub fn load(self: *Writer, allocator: std.mem.Allocator) !OwnedConfig {
         const io = sys.io();
-        const file = self.lock.directory.openFile(io, self.basename, .{
+        const file = self.directory().openFile(io, self.basename, .{
             .allow_directory = false,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -491,14 +527,14 @@ pub const Writer = struct {
         };
         defer allocator.free(actual);
         if (!std.mem.eql(u8, self.target.path, actual)) return errors.Error.ConfigTargetChanged;
-        const parent = try self.lock.directory.realPathFileAlloc(sys.io(), ".", allocator);
+        const parent = try self.directory().realPathFileAlloc(sys.io(), ".", allocator);
         defer allocator.free(parent);
         if (!std.mem.eql(u8, std.fs.path.dirname(actual) orelse ".", parent)) return errors.Error.ConfigTargetChanged;
     }
 
     pub fn requireUnchanged(self: Writer) !void {
         try self.requireTarget();
-        var filesystem = fs.FileSystem.init(sys.io(), self.lock.directory, null);
+        var filesystem = fs.FileSystem.init(sys.io(), self.directory(), null);
         const current = try filesystem.pathState(self.basename);
         switch (self.snapshot) {
             .not_found => if (current != .not_found) return errors.Error.ConfigTargetChanged,
@@ -513,8 +549,9 @@ pub const Writer = struct {
     }
 
     pub fn stage(self: Writer, cfg: Config, options: sys.StagedFileOptions) !staged_output.Finished {
+        if (self.lockError()) |err| return err;
         try self.requireUnchanged();
-        return stageConfig(self.target.allocator, self.lock.directory, self.basename, cfg, options);
+        return stageConfig(self.target.allocator, self.directory(), self.basename, cfg, options);
     }
 };
 

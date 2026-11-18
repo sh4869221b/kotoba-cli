@@ -6,6 +6,7 @@ pub const Code = enum {
     not_initialized,
     config_invalid,
     config_target_changed,
+    state_rollback_conflict,
     models_invalid,
     config_schema_unsupported,
     models_schema_unsupported,
@@ -37,6 +38,7 @@ pub const Code = enum {
     pub fn asText(self: Code) []const u8 {
         return switch (self) {
             .not_initialized => "not_initialized",
+            .state_rollback_conflict => "state_rollback_conflict",
             .config_target_changed => "config_target_changed",
             .config_invalid => "config_invalid",
             .models_invalid => "models_invalid",
@@ -74,6 +76,7 @@ pub const Error = error{
     NotInitialized,
     ConfigInvalid,
     ConfigTargetChanged,
+    StateRollbackConflict,
     StateRollbackFailed,
     ModelsInvalid,
     ConfigSchemaUnsupported,
@@ -120,6 +123,7 @@ pub fn fromError(err: anyerror) AppError {
     return switch (err) {
         Error.NotInitialized => .{ .code = .not_initialized, .message = "Kotoba is not initialized. Run `kotoba init`." },
         Error.ConfigTargetChanged => .{ .code = .config_target_changed, .message = "The configuration target changed during the operation. Retry the command." },
+        Error.StateRollbackConflict => .{ .code = .state_rollback_conflict, .message = "State changed during rollback. Inspect the current files and retained .kotoba-*.tmp backups before retrying." },
         Error.StateRollbackFailed => .{ .code = .io_error, .message = "Could not restore settings or model registry. Inspect the state files and any .kotoba-*.tmp backup before retrying." },
         Error.ConfigInvalid => .{ .code = .config_invalid, .message = "config.toml is invalid." },
         Error.ModelsInvalid => .{ .code = .models_invalid, .message = "models.toml is invalid." },

@@ -191,6 +191,9 @@ reference from another ID blocks replacement of an existing output when its
 base directory is unknown. Model installation requires a readable, valid
 config when one exists. A symbolic link to the settings file stays in place
 when Kotoba updates its target. A dangling config link causes an error.
+`config set` rejects a settings path shared with the model registry. When
+the settings directory is read-only, Kotoba can still install an unregistered
+model at a vacant output without changing the selection.
 `config set model_path PATH` records an explicit override in config with
 `model_path_explicit = true`. `models use ID` and `--use` select the registered
 path and clear that marker. Installs keep recorded overrides that name a
@@ -244,10 +247,14 @@ writers in the resolved settings directory, including different XDG
 configurations linked to the same settings. A target change during a command
 reports `config_target_changed`. Model writers also lock their registry
 directory. They prepare settings and registry updates before replacing or
-deleting a model and restore published metadata if a later step fails.
-These steps do not provide a single atomic view across files, directory
-fsync, or crash recovery. Translation output files use the separate
-staged-publication contract described above.
+deleting a model. If a later step fails, they restore the previous metadata
+when the current entries still match the versions they published.
+An intervening edit produces `state_rollback_conflict` and leaves the edit and
+available backups for inspection. A forced exit can leave metadata pointing
+to an absent model or to an older model file. See the
+[interrupted model operations](docs/strict-toml.md#interrupted-model-operations)
+section for diagnostics and recovery. Translation output files use the
+separate staged-publication contract described above.
 
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars
 before opening SQLite when examining a database without concurrent writers.

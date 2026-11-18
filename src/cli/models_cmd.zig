@@ -323,12 +323,6 @@ fn commitInstall(
         },
     }
 
-    // Recheck after staging under the same lock used for publication. An
-    // unreadable configuration cannot rule out a selected-model reference.
-    var cfg_writer = try beginConfigWrite(allocator, paths, config_target);
-    defer cfg_writer.close();
-    var cfg = try cfg_writer.loadOrDefault(allocator);
-    defer cfg.deinit();
     const destination = (try installEntryPath(allocator, m.path)) orelse return errors.Error.PathResolutionFailed;
     defer allocator.free(destination);
     try protectStateEntry(allocator, paths, destination);
@@ -336,10 +330,17 @@ fn commitInstall(
         error.FileNotFound => null,
         else => return err,
     };
-    // Replacing a link to a directory could break references to models
-    // below it even if their final components differ from the output.
+    // Replacing a link to a directory could break model references below it.
     if (dest_stat != null and dest_stat.?.kind == .directory) return error.IsDir;
     const replacing = dest_stat != null or (try sys.pathState(destination)) == .present;
+
+    // A fresh ID and vacant output can be added without modifying the
+    // selection or overwriting any existing model, even without its lock.
+    try requireSeparateState(allocator, paths, config_target);
+    var cfg_writer = try config_target.beginForInstall(!use_model and current == null and !replacing);
+    defer cfg_writer.close();
+    var cfg = try cfg_writer.loadOrDefault(allocator);
+    defer cfg.deinit();
     for (entries.view().models) |other| {
         if (!std.mem.eql(u8, other.id, m.id) and try conflictsWithInstall(allocator, other.path, destination, replacing))
             return errors.Error.ModelPathInUse;
@@ -347,6 +348,10 @@ fn commitInstall(
 
     const settings = cfg.view();
     const active_id = std.mem.eql(u8, settings.model_id, m.id);
+    if (cfg_writer.lockError()) |err| {
+        if (active_id or cfg_writer.snapshot != .present or
+            (settings.model_path.len != 0 and !std.fs.path.isAbsolute(settings.model_path))) return err;
+    }
     if (!active_id and try conflictsWithInstall(allocator, settings.model_path, destination, replacing))
         return errors.Error.ModelPathInUse;
     const update_selection = use_model or (active_id and try followsMovingRegistration(settings, current, m.path));
@@ -356,11 +361,16 @@ fn commitInstall(
     var registry = try writer.stageUpsert(allocator, entries.view(), m);
     defer registry.deinit();
     try commitModelState(cfg_writer, if (selection) |*prepared| prepared else null, &registry, .{
-        .install = .{ .stage = stage, .path = destination },
+        .install = .{ .stage = stage, .path = destination, .no_replace = cfg_writer.lockError() != null },
     });
 }
 
 pub fn beginConfigWrite(allocator: std.mem.Allocator, paths: xdg.Paths, target: config.WriteTarget) !config.Writer {
+    try requireSeparateState(allocator, paths, target);
+    return target.begin();
+}
+
+pub fn requireSeparateState(allocator: std.mem.Allocator, paths: xdg.Paths, target: config.WriteTarget) !void {
     // The registry still publishes to its own directory entry. It must not
     // replace the linked config or change the file that the config resolves to.
     const registry_entry = (try installEntryPath(allocator, paths.models_file)) orelse return errors.Error.PathResolutionFailed;
@@ -368,7 +378,6 @@ pub fn beginConfigWrite(allocator: std.mem.Allocator, paths: xdg.Paths, target: 
     if (try referencesInstallEntry(allocator, paths.config_file, registry_entry) or
         try referencesInstallEntry(allocator, paths.models_file, target.path))
         return errors.Error.InvalidArguments;
-    return target.begin();
 }
 
 fn protectStateEntry(allocator: std.mem.Allocator, paths: xdg.Paths, entry: []const u8) !void {
@@ -379,7 +388,7 @@ fn protectStateEntry(allocator: std.mem.Allocator, paths: xdg.Paths, entry: []co
 
 pub const ModelChange = union(enum) {
     none,
-    install: struct { stage: *models.StagedModel, path: []const u8 },
+    install: struct { stage: *models.StagedModel, path: []const u8, no_replace: bool },
     delete: struct { filesystem: *fs.FileSystem, path: []const u8 },
 };
 
@@ -410,19 +419,22 @@ fn finishModelChange(config_writer: config.Writer, updated_config: bool, model: 
     if (updated_config) try config_writer.requireTarget() else try config_writer.requireUnchanged();
     switch (model) {
         .none => {},
-        .install => |change| try change.stage.publish(change.path),
+        .install => |change| if (change.no_replace)
+            try change.stage.publishNew(change.path)
+        else
+            try change.stage.publish(change.path),
         .delete => |change| _ = try change.filesystem.removeFileIfExists(change.path),
     }
 }
 
 fn rollbackState(cause: anyerror, registry: ?*staged_output.Published, selection: ?*staged_output.Published) anyerror {
     var failure = cause;
-    if (registry) |published| published.rollback() catch {
-        failure = errors.Error.StateRollbackFailed;
-    };
-    if (selection) |published| published.rollback() catch {
-        failure = errors.Error.StateRollbackFailed;
-    };
+    for ([_]?*staged_output.Published{ registry, selection }) |candidate| {
+        if (candidate) |published| published.rollback() catch |err| {
+            if (err == error.StateRollbackConflict or failure != error.StateRollbackConflict)
+                failure = if (err == error.StateRollbackConflict) err else error.StateRollbackFailed;
+        };
+    }
     return failure;
 }
 

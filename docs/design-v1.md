@@ -91,10 +91,11 @@ Kotoba updates its captured target and keeps the link. A dangling config
 link or a change of target causes an error. Settings writers share a lock in
 the resolved settings directory, including across different XDG config
 directories. Model writes also lock their registry and stage metadata before
-replacing or deleting a model. A failure during publication restores any
-metadata already changed if the filesystem permits it. Readers can see the
-individual replacements, and publication does not provide directory fsync
-or power-loss recovery. Translation output files use the separate
+replacing or deleting a model. On failure they restore their own published
+metadata versions when the filesystem permits it. A later external edit
+causes a rollback conflict and leaves available backups for inspection.
+Readers can see the individual filesystem changes. See the [recovery
+guidance](strict-toml.md#interrupted-model-operations) for forced exits. Translation output files use the separate
 staged-publication contract below.
 
 Read-only memory and doctor checks preflight databases without concurrent

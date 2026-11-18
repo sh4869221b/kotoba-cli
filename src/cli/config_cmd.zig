@@ -3,6 +3,7 @@ const config = @import("../config.zig");
 const errors = @import("../errors.zig");
 const sys = @import("../sys.zig");
 const xdg = @import("../xdg.zig");
+const models_cmd = @import("models_cmd.zig");
 
 pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     var invocation_arena = std.heap.ArenaAllocator.init(original_allocator);
@@ -30,7 +31,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         // Preserve the missing-config error without creating lock state.
         var preflight = try config.load(allocator, target.path);
         preflight.deinit();
-        var writer = try target.begin();
+        var writer = try models_cmd.beginConfigWrite(allocator, paths, target);
         defer writer.close();
         var cfg = try writer.load(allocator);
         defer cfg.deinit();
@@ -44,6 +45,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         var staged = try writer.stage(cfg.view(), .{});
         defer staged.deinit();
         try writer.requireUnchanged();
+        try models_cmd.requireSeparateState(allocator, paths, target);
         try staged.publish(.replace);
         return 0;
     }
@@ -96,6 +98,8 @@ test "config set works without directory read permission" {
     var paths: xdg.Paths = undefined;
     paths.config_file = try std.fs.path.join(allocator, &.{ root, "config.toml" });
     defer allocator.free(paths.config_file);
+    paths.models_file = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    defer allocator.free(paths.models_file);
     try config.save(paths.config_file, config.default());
 
     const directory = try tmp.dir.openDir(io, ".", .{ .iterate = true });

@@ -42,20 +42,23 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         return errors.Error.InvalidArguments;
     }
     const expected = if (model_id.len > 0) models.find(list, model_id) else null;
+    const select_registered = model_path.len == 0 and model_id.len > 0;
+    if (select_registered and expected == null) return errors.Error.InvalidArguments;
+
+    const config_target = try models_cmd.preflightConfig(allocator, paths.config_file);
+    defer config_target.deinit();
     var selected_registry_model: ?models.Model = null;
-    if (model_path.len == 0 and model_id.len > 0) {
-        if (expected) |m| {
-            models.verifyModel(m) catch |err| {
-                if (err != error.ModelMissing) return err;
-                sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{}) catch {};
-                return err;
-            };
-            model_path = try sys.absolutePathAlloc(allocator, m.path);
-            var anchored = m;
-            anchored.path = model_path;
-            try models.validateModel(anchored);
-            selected_registry_model = anchored;
-        } else return errors.Error.InvalidArguments;
+    if (select_registered) {
+        var m = expected.?;
+        models.verifyModel(m) catch |err| {
+            if (err != error.ModelMissing) return err;
+            sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{}) catch {};
+            return err;
+        };
+        model_path = try sys.absolutePathAlloc(allocator, m.path);
+        m.path = model_path;
+        try models.validateModel(m);
+        selected_registry_model = m;
     }
     if (explicit_model_path) {
         model_path = try sys.absolutePathAlloc(allocator, model_path);
@@ -73,8 +76,6 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         selected_registry_model = registry_model;
     }
     try models.validateStoredPath(model_path);
-    const config_target = try models_cmd.preflightConfig(allocator, paths.config_file);
-    defer config_target.deinit();
     try xdg.ensureDirs(paths);
     {
         const writer = try models.beginRegistryWrite(paths.models_file);
@@ -126,6 +127,7 @@ test "init retains typed errors when pre-return diagnostic stderr fails" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     var paths: xdg.Paths = undefined;
     paths.models_file = try std.fs.path.join(allocator, &.{ root, "models.toml" });
+    paths.config_file = try std.fs.path.join(allocator, &.{ root, "config.toml" });
     const null_file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
     defer null_file.close(std.testing.io);
     const full = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/full", .{ .mode = .write_only });

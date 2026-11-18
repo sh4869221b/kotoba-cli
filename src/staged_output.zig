@@ -218,6 +218,12 @@ pub const Finished = struct {
         const s = self.storage orelse return error.InvalidStageState;
         if (s.state != .finished) return error.InvalidStageState;
         try s.check(.rename);
+        // Keep the staged inode open through rollback, so a replaced file
+        // cannot reuse its inode number. Capture the ctime after our rename.
+        const file = try openVersion(s);
+        errdefer file.close(s.filesystem.io);
+        const version = try file.stat(s.filesystem.io);
+        if (version.kind != .file) return error.InvalidStageState;
         const previous: PreviousEntry = if (s.previous_entry) prior: {
             exchange(s) catch |err| switch (err) {
                 error.OperationUnsupported => {
@@ -233,7 +239,7 @@ pub const Finished = struct {
         };
         s.completed(.rename);
         self.storage = null;
-        return .{ .storage = s, .previous = previous };
+        return Published.init(s, previous, file, version);
     }
 
     pub fn abort(self: *Finished) !void {
@@ -250,22 +256,57 @@ const PreviousEntry = enum { absent, exchanged, linked };
 pub const Published = struct {
     storage: ?*Storage,
     previous: PreviousEntry,
+    file: std.Io.File,
+    version: std.Io.File.Stat,
+    published_ctime: ?std.Io.Timestamp,
+
+    fn init(s: *Storage, previous: PreviousEntry, file: std.Io.File, version: std.Io.File.Stat) Published {
+        const published_stat = file.stat(s.filesystem.io) catch null;
+        return .{
+            .storage = s,
+            .previous = previous,
+            .file = file,
+            .version = version,
+            .published_ctime = if (published_stat) |stat| stat.ctime else null,
+        };
+    }
 
     pub fn rollback(self: *Published) !void {
         const s = self.storage orelse return error.InvalidStageState;
-        const restored = switch (self.previous) {
-            .absent => if (s.filesystem.removeFileIfExists(s.destination)) |_| {} else |err| err,
-            .exchanged => exchange(s),
-            .linked => s.filesystem.renameFile(&backupName(s), s.destination),
-        };
-        restored catch |err| {
-            // Leave the previous entry available if the filesystem now
-            // refuses to restore it. A later deinit must not unlink it.
-            self.storage = null;
-            s.destroy();
+        self.restore(s) catch |err| {
+            // Leave recovery files in place if a writer changed the
+            // destination or the filesystem refuses restoration.
+            self.release(s);
             return err;
         };
         self.deinit();
+    }
+
+    fn restore(self: Published, s: *Storage) !void {
+        const ctime = self.published_ctime orelse return error.StateRollbackFailed;
+        const current = try s.filesystem.pathState(s.destination);
+        if (!matchesVersion(current, self.version) or
+            current.present.ctime.nanoseconds != ctime.nanoseconds)
+            return error.StateRollbackConflict;
+
+        // Linux rename has no compare-and-swap operation. Detach the
+        // destination without replacing anything and check what moved.
+        // All subsequent moves use no-replace, even on the error path.
+        const detached = stageName(s, ".kotoba-revert-");
+        try moveForRollback(s, s.destination, &detached);
+        errdefer moveForRollback(s, &detached, s.destination) catch {};
+        if (!matchesVersion(try s.filesystem.pathState(&detached), self.version))
+            return error.StateRollbackConflict;
+
+        switch (self.previous) {
+            .absent => {
+                if ((try s.filesystem.pathState(s.destination)) == .present)
+                    return error.StateRollbackConflict;
+            },
+            .exchanged => try moveForRollback(s, &s.name, s.destination),
+            .linked => try moveForRollback(s, &backupName(s), s.destination),
+        }
+        s.removeBackup(&detached);
     }
 
     pub fn deinit(self: *Published) void {
@@ -275,16 +316,47 @@ pub const Published = struct {
             .exchanged => s.removeBackup(&s.name),
             .linked => s.removeBackup(&backupName(s)),
         }
+        self.release(s);
+    }
+
+    fn release(self: *Published, s: *Storage) void {
+        self.file.close(s.filesystem.io);
         self.storage = null;
         s.destroy();
     }
 };
 
-fn backupName(s: *const Storage) @TypeOf(s.name) {
-    const prefix = ".kotoba-backup-";
+fn openVersion(s: *Storage) !std.Io.File {
+    return s.filesystem.dir.openFile(s.filesystem.io, &s.name, .{
+        .path_only = true,
+        .follow_symlinks = false,
+    });
+}
+
+fn matchesVersion(state: fs.PathState, version: std.Io.File.Stat) bool {
+    if (state != .present) return false;
+    const current = state.present;
+    return current.kind == .file and version.inode == current.inode and
+        version.size == current.size and version.mtime.nanoseconds == current.mtime.nanoseconds and
+        version.permissions.toMode() == current.permissions.toMode();
+}
+
+fn moveForRollback(s: *Storage, source: []const u8, destination: []const u8) !void {
+    s.filesystem.renameFilePreserve(source, destination) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return error.StateRollbackConflict,
+        else => return err,
+    };
+}
+
+fn stageName(s: *const Storage, comptime prefix: []const u8) @TypeOf(s.name) {
+    comptime std.debug.assert(prefix.len == ".kotoba-output-".len);
     var name = s.name;
     @memcpy(name[0..prefix.len], prefix);
     return name;
+}
+
+fn backupName(s: *const Storage) @TypeOf(s.name) {
+    return stageName(s, ".kotoba-backup-");
 }
 
 fn publishWithHardLink(s: *Storage) !void {
@@ -442,6 +514,38 @@ fn expectEntries(dir: std.Io.Dir, expected: []const []const u8) !void {
     try testing.expectEqual(expected.len, count);
 }
 
+test "reversible publication keeps atomic editor replacements and the old backup" {
+    for ([_]bool{ false, true }) |existing| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const io = testing.io;
+        if (existing) try put(tmp.dir, "config.toml", "original");
+        var pending = try begin(testing.allocator, io, tmp.dir, "config.toml", .{});
+        defer pending.deinit();
+        try pending.writeAll("published");
+        var finished = try pending.finish();
+        defer finished.deinit();
+        var published = try finished.publishReversible();
+        defer published.deinit();
+        const s = published.storage.?;
+        const backup = if (published.previous == .linked) backupName(s) else s.name;
+
+        // The same bytes in a different inode are still an editor's version.
+        try put(tmp.dir, "editor.toml", "published");
+        const editor = try tmp.dir.statFile(io, "editor.toml", .{});
+        try tmp.dir.rename("editor.toml", tmp.dir, "config.toml", io);
+        try testing.expectError(error.StateRollbackConflict, published.rollback());
+        try testing.expectEqual(editor.inode, (try tmp.dir.statFile(io, "config.toml", .{})).inode);
+        try expectBytes(tmp.dir, "config.toml", "published");
+        if (existing) {
+            try expectBytes(tmp.dir, &backup, "original");
+            try expectEntries(tmp.dir, &.{ "config.toml", &backup });
+        } else {
+            try expectEntries(tmp.dir, &.{"config.toml"});
+        }
+    }
+}
+
 test "hard-link fallback restores the previous symbolic link" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -454,8 +558,12 @@ test "hard-link fallback restores the previous symbolic link" {
     try pending.writeAll("replacement");
     var finished = try pending.finish();
     defer finished.deinit();
-    try publishWithHardLink(finished.storage.?);
-    var published: Published = .{ .storage = finished.storage, .previous = .linked };
+    const s = finished.storage.?;
+    const version = try openVersion(s);
+    errdefer if (finished.storage != null) version.close(io);
+    const stat = try version.stat(io);
+    try publishWithHardLink(s);
+    var published = Published.init(s, .linked, version, stat);
     finished.storage = null;
     defer published.deinit();
     try expectBytes(tmp.dir, "models.toml", "replacement");

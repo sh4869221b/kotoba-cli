@@ -111,6 +111,15 @@ pub const StagedModel = struct {
         try sys.renameFile(self.path, dest);
         self.published = true;
     }
+
+    pub fn publishNew(self: *StagedModel, dest: []const u8) !void {
+        const cwd = sys.cwd();
+        cwd.renamePreserve(self.path, cwd, dest, sys.io()) catch |err| switch (err) {
+            error.PathAlreadyExists => return errors.Error.ModelPathInUse,
+            else => return err,
+        };
+        self.published = true;
+    }
 };
 
 /// Pins the source inode for copying and for comparison at publish time.

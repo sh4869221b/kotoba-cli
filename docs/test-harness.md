@@ -395,6 +395,8 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `commands-models-remove-permission` | 1; exact `io_error: AccessDenied`, empty stdout | No `removed` success line; config, registry, and model remain intact |
 | `commands-models-{pull,remove}-read-only-shared-config` | 1; exact `io_error: AccessDenied`, empty stdout | A shared config parent at mode 0555 leaves linked settings, models and registry unchanged |
 | `commands-shared-config-{retarget,concurrent}` | Real subprocess assertions | Retarget a settings link while an import waits after staging; independently run writers from two XDG config directories against one target and verify both edits |
+| `commands-shared-config-{init-retarget,rollback-editor,kill-before-model}` | Real subprocess assertions with a Linux syscall gate | Switch the link during model verification, replace settings with an editor's atomic rename before a real permission failure, and characterize the state and staged backups after SIGKILL |
+| `commands-{models-import-inactive-read-only-shared-config,config-set-linked-registry-target}` | Successful inactive import and rejected config edit | A new model can publish without writing read-only shared settings; config set preserves a registry reached through a symlink |
 | `commands-models-{pull-output-linked-registry-target,remove-linked-config-target}` | 2; exact `invalid_arguments`, empty stdout | Reject use of metadata as a model destination or deletion target; preserve both links and their contents |
 
 Finalized initialization regression #9 remains in `smoke.sh` and

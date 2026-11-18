@@ -92,6 +92,20 @@ commands_linked_config_permissions() (
   commands_state '' '' ''
 )
 
+commands_inactive_import_readonly() (
+  matrix_case commands-models-import-inactive-read-only-shared-config
+  commands_fixture
+  mkdir shared
+  mv "$XDG_CONFIG_HOME/kotoba/config.toml" shared/settings.toml
+  ln -s ../../work/shared/settings.toml "$XDG_CONFIG_HOME/kotoba/config.toml"
+  trap 'chmod 0700 "$CASE_ROOT/work/shared"' EXIT
+  chmod 0555 shared
+  matrix_run models import --id incoming --path "$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  commands_streams 0 $'imported incoming\n'
+  matrix_assert custom shared-parent-readonly test ! -w shared
+  commands_state data/kotoba/models/incoming.gguf config/kotoba/models.toml ''
+)
+
 commands_streams() {
   local status="$1" stdout="$2" stderr="${3:-}"
   printf '%s' "$stdout" >"$CASE_DIR/expected.stdout"
@@ -1005,7 +1019,18 @@ PYTHON
   commands_linked_config_permissions pull
   commands_linked_config_permissions remove
 
-  for variant in retarget concurrent; do
+  commands_inactive_import_readonly
+
+  matrix_case commands-config-set-linked-registry-target
+  commands_fixture
+  printf '# Empty registry\n' >"$XDG_CONFIG_HOME/kotoba/models.toml"
+  rm -- "$XDG_CONFIG_HOME/kotoba/config.toml"
+  ln -s models.toml "$XDG_CONFIG_HOME/kotoba/config.toml"
+  matrix_run config set threads 19
+  commands_error
+  commands_unchanged
+
+  for variant in retarget concurrent init-retarget rollback-editor kill-before-model; do
     matrix_case "commands-shared-config-$variant"
     commands_fixture
     matrix_run config get threads

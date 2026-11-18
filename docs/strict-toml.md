@@ -263,19 +263,26 @@ stays in place. A dangling link causes an error. Writes hold a lock in the
 resolved settings directory from the final read through publication. XDG
 directories that link to the same settings share that lock. Model writers
 also acquire the XDG registry lock before the settings lock. The directories
-used for these locks must allow writes and path traversal.
+used for these locks must allow writes and path traversal. When the settings
+lock fails for lack of write permission, an install can proceed only for an
+unregistered, inactive ID, a vacant output, and an existing valid config
+whose selected path is absolute or empty. The operation still holds the
+registry lock, rechecks the settings, and uses a no-replace model rename.
+Selection changes and model replacements require the settings lock.
 
 Settings updates use the target captured before acquisition or verification
 and check that the config still resolves there. A changed target or settings
 file during publication reports `config_target_changed`. Kotoba stages
 settings and registry updates before replacing or deleting a model. If a
-later step fails, it restores the prior metadata entries, including symlinks.
-On Linux a reversible replacement uses a same-directory rename exchange or
-a hard-link backup. A filesystem supporting neither operation refuses the
-replacement before changing model data. If the filesystem also prevents
-rollback, Kotoba reports the failure and keeps any intact backup. Publication
-does not provide a single atomic view across files, directory fsync, or
-recovery from a crash or power loss.
+later step fails, Kotoba checks the inode and version it published before
+attempting to restore the previous metadata. Rollback detaches that version,
+checks what moved, and restores a backup with a no-replace rename. Third-party
+edits produce `state_rollback_conflict` and leave the current entry and any
+retained backups. If another writer creates the entry during the rollback,
+Kotoba also leaves any displaced version for inspection. An existing
+metadata entry requires an exchange or hard-link backup, and rollback
+requires no-replace rename support. Metadata publication and model
+publication are separate filesystem operations.
 
 For a canonical supported model `M`, the invariant is:
 
@@ -339,8 +346,28 @@ operations. Registry validation precedes every acquisition or mutation,
 including direct URL and Hugging Face pulls. Installs also recheck
 configuration under the resolved settings lock before publication. Model
 commands reject replacing or deleting a directory entry used to reach
-`config.toml` or `models.toml`. Argument-shape validation still has
+`config.toml` or `models.toml`. A settings write also rejects a symlink
+chain shared with the registry. Argument-shape validation still has
 precedence.
+
+### Interrupted model operations
+
+An interruption such as `SIGKILL` can leave the new metadata visible before
+the model rename or unlink. The output may still contain the old model or
+may be absent. An interruption during rollback can leave the destination
+temporarily absent. The publication sequence provides per-file replacement
+and checked-error recovery. Crash recovery and directory durability are
+outside that sequence.
+
+Before retrying, preserve current files and intact `.kotoba-*.tmp`
+metadata backups and `.kotoba-model.tmp-*` stages. Look for them in the
+resolved settings directory, the registry directory, and the model output's
+parent. `kotoba doctor` checks the selected model, and `kotoba models verify
+ID` checks an individual registration and its checksum when recorded.
+Compare retained metadata with the current settings, registry, and model
+before restoring any file. A verified import or pull with `--use` can
+re-establish a consistent selection. Keep external edits when resolving a
+`state_rollback_conflict`.
 
 ## Design choice
 
