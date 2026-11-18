@@ -93,6 +93,7 @@ commands_error() {
     model_missing) message='Configured model file does not exist.' ;;
     checksum_failed) message='Model checksum verification failed.' ;;
     model_registry_invalid) message='Model registry entry is invalid.' ;;
+    model_reselection_required) message='Cannot tell whether the selected path follows the registry. Run kotoba models use ID, record the override with kotoba config set model_path PATH, or retry with --use.' ;;
     model_path_in_use) message='The destination is referenced by another model. Choose a different output path.' ;;
     models_invalid) message='models.toml is invalid.' ;;
     model_not_selected) message='No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`.' ;;
@@ -402,6 +403,7 @@ from pathlib import Path
 root, directory = Path(os.environ['CASE_ROOT']), Path(os.environ['CASE_DIR'])
 config = tomllib.loads((root / 'config/kotoba/config.toml').read_text())
 config['model_path'] = (directory / 'value').read_bytes().decode()
+config['model_path_explicit'] = True
 (directory / 'expected-config.json').write_text(json.dumps(config))
 PY
     if [[ "$operation" == get ]]; then
@@ -829,6 +831,7 @@ PYTHON
   matrix_case commands-models-pull-follows-moved-registration
   commands_fixture
   sed -i "s|^download_url = .*|download_url = \"file://$XDG_DATA_HOME/kotoba/models/fixture.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_setup config set model_path "$XDG_DATA_HOME/kotoba/models/fixture.gguf"
   matrix_setup models pull fixture --output "$XDG_DATA_HOME/kotoba/models/./fixture.gguf"
   python3 - "$CASE_ROOT" <<'PYTHON'
 from pathlib import Path
@@ -860,6 +863,58 @@ PYTHON
   commands_streams 0 $'pulled fixture\n'
   matrix_assert file "$PWD/moved.gguf" "$PWD/parent/fixture.gguf"
   commands_state work/moved.gguf config/kotoba/models.toml ''
+
+  for variant in legacy-relative registered-symlink; do
+    matrix_case "commands-models-pull-selection-follows-$variant"
+    commands_fixture
+    local old_model="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+    sed -i "s|^download_url = .*|download_url = \"file://$old_model\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+    case "$variant" in
+      legacy-relative)
+        sed -i 's|^model_path = .*|model_path = "fixture.gguf"|' "$XDG_CONFIG_HOME/kotoba/config.toml"
+        sed -i 's|^path = .*|path = "fixture.gguf"|' "$XDG_CONFIG_HOME/kotoba/models.toml" ;;
+      registered-symlink)
+        ln -s "$old_model" registered.gguf
+        sed -i "s|^path = .*|path = \"$PWD/registered.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+        matrix_setup models use fixture
+        matrix_setup models pull fixture --output "$old_model"
+        python3 -c 'import sys, tomllib; assert tomllib.load(open(sys.argv[1], "rb"))["model_path"] == sys.argv[2]' "$XDG_CONFIG_HOME/kotoba/config.toml" "$old_model" ;;
+    esac
+    matrix_run models pull fixture --output ./moved.gguf
+    commands_streams 0 $'pulled fixture\n'
+    matrix_assert custom follows-moved-path python3 - "$CASE_ROOT" <<'PYTHON'
+from pathlib import Path
+import sys, tomllib
+root = Path(sys.argv[1])
+config, registry = (tomllib.loads((root / 'config/kotoba' / name).read_text()) for name in ('config.toml', 'models.toml'))
+assert config['model_id'] == 'fixture'
+assert Path(config['model_path']) == Path(registry['models'][0]['path']) == root / 'work/moved.gguf'
+PYTHON
+    commands_state work/moved.gguf config/kotoba/config.toml,config/kotoba/models.toml ''
+  done
+
+  for variant in ambiguous-alias confirmed-use mixed-relative; do
+    matrix_case "commands-models-pull-selection-$variant"
+    commands_fixture
+    local old_model="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+    sed -i "s|^download_url = .*|download_url = \"file://$old_model\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+    if [[ "$variant" == mixed-relative ]]; then
+      sed -i 's|^model_path = .*|model_path = "fixture.gguf"|' "$XDG_CONFIG_HOME/kotoba/config.toml"
+    else
+      ln -s "$old_model" legacy-selection.gguf
+      sed -i "s|^model_path = .*|model_path = \"$PWD/legacy-selection.gguf\"|" "$XDG_CONFIG_HOME/kotoba/config.toml"
+    fi
+    if [[ "$variant" == confirmed-use ]]; then
+      matrix_run models pull fixture --output "$PWD/moved.gguf" --use
+      commands_streams 0 $'pulled fixture\n'
+      matrix_assert custom selected-path python3 -c 'import sys, tomllib; assert tomllib.load(open(sys.argv[1], "rb"))["model_path"] == sys.argv[2]' "$XDG_CONFIG_HOME/kotoba/config.toml" "$PWD/moved.gguf"
+      commands_state work/moved.gguf config/kotoba/config.toml,config/kotoba/models.toml ''
+    else
+      matrix_run models pull fixture --output "$PWD/moved.gguf"
+      commands_error model_reselection_required
+      commands_state '' '' ''
+    fi
+  done
 
   local destination
   for variant in selected-via-parent registered-via-link selected-via-dangling-link selected-via-40-links; do
@@ -953,6 +1008,27 @@ TOML
   matrix_run models pull incoming --output "$PWD/selected.gguf"
   commands_error config_invalid
   commands_unchanged
+
+  for variant in no-use use; do
+    matrix_case "commands-models-pull-dangling-config-$variant"
+    commands_fixture
+    printf 'explicit selected model\n' > selected.gguf
+    printf 'different remote model\n' > replacement.gguf
+    matrix_setup config set model_path "$PWD/selected.gguf"
+    mv "$XDG_CONFIG_HOME/kotoba/config.toml" held-config.toml
+    ln -s "$PWD/unavailable.toml" "$XDG_CONFIG_HOME/kotoba/config.toml"
+    cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "incoming"
+download_url = "file://$PWD/replacement.gguf"
+TOML
+    local -a activation=()
+    if [[ "$variant" == use ]]; then activation=(--use); fi
+    matrix_run models pull incoming --output "$PWD/selected.gguf" "${activation[@]}"
+    commands_error io_error FileNotFound
+    matrix_assert custom dangling-link test "$(readlink "$XDG_CONFIG_HOME/kotoba/config.toml")" = "$PWD/unavailable.toml"
+    commands_unchanged
+  done
 
   for selector in use init active-config; do
     matrix_case "commands-models-remove-active-alias-$selector"

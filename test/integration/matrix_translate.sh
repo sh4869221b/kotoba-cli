@@ -221,6 +221,7 @@ PY
   matrix_translate_plain_extra markdown-table-tab-after-quote $'>\t- | A | B |\r\n>\t  | - | - |\r\n>\t  | Left | Right |\r\n\r\nAfterward' $'>\t- | A | B |\r\n>\t  | - | - |\r\n>\t  | Left | Right |\r\n\r\nJA:Afterward' markdown
   matrix_translate_plain_extra markdown-pre-after-list-indented-code $'-     first code\n  <pre>\n  still raw\nOutside' $'-     first code\n  <pre>\n  still raw\nJA:Outside' markdown
   matrix_translate_plain_extra markdown-pre-in-list-indented-code $'-     <pre>\n      literal code\n\nOutside' $'-     <pre>\n      literal code\n\nJA:Outside' markdown
+  matrix_translate_plain_extra markdown-indented-code-after-table $'| A | B |\r\n| - | - |\r\n| left | right |\r\n    first code\r\n\tsecond code\r\nOrdinary paragraph.' $'| A | B |\r\n| - | - |\r\n| left | right |\r\n    first code\r\n\tsecond code\r\nJA:Ordinary paragraph.' markdown
   matrix_translate_plain_extra markdown-pipe-less-table-row $'| A | B |\n| - | - |\nCell\n# Heading' $'| A | B |\n| - | - |\nCell\nJA:# Heading' markdown
   matrix_translate_plain_extra paragraphs-whitespace-crlf $'First\r\n \t\r\nSecond' $'JA:First\r\n \t\r\nJA:Second' plain
 

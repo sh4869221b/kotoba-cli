@@ -52,6 +52,8 @@ pub const Config = struct {
     default_output: OutputRenderer = .plain,
     model_id: []const u8 = "",
     model_path: []const u8 = "",
+    /// Persisted for paths chosen independently of the registry.
+    model_path_explicit: bool = false,
     gpu_layers: i32 = -1,
     context_length: u32 = 4096,
     threads: u32 = 0,
@@ -92,6 +94,19 @@ pub const OwnedConfig = struct {
         self.allocator.free(self.value.model_path);
         self.allocator.free(self.value.log_level);
         self.* = undefined;
+    }
+
+    pub fn selectRegisteredModel(self: *OwnedConfig, id: []const u8, path: []const u8) !void {
+        strict.validateString(id) catch return error.InvalidArguments;
+        strict.validateString(path) catch return error.InvalidArguments;
+        const model_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(model_id);
+        const model_path = try self.allocator.dupe(u8, path);
+        self.allocator.free(self.value.model_id);
+        self.allocator.free(self.value.model_path);
+        self.value.model_id = model_id;
+        self.value.model_path = model_path;
+        self.value.model_path_explicit = false;
     }
 
     /// Validation or allocation failure leaves every previous field valid.
@@ -153,7 +168,10 @@ pub fn default() Config {
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !OwnedConfig {
     const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return errors.Error.NotInitialized,
+        error.FileNotFound => switch (try sys.pathState(path)) {
+            .not_found => return errors.Error.NotInitialized,
+            .present => return err,
+        },
         else => return err,
     };
     defer allocator.free(data);
@@ -170,6 +188,46 @@ test "strict config loader distinguishes missing files without creating paths" {
     const path = try std.fs.path.join(allocator, &.{ root, "missing", "config.toml" });
     try std.testing.expectError(error.NotInitialized, load(allocator, path));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "missing", .{}));
+}
+
+test "config loader reports a dangling symlink without treating it as absent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    defer allocator.free(path);
+    try tmp.dir.symLink(io, "settings.toml", "config.toml", .{});
+    try std.testing.expectError(error.FileNotFound, load(allocator, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "settings.toml", .data = "model_id = 'restored'\n" });
+    var loaded = try load(allocator, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("restored", loaded.view().model_id);
+}
+
+test "explicit model paths round trip and registry selection clears the marker" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
+    defer allocator.free(path);
+    try save(path, .{ .model_id = "old", .model_path = "/alias.gguf", .model_path_explicit = true });
+    var cfg = try load(allocator, path);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.view().model_path_explicit);
+    try cfg.selectRegisteredModel("new", "/registered.gguf");
+    try save(path, cfg.view());
+    var loaded = try load(allocator, path);
+    defer loaded.deinit();
+    try std.testing.expect(!loaded.view().model_path_explicit);
+    try std.testing.expectEqualStrings("/registered.gguf", loaded.view().model_path);
+    try std.testing.expectError(error.ConfigInvalid, parse(allocator, "model_path_explicit=true\nmodel_path_explicit=false"));
+    try std.testing.expectError(error.ConfigInvalid, parse(allocator, "model_path_explicit='true'"));
 }
 
 test "strict config loader preserves size failures" {
@@ -254,6 +312,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
 fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
     var cfg = default();
     var seen = [_]bool{false} ** settable_keys.len;
+    var seen_explicit = false;
     var owned = [_]bool{false} ** settable_keys.len;
     errdefer inline for (settable_keys, 0..) |key, index| {
         if (@TypeOf(@field(cfg, key)) == []const u8 and owned[index]) allocator.free(@field(cfg, key));
@@ -268,6 +327,12 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
             .pair => |pair| pair,
         };
         if (strict.isSchemaMarker(pair.key)) return error.ConfigSchemaUnsupported;
+        if (std.mem.eql(u8, pair.key, "model_path_explicit")) {
+            if (seen_explicit) return error.Invalid;
+            seen_explicit = true;
+            cfg.model_path_explicit = try strict.parseBool(pair.value);
+            continue;
+        }
         var matched = false;
         inline for (settable_keys, 0..) |key, index| {
             if (std.mem.eql(u8, key, pair.key)) {
@@ -336,6 +401,7 @@ fn appendConfig(out: *strict.Buffer, cfg: Config) !void {
         }
         try out.append('\n');
     }
+    if (cfg.model_path_explicit) try out.appendSlice("model_path_explicit = true\n");
 }
 
 /// Returns caller-owned bytes allocated with allocator.

@@ -137,7 +137,9 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
             } else if (raw_html_depth != null) {
                 try protection.add(line.body);
                 if (endsRawHtml(leaf.text)) raw_html_depth = null;
-            } else if (leaf.starts_indented_code or indented_code_depth != null) {
+            } else if (leaf.starts_indented_code or indented_code_depth != null or
+                (table != null and !table.?.delimiter_pending and leaf.indent == 4 and !leaf.blank))
+            {
                 table = null;
                 indented_code_depth = depth;
                 try protection.add(line.body);
@@ -359,7 +361,7 @@ fn isTableLine(text: []const u8, leaf: Leaf, next: usize, containers: []const Co
                 active.delimiter_pending = false;
                 return true;
             }
-            if (!leaf.blank and (leaf.indent == 4 or !startsTableEndingBlock(leaf.text))) return true;
+            if (!leaf.blank and leaf.indent < 4 and !startsTableEndingBlock(leaf.text)) return true;
         }
         table.* = null;
     }
@@ -847,4 +849,15 @@ test "five columns after a list marker start code and preserve later pre scope" 
         try std.testing.expectEqualStrings("  still raw", doc.protected[2]);
         try std.testing.expect(std.mem.endsWith(u8, doc.text, "\nOutside"));
     }
+}
+
+test "four-column indented code closes a table before the next paragraph" {
+    const allocator = std.testing.allocator;
+    const source = "| A | B |\r\n| - | - |\r\n| left | right |\r\n    first code\r\n\tsecond code\r\nOrdinary paragraph.";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 5), doc.protected.len);
+    try std.testing.expectEqualStrings("    first code", doc.protected[3]);
+    try std.testing.expectEqualStrings("\tsecond code", doc.protected[4]);
+    try std.testing.expect(std.mem.endsWith(u8, doc.text, "\r\nOrdinary paragraph."));
 }

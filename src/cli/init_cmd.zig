@@ -81,8 +81,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         defer writer.close();
         var cfg = try models_cmd.loadConfigOrDefault(allocator, paths.config_file);
         defer cfg.deinit();
-        try cfg.setValue("model_id", model_id);
-        try cfg.setValue("model_path", model_path);
+        try cfg.selectRegisteredModel(model_id, model_path);
         try models.ensure(paths.models_file);
         if (selected_registry_model) |registry_model| {
             try models.verifyModel(.{ .path = registry_model.path });

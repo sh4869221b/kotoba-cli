@@ -187,10 +187,15 @@ Model installs reject an output referenced by another registered or selected
 model, including paths that refer to the output through symlinks. A relative
 reference from another ID blocks replacement of an existing output when its
 base directory is unknown. Model installation requires a readable, valid
-config when one exists.
-`models import` and `models pull` preserve an explicitly configured
-`model_path` unless invoked with `--use`. If the active path follows the
-previous registration and that registration moves, the active path follows it.
+config when one exists, including a config reached through a symbolic link.
+`config set model_path PATH` records an explicit override in config with
+`model_path_explicit = true`. `models use ID` and `--use` select the registered
+path and clear that marker. Installs keep recorded overrides that name a
+different path. A selection that names its registered path follows the
+registration when the name changes. If an older config could represent
+either a registry selection or an override, Kotoba asks for an explicit
+choice before publishing the model. Older releases with strict config
+parsing reject the override marker when present.
 
 ## Command side effects
 

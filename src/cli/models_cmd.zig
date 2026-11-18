@@ -341,17 +341,39 @@ fn commitInstall(
     const active_id = std.mem.eql(u8, settings.model_id, m.id);
     if (!active_id and try conflictsWithInstall(allocator, settings.model_path, destination, replacing))
         return errors.Error.ModelPathInUse;
-    const update_selection = use_model or (active_id and current != null and
-        sameStoredPath(settings.model_path, current.?.path) and
-        !try referencesInstallEntry(allocator, current.?.path, destination));
-    if (update_selection) {
-        try cfg.setValue("model_id", m.id);
-        try cfg.setValue("model_path", m.path);
-    }
+    const update_selection = use_model or (active_id and try followsMovingRegistration(settings, current, m.path));
+    if (update_selection) try cfg.selectRegisteredModel(m.id, m.path);
     try models.ensure(paths.models_file);
     try stage.publish(m.path);
     try writer.upsert(allocator, m);
     if (update_selection) try config.save(paths.config_file, cfg.view());
+}
+
+fn followsMovingRegistration(settings: config.Config, current: ?models.Model, output: []const u8) !bool {
+    const selected = settings.model_path;
+    if (selected.len == 0 or sameStoredPath(selected, output)) return false;
+
+    const previous = (current orelse {
+        if (settings.model_path_explicit) return false;
+        return errors.Error.ModelReselectionRequired;
+    }).path;
+    // Identical names share the same reference even in legacy config. Keep
+    // selection and registration together when changing from a symlink to
+    // its referent too, so a subsequent move can still follow the registry.
+    if (sameStoredPath(selected, previous)) return true;
+    if (settings.model_path_explicit or sameStoredPath(previous, output)) return false;
+
+    // Older configs recorded no explicit override. Different absolute paths
+    // to distinct files identify an override. An alias, unknown base, or
+    // missing file could instead be a registration that previously drifted.
+    if (!std.fs.path.isAbsolute(selected) or !std.fs.path.isAbsolute(previous))
+        return errors.Error.ModelReselectionRequired;
+    const active = try models.InstallSource.open(selected) orelse return errors.Error.ModelReselectionRequired;
+    defer active.close();
+    const registered = try models.InstallSource.open(previous) orelse return errors.Error.ModelReselectionRequired;
+    defer registered.close();
+    if (active.sameFile(registered)) return errors.Error.ModelReselectionRequired;
+    return false;
 }
 
 fn conflictsWithInstall(allocator: std.mem.Allocator, reference: []const u8, destination: []const u8, replacing: bool) !bool {
@@ -365,7 +387,8 @@ fn conflictsWithInstall(allocator: std.mem.Allocator, reference: []const u8, des
 /// Ignore spelling differences that do not traverse a different directory
 /// entry. Keep symlink names and ".." because they may encode an override.
 fn sameStoredPath(selected: []const u8, registered: []const u8) bool {
-    if (!std.fs.path.isAbsolute(selected) or !std.fs.path.isAbsolute(registered)) return false;
+    if (selected.len == 0 or registered.len == 0) return false;
+    if (std.fs.path.isAbsolute(selected) != std.fs.path.isAbsolute(registered)) return false;
     var left = std.mem.tokenizeScalar(u8, selected, '/');
     var right = std.mem.tokenizeScalar(u8, registered, '/');
     while (true) {
@@ -504,8 +527,7 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
             _ = try filesystem.removeFileIfExists(removed.path);
         }
         if (removing_selected) {
-            try cfg.setValue("model_id", "");
-            try cfg.setValue("model_path", "");
+            try cfg.selectRegisteredModel("", "");
             try config.save(paths.config_file, cfg.view());
         }
     }
@@ -564,10 +586,9 @@ pub fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !conf
 pub fn selectModel(allocator: std.mem.Allocator, paths: xdg.Paths, id: []const u8, model_path: []const u8) !void {
     var cfg = try loadConfigOrDefault(allocator, paths.config_file);
     defer cfg.deinit();
-    try cfg.setValue("model_id", id);
     const absolute_path = try sys.absolutePathAlloc(allocator, model_path);
     defer allocator.free(absolute_path);
-    try cfg.setValue("model_path", absolute_path);
+    try cfg.selectRegisteredModel(id, absolute_path);
     try config.save(paths.config_file, cfg.view());
 }
 
@@ -1355,22 +1376,11 @@ test "self import refuses a staged copy after registry or source changes" {
     }
 }
 
-test "pull rechecks the configuration after staging even without use" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+test "pull rechecks invalid or dangling config after staging even without use" {
     const io = sys.io();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    const paths = try testPullPaths(allocator, root);
-    const selected = try std.fs.path.join(allocator, &.{ root, "selected.gguf" });
-    try sys.writeFile(selected, "selected model");
-    try config.save(paths.config_file, .{ .model_id = "selected", .model_path = selected });
-    try models.ensure(paths.models_file);
-
     const Fixture = struct {
-        var config_path: []const u8 = undefined;
+        var path: []const u8 = undefined;
+        var lost_target: bool = false;
         const invalid = "unknown_key = true\n";
         const bytes = "incoming bytes";
 
@@ -1379,23 +1389,51 @@ test "pull rechecks the configuration after staging even without use" {
             errdefer staged.deinit();
             try sys.writeFile(staged.path, bytes);
             try staged.verify(m.checksum, options.managed);
-            try sys.writeFile(config_path, invalid);
+            if (lost_target) {
+                try sys.cwd().deleteFile(sys.io(), path);
+            } else {
+                try sys.writeFile(path, invalid);
+            }
             return staged;
         }
     };
-    Fixture.config_path = paths.config_file;
-    const checksum = try sys.hexSha256(allocator, Fixture.bytes);
-    try std.testing.expectError(error.ConfigInvalid, runPullWithAcquirer(
-        allocator,
-        paths,
-        &.{ "--model-url", "https://example.invalid/incoming.gguf", "--id", "incoming", "--checksum", checksum, "--output", selected },
-        Fixture.acquire,
-    ));
-    try std.testing.expectEqualStrings("selected model", try sys.readFileAlloc(allocator, selected, 1024));
-    try std.testing.expectEqualStrings(Fixture.invalid, try sys.readFileAlloc(allocator, paths.config_file, 1024));
-    var registry = try models.load(allocator, paths.models_file);
-    defer registry.deinit();
-    try std.testing.expect(models.find(registry.view(), "incoming") == null);
+
+    for ([_]bool{ false, true }) |lost_target| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        const paths = try testPullPaths(allocator, root);
+        const selected = try std.fs.path.join(allocator, &.{ root, "selected.gguf" });
+        const target = if (lost_target) try std.fs.path.join(allocator, &.{ root, "settings.toml" }) else paths.config_file;
+        try sys.writeFile(selected, "selected model");
+        try config.save(target, .{ .model_id = "selected", .model_path = selected });
+        if (lost_target) try tmp.dir.symLink(io, "settings.toml", "config.toml", .{});
+        try models.ensure(paths.models_file);
+
+        Fixture.path = target;
+        Fixture.lost_target = lost_target;
+        const checksum = try sys.hexSha256(allocator, Fixture.bytes);
+        try std.testing.expectError(if (lost_target) error.FileNotFound else error.ConfigInvalid, runPullWithAcquirer(
+            allocator,
+            paths,
+            &.{ "--model-url", "https://example.invalid/incoming.gguf", "--id", "incoming", "--checksum", checksum, "--output", selected },
+            Fixture.acquire,
+        ));
+        try std.testing.expectEqualStrings("selected model", try sys.readFileAlloc(allocator, selected, 1024));
+        if (lost_target) {
+            var link: [64]u8 = undefined;
+            const len = try tmp.dir.readLink(io, "config.toml", &link);
+            try std.testing.expectEqualStrings("settings.toml", link[0..len]);
+        } else {
+            try std.testing.expectEqualStrings(Fixture.invalid, try sys.readFileAlloc(allocator, paths.config_file, 1024));
+        }
+        var registry = try models.load(allocator, paths.models_file);
+        defer registry.deinit();
+        try std.testing.expect(models.find(registry.view(), "incoming") == null);
+    }
 }
 
 test "stored-path spelling retains distinct symlink and parent components" {
@@ -1403,5 +1441,6 @@ test "stored-path spelling retains distinct symlink and parent components" {
     try std.testing.expect(sameStoredPath("/X//current.gguf", "/./X/current.gguf"));
     try std.testing.expect(!sameStoredPath("/X/link/current.gguf", "/X/current.gguf"));
     try std.testing.expect(!sameStoredPath("/X/link/../current.gguf", "/X/current.gguf"));
-    try std.testing.expect(!sameStoredPath("current.gguf", "current.gguf"));
+    try std.testing.expect(sameStoredPath("current.gguf", "./current.gguf"));
+    try std.testing.expect(!sameStoredPath("current.gguf", "/current.gguf"));
 }
