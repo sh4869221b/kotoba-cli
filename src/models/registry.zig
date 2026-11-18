@@ -199,21 +199,42 @@ pub fn installedPath(allocator: std.mem.Allocator, models_dir: []const u8, id: [
     return std.fs.path.join(allocator, &.{ models_dir, filename });
 }
 
-const write_lock_name = ".state.lock";
+const write_lock_name = sys.StateLock.registry_name;
 
-/// Use a known filename so the directory only needs write and search access.
-/// The lock file is unlinked before releasing the lock. Waiters check its
-/// identity after flock so a waiter on the retired inode cannot enter.
 pub const Writer = struct {
-    directory: std.Io.Dir,
-    lock_file: std.Io.File,
+    lock: sys.StateLock,
     path: []const u8,
 
     pub fn close(self: Writer) void {
-        const io = sys.io();
-        self.directory.deleteFile(io, write_lock_name) catch {};
-        self.lock_file.close(io);
-        self.directory.close(io);
+        self.lock.close();
+    }
+
+    pub fn loadForWrite(self: Writer, allocator: std.mem.Allocator) !OwnedList {
+        return load(allocator, self.path) catch |err| switch (err) {
+            error.NotInitialized => switch (try sys.pathState(self.path)) {
+                .not_found => parse(allocator, defaultTemplate()),
+                .present => error.DestinationExists,
+            },
+            else => return err,
+        };
+    }
+
+    /// Build the entire next registry before any metadata or model mutation.
+    pub fn stageUpsert(self: Writer, allocator: std.mem.Allocator, list: List, model: Model) !staged_output.Finished {
+        var items = std.array_list.Managed(Model).init(allocator);
+        defer items.deinit();
+        try items.appendSlice(list.models);
+        for (items.items) |*existing| {
+            if (std.mem.eql(u8, existing.id, model.id)) {
+                existing.* = model;
+                break;
+            }
+        } else try items.append(model);
+        return self.stage(allocator, .{ .models = items.items });
+    }
+
+    pub fn stage(self: Writer, allocator: std.mem.Allocator, list: List) !staged_output.Finished {
+        return stageRegistry(allocator, self.lock.directory, std.fs.path.basename(self.path), list, .{});
     }
 
     pub fn upsert(self: Writer, allocator: std.mem.Allocator, model: Model) !void {
@@ -223,17 +244,30 @@ pub const Writer = struct {
         try saveUpsert(allocator, self.path, &list, model);
     }
 
-    /// A selection verifies its input before taking the lock. Compare all
-    /// fields again under the lock and keep the lock through config save.
-    pub fn replaceIfUnchanged(self: Writer, allocator: std.mem.Allocator, expected: ?Model, model: Model) !void {
-        var list = try load(allocator, self.path);
+    /// Compare the registration again after the caller verifies it.
+    pub fn stageReplacement(self: Writer, allocator: std.mem.Allocator, expected: ?Model, model: Model) !?staged_output.Finished {
+        var list = try self.loadForWrite(allocator);
         defer list.deinit();
         const current = find(list.view(), model.id);
         try requireCurrent(current, expected);
         if (current) |old| {
-            if (equalModels(old, model)) return;
+            if (equalModels(old, model)) return null;
         }
-        try saveUpsert(allocator, self.path, &list, model);
+        return try self.stageUpsert(allocator, list.view(), model);
+    }
+
+    pub fn stageDefaultIfMissing(self: Writer, allocator: std.mem.Allocator) !?staged_output.Finished {
+        var existing = load(allocator, self.path) catch |err| switch (err) {
+            error.NotInitialized => {
+                var pending = try staged_output.begin(allocator, sys.io(), self.lock.directory, std.fs.path.basename(self.path), .{ .mode = .no_replace });
+                defer pending.deinit();
+                try pending.writeAll(defaultTemplate());
+                return try pending.finish();
+            },
+            else => return err,
+        };
+        existing.deinit();
+        return null;
     }
 
     pub fn removeById(self: Writer, allocator: std.mem.Allocator, id: []const u8) !OwnedModel {
@@ -242,41 +276,10 @@ pub const Writer = struct {
 };
 
 pub fn beginWrite(path: []const u8) !Writer {
-    const io = sys.io();
-    const directory = sys.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{}) catch |err| switch (err) {
-        error.FileNotFound => return errors.Error.NotInitialized,
-        else => return err,
+    return .{
+        .lock = try sys.StateLock.acquire(std.fs.path.dirname(path) orelse ".", write_lock_name),
+        .path = path,
     };
-    errdefer directory.close(io);
-    while (true) {
-        const lock_file = directory.createFile(io, write_lock_name, .{
-            .read = true,
-            .exclusive = true,
-            .permissions = .fromMode(0o600),
-        }) catch |err| switch (err) {
-            error.PathAlreadyExists => directory.openFile(io, write_lock_name, .{
-                .mode = .read_write,
-                .follow_symlinks = false,
-                .allow_directory = false,
-            }) catch |open_err| switch (open_err) {
-                error.FileNotFound => continue,
-                else => return open_err,
-            },
-            else => return err,
-        };
-        errdefer lock_file.close(io);
-        const opened = try lock_file.stat(io);
-        if (opened.kind != .file) return error.AccessDenied;
-        try lock_file.lock(io, .exclusive);
-        const named = directory.statFile(io, write_lock_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (named != null and named.?.kind == .file and named.?.inode == opened.inode) {
-            return .{ .directory = directory, .lock_file = lock_file, .path = path };
-        }
-        lock_file.close(io);
-    }
 }
 
 pub fn requireCurrent(current: ?Model, expected: ?Model) !void {
@@ -358,6 +361,12 @@ fn saveWithAllocator(allocator: std.mem.Allocator, path: []const u8, list: List)
 }
 
 fn saveWithAllocatorAndOptions(allocator: std.mem.Allocator, path: []const u8, list: List, options: sys.StagedFileOptions) !void {
+    var finished = try stageRegistry(allocator, sys.cwd(), path, list, options);
+    defer finished.deinit();
+    try finished.publish(options.mode);
+}
+
+fn stageRegistry(allocator: std.mem.Allocator, dir: std.Io.Dir, path: []const u8, list: List, options: sys.StagedFileOptions) !staged_output.Finished {
     var out = strict.Buffer.init(allocator);
     defer out.deinit();
     validateModels(out.allocator, list) catch |err| switch (err) {
@@ -368,7 +377,10 @@ fn saveWithAllocatorAndOptions(allocator: std.mem.Allocator, path: []const u8, l
     for (list.models) |m| {
         try appendModel(&out, m);
     }
-    try sys.atomicWriteFile(allocator, path, out.items, options);
+    var pending = try staged_output.begin(allocator, sys.io(), dir, path, options);
+    defer pending.deinit();
+    try pending.writeAll(out.items);
+    return pending.finish();
 }
 
 fn validateModels(allocator: std.mem.Allocator, list: List) !void {
@@ -858,7 +870,7 @@ test "registry writer serializes commits and rejects stale legacy path migration
         try writer.upsert(allocator, imported);
         var migrated = legacy;
         migrated.path = "/work/old.gguf";
-        try std.testing.expectError(errors.Error.ModelSelectionChanged, writer.replaceIfUnchanged(allocator, legacy, migrated));
+        try std.testing.expectError(errors.Error.ModelSelectionChanged, writer.stageReplacement(allocator, legacy, migrated));
     }
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, write_lock_name, .{}));
     var persisted = try load(allocator, path);

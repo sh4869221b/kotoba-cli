@@ -184,7 +184,9 @@ kotoba version
 ```
 
 Model installs reject an output referenced by another registered or selected
-model, including paths that refer to the output through symlinks. A relative
+model, including paths that refer to the output through symlinks. Installs
+and removals also protect entries used by the settings or model registry,
+including linked files. A relative
 reference from another ID blocks replacement of an existing output when its
 base directory is unknown. Model installation requires a readable, valid
 config when one exists. A symbolic link to the settings file stays in place
@@ -237,10 +239,14 @@ accepted syntax, manual repair guidance, canonical URL behavior, and mutation
 preflight boundary. Each `config.toml` and `models.toml` file is published
 independently by same-parent per-file atomic replacement: Kotoba writes a
 complete exclusive sibling stage, flushes it, syncs the file, closes it with
-checked errors, and then replaces the destination entry. This does not fsync the
-parent directory or promise power-loss durability or recovery. The two files
-are not one cross-file transaction: no rollback is attempted, and no
-inter-process locking is provided. Translation output files use the separate
+checked errors, and then replaces the destination entry. Kotoba serializes
+writers in the resolved settings directory, including different XDG
+configurations linked to the same settings. A target change during a command
+reports `config_target_changed`. Model writers also lock their registry
+directory. They prepare settings and registry updates before replacing or
+deleting a model and restore published metadata if a later step fails.
+These steps do not provide a single atomic view across files, directory
+fsync, or crash recovery. Translation output files use the separate
 staged-publication contract described above.
 
 Read-only memory and doctor checks refuse WAL databases and WAL/SHM sidecars

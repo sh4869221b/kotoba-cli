@@ -2,8 +2,9 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const lang = @import("lang.zig");
 const sys = @import("sys.zig");
-const strict = @import("strict_toml.zig");
+const fs = @import("fs.zig");
 const staged_output = @import("staged_output.zig");
+const strict = @import("strict_toml.zig");
 
 pub const Mode = enum {
     default,
@@ -370,25 +371,177 @@ fn parseStrict(allocator: std.mem.Allocator, data: []const u8) !OwnedConfig {
     return .{ .allocator = allocator, .value = cfg };
 }
 
+/// Resolve before slow work begins. Writers subsequently read and stage
+/// through the locked target directory, never through the original link.
+pub const WriteTarget = struct {
+    allocator: std.mem.Allocator,
+    entry: []const u8,
+    path: []u8,
+
+    pub fn capture(allocator: std.mem.Allocator, entry: []const u8) !WriteTarget {
+        return .{ .allocator = allocator, .entry = entry, .path = try resolveWritePath(allocator, entry) };
+    }
+
+    pub fn deinit(self: WriteTarget) void {
+        self.allocator.free(self.path);
+    }
+
+    pub fn begin(self: WriteTarget) !Writer {
+        const basename = std.fs.path.basename(self.path);
+        if (std.mem.eql(u8, basename, sys.StateLock.config_name) or std.mem.eql(u8, basename, sys.StateLock.registry_name))
+            return errors.Error.InvalidArguments;
+        const lock = try sys.StateLock.acquire(std.fs.path.dirname(self.path) orelse ".", sys.StateLock.config_name);
+        errdefer lock.close();
+        const writer: Writer = .{ .target = self, .lock = lock, .basename = basename };
+        try writer.requireTarget();
+        return writer;
+    }
+};
+
+fn resolveWritePath(allocator: std.mem.Allocator, entry: []const u8) ![]u8 {
+    if ((try sys.pathState(entry)) == .present) {
+        const canonical = try sys.realPathAlloc(allocator, entry);
+        defer allocator.free(canonical);
+        return allocator.dupe(u8, canonical);
+    }
+    // The XDG application directory may not exist yet. Anchor its missing
+    // suffix to the nearest existing directory, including any symlink prefix.
+    const absolute = try sys.absolutePathAlloc(allocator, entry);
+    defer allocator.free(absolute);
+    var prefix = std.fs.path.dirname(absolute) orelse return error.BadPathName;
+    while (true) {
+        if (try sys.realPathIfExistsAlloc(allocator, prefix)) |parent| {
+            defer allocator.free(parent);
+            return std.fs.path.join(allocator, &.{ parent, std.mem.trimStart(u8, absolute[prefix.len..], "/") });
+        }
+        prefix = std.fs.path.dirname(prefix) orelse return error.FileNotFound;
+    }
+}
+
+test "a future config is anchored through a linked XDG parent" {
+    const allocator = std.testing.allocator;
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(io, "actual", .default_dir);
+    try tmp.dir.symLink(io, "actual", "alias", .{ .is_directory = true });
+    const link_path = try std.fs.path.join(allocator, &.{ root, "alias/kotoba/config.toml" });
+    defer allocator.free(link_path);
+    const target = try WriteTarget.capture(allocator, link_path);
+    defer target.deinit();
+    try tmp.dir.createDirPath(io, "alias/kotoba");
+    var writer = try target.begin();
+    defer writer.close();
+    var cfg = try writer.loadOrDefault(allocator);
+    defer cfg.deinit();
+    try std.testing.expectEqual(default().threads, cfg.view().threads);
+}
+
+pub const Writer = struct {
+    target: WriteTarget,
+    lock: sys.StateLock,
+    basename: []const u8,
+    snapshot: fs.PathState = .not_found,
+
+    pub fn close(self: Writer) void {
+        self.lock.close();
+    }
+
+    pub fn load(self: *Writer, allocator: std.mem.Allocator) !OwnedConfig {
+        const io = sys.io();
+        const file = self.lock.directory.openFile(io, self.basename, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.snapshot = .not_found;
+                try self.requireUnchanged();
+                return errors.Error.NotInitialized;
+            },
+            else => return err,
+        };
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.AccessDenied;
+        self.snapshot = .{ .present = stat };
+        var reader = file.reader(io, &.{});
+        const data = reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            else => return err,
+        };
+        defer allocator.free(data);
+        try self.requireUnchanged();
+        return parse(allocator, data);
+    }
+
+    pub fn loadOrDefault(self: *Writer, allocator: std.mem.Allocator) !OwnedConfig {
+        return self.load(allocator) catch |err| switch (err) {
+            error.NotInitialized => OwnedConfig.clone(allocator, default()),
+            else => return err,
+        };
+    }
+
+    pub fn requireTarget(self: Writer) !void {
+        const allocator = self.target.allocator;
+        const actual = resolveWritePath(allocator, self.target.entry) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.SymLinkLoop => return errors.Error.ConfigTargetChanged,
+            else => return err,
+        };
+        defer allocator.free(actual);
+        if (!std.mem.eql(u8, self.target.path, actual)) return errors.Error.ConfigTargetChanged;
+        const parent = try self.lock.directory.realPathFileAlloc(sys.io(), ".", allocator);
+        defer allocator.free(parent);
+        if (!std.mem.eql(u8, std.fs.path.dirname(actual) orelse ".", parent)) return errors.Error.ConfigTargetChanged;
+    }
+
+    pub fn requireUnchanged(self: Writer) !void {
+        try self.requireTarget();
+        var filesystem = fs.FileSystem.init(sys.io(), self.lock.directory, null);
+        const current = try filesystem.pathState(self.basename);
+        switch (self.snapshot) {
+            .not_found => if (current != .not_found) return errors.Error.ConfigTargetChanged,
+            .present => |old| {
+                if (current != .present) return errors.Error.ConfigTargetChanged;
+                const now = current.present;
+                if (now.kind != .file or old.inode != now.inode or old.size != now.size or
+                    old.mtime.nanoseconds != now.mtime.nanoseconds or old.ctime.nanoseconds != now.ctime.nanoseconds)
+                    return errors.Error.ConfigTargetChanged;
+            },
+        }
+    }
+
+    pub fn stage(self: Writer, cfg: Config, options: sys.StagedFileOptions) !staged_output.Finished {
+        try self.requireUnchanged();
+        return stageConfig(self.target.allocator, self.lock.directory, self.basename, cfg, options);
+    }
+};
+
 pub fn save(path: []const u8, cfg: Config) !void {
     return saveWithOptions(path, cfg, .{});
 }
 
 fn saveWithOptions(path: []const u8, cfg: Config, options: sys.StagedFileOptions) !void {
-    var out = strict.Buffer.init(std.heap.page_allocator);
+    const allocator = std.heap.page_allocator;
+    const destination = try resolveWritePath(allocator, path);
+    defer allocator.free(destination);
+    var finished = try stageConfig(allocator, sys.cwd(), destination, cfg, options);
+    defer finished.deinit();
+    try finished.publish(options.mode);
+}
+
+fn stageConfig(allocator: std.mem.Allocator, dir: std.Io.Dir, path: []const u8, cfg: Config, options: sys.StagedFileOptions) !staged_output.Finished {
+    var out = strict.Buffer.init(allocator);
     defer out.deinit();
     appendConfig(&out, cfg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ConfigInvalid,
     };
-    const allocator = std.heap.page_allocator;
-    const linked_target = switch (try sys.pathState(path)) {
-        .not_found => null,
-        .present => |stat| if (stat.kind == .sym_link) try sys.realPathAlloc(allocator, path) else null,
-    };
-    defer if (linked_target) |target| allocator.free(target);
-    const destination: []const u8 = if (linked_target) |target| target else path;
-    try sys.atomicWriteFile(allocator, destination, out.items, options);
+    var pending = try staged_output.begin(allocator, sys.io(), dir, path, options);
+    defer pending.deinit();
+    try pending.writeAll(out.items);
+    return pending.finish();
 }
 
 fn appendConfig(out: *strict.Buffer, cfg: Config) !void {

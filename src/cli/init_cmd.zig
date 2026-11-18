@@ -1,5 +1,4 @@
 const std = @import("std");
-const config = @import("../config.zig");
 const errors = @import("../errors.zig");
 const glossary = @import("../glossary.zig");
 const memory = @import("../memory.zig");
@@ -74,21 +73,26 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         selected_registry_model = registry_model;
     }
     try models.validateStoredPath(model_path);
-    try models_cmd.validateConfigLoad(allocator, paths.config_file);
+    const config_target = try models_cmd.preflightConfig(allocator, paths.config_file);
+    defer config_target.deinit();
     try xdg.ensureDirs(paths);
     {
         const writer = try models.beginRegistryWrite(paths.models_file);
         defer writer.close();
-        var cfg = try models_cmd.loadConfigOrDefault(allocator, paths.config_file);
+        var cfg_writer = try models_cmd.beginConfigWrite(allocator, paths, config_target);
+        defer cfg_writer.close();
+        var cfg = try cfg_writer.loadOrDefault(allocator);
         defer cfg.deinit();
         try cfg.selectRegisteredModel(model_id, model_path);
-        try models.ensure(paths.models_file);
-        if (selected_registry_model) |registry_model| {
+        var selection = try cfg_writer.stage(cfg.view(), .{});
+        defer selection.deinit();
+        var registry = if (selected_registry_model) |registry_model| staged: {
             try models.verifyModel(.{ .path = registry_model.path });
-            try writer.replaceIfUnchanged(allocator, expected, registry_model);
-        }
+            break :staged try writer.stageReplacement(allocator, expected, registry_model);
+        } else try writer.stageDefaultIfMissing(allocator);
+        defer if (registry) |*prepared| prepared.deinit();
         try glossary.ensure(paths.glossary_file);
-        try config.save(paths.config_file, cfg.view());
+        try models_cmd.commitModelState(cfg_writer, &selection, if (registry) |*prepared| prepared else null, .none);
     }
     var db = try memory.open(allocator, paths.memory_file);
     db.close();

@@ -5,6 +5,7 @@ const sys = @import("sys.zig");
 pub const Code = enum {
     not_initialized,
     config_invalid,
+    config_target_changed,
     models_invalid,
     config_schema_unsupported,
     models_schema_unsupported,
@@ -36,6 +37,7 @@ pub const Code = enum {
     pub fn asText(self: Code) []const u8 {
         return switch (self) {
             .not_initialized => "not_initialized",
+            .config_target_changed => "config_target_changed",
             .config_invalid => "config_invalid",
             .models_invalid => "models_invalid",
             .config_schema_unsupported => "config_schema_unsupported",
@@ -71,6 +73,8 @@ pub const Code = enum {
 pub const Error = error{
     NotInitialized,
     ConfigInvalid,
+    ConfigTargetChanged,
+    StateRollbackFailed,
     ModelsInvalid,
     ConfigSchemaUnsupported,
     ModelsSchemaUnsupported,
@@ -115,6 +119,8 @@ pub const AppError = struct {
 pub fn fromError(err: anyerror) AppError {
     return switch (err) {
         Error.NotInitialized => .{ .code = .not_initialized, .message = "Kotoba is not initialized. Run `kotoba init`." },
+        Error.ConfigTargetChanged => .{ .code = .config_target_changed, .message = "The configuration target changed during the operation. Retry the command." },
+        Error.StateRollbackFailed => .{ .code = .io_error, .message = "Could not restore settings or model registry. Inspect the state files and any .kotoba-*.tmp backup before retrying." },
         Error.ConfigInvalid => .{ .code = .config_invalid, .message = "config.toml is invalid." },
         Error.ModelsInvalid => .{ .code = .models_invalid, .message = "models.toml is invalid." },
         Error.ConfigSchemaUnsupported => .{ .code = .config_schema_unsupported, .message = "config.toml uses an unsupported schema or version." },

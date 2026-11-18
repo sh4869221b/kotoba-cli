@@ -13,6 +13,73 @@ pub fn atomicWriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []
     return staged_output.atomicWriteFile(allocator, io(), cwd(), path, bytes, options);
 }
 
+/// A known filename lets cooperating writers lock even a write/search-only
+/// directory. A waiter on an unlinked lock inode retries against the live name.
+pub const StateLock = struct {
+    directory: std.Io.Dir,
+    file: std.Io.File,
+    name: []const u8,
+    retire_inode: ?std.Io.File.INode,
+
+    pub const registry_name = ".state.lock";
+    pub const config_name = ".kotoba-config.lock";
+
+    pub fn close(self: StateLock) void {
+        const runtime = io();
+        if (self.retire_inode) |inode| {
+            // Never remove an entry this invocation did not create.
+            if (self.directory.statFile(runtime, self.name, .{ .follow_symlinks = false })) |named| {
+                if (named.kind == .file and named.inode == inode)
+                    self.directory.deleteFile(runtime, self.name) catch {};
+            } else |_| {}
+        }
+        self.file.close(runtime);
+        self.directory.close(runtime);
+    }
+
+    pub fn acquire(parent: []const u8, name: []const u8) !StateLock {
+        const runtime = io();
+        const directory = std.Io.Dir.cwd().openDir(runtime, parent, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.NotInitialized,
+            else => return err,
+        };
+        errdefer directory.close(runtime);
+        while (true) {
+            var created = true;
+            const lock_file = directory.createFile(runtime, name, .{
+                .read = true,
+                .exclusive = true,
+                .permissions = .fromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => existing: {
+                    created = false;
+                    break :existing directory.openFile(runtime, name, .{
+                        .mode = .read_write,
+                        .follow_symlinks = false,
+                        .allow_directory = false,
+                    }) catch |open_err| switch (open_err) {
+                        error.FileNotFound => continue,
+                        else => return open_err,
+                    };
+                },
+                else => return err,
+            };
+            errdefer lock_file.close(runtime);
+            const opened = try lock_file.stat(runtime);
+            if (opened.kind != .file) return error.AccessDenied;
+            try lock_file.lock(runtime, .exclusive);
+            const named = directory.statFile(runtime, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (named != null and named.?.kind == .file and named.?.inode == opened.inode) {
+                return .{ .directory = directory, .file = lock_file, .name = name, .retire_inode = if (created) opened.inode else null };
+            }
+            lock_file.close(runtime);
+        }
+    }
+};
+
 pub fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

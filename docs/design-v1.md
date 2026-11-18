@@ -87,11 +87,15 @@ commands. Each `config.toml` and `models.toml` file is published independently
 by same-parent per-file atomic replacement: Kotoba writes a complete exclusive
 sibling stage, flushes it, syncs the file, closes it with checked errors, and
 then replaces the destination entry. When the config is a symbolic link,
-Kotoba updates its resolved target and keeps the link. A dangling config
-link causes an error. Kotoba writers sharing the XDG config directory
-serialize their commits with a common lock. Publication does not fsync the
-parent directory or provide cross-file rollback or power-loss recovery.
-Translation output files use the separate staged-publication contract below.
+Kotoba updates its captured target and keeps the link. A dangling config
+link or a change of target causes an error. Settings writers share a lock in
+the resolved settings directory, including across different XDG config
+directories. Model writes also lock their registry and stage metadata before
+replacing or deleting a model. A failure during publication restores any
+metadata already changed if the filesystem permits it. Readers can see the
+individual replacements, and publication does not provide directory fsync
+or power-loss recovery. Translation output files use the separate
+staged-publication contract below.
 
 Read-only memory and doctor checks preflight databases without concurrent
 writers before opening SQLite. WAL mode and `-wal`/`-shm` sidecars, along with
@@ -259,10 +263,10 @@ this module; no compensating transaction or rollback is attempted here.
 Important model removal steps distinguish a missing path from an access or
 other filesystem failure. A missing path can be an intentional no-op, but
 realpath, reload, or deletion failures propagate as errors. Such a failure
-returns nonzero and must not print the `removed` success line. If the registry
-was already changed before a later reload or file operation fails, the
-registry may remain changed while the model or config is unchanged; Issue #25
-does not add a compensating registry transaction or #27 rollback.
+returns nonzero and must not print the `removed` success line. The command
+checks managed paths before publishing state, prepares any selection reset
+and registry update before deleting the model, and restores the previous
+metadata if deletion fails.
 
 The loader, defaults, and preflight rules remain the separate responsibility
 of Issue #61. This output and deletion primitive does not broaden that
@@ -274,9 +278,10 @@ boundary or introduce a general transaction layer.
 registers it. `kotoba models pull` downloads a GGUF from a registered HTTPS
 source, a direct HTTPS URL, or a Hugging Face repo/file selector. `models use`
 selects a registered model, `models verify` checks file existence and checksum
-when available, and `models remove ID --yes` deletes the managed model file
-only when no other registry entry references the same file, then clears the
-selection if it was active.
+when available, and `models remove ID --yes` unregisters the model and clears
+its selection if it was active. It deletes the managed file only when no
+other registration or selection references it. Model installs and removals
+reject paths used by the settings or registry.
 
 Remote model URLs are bounded to 8192 bytes and must be valid HTTPS URLs without
 userinfo (including empty userinfo) or raw ASCII control characters. Validation

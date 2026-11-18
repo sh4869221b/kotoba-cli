@@ -392,7 +392,10 @@ summary. All rows assert real status, both streams, and FS/TM state.
 | `files-atomic-{mode-600,mode-640}` | 0; empty streams | Existing regular destination mode is retained after replacement |
 | `files-atomic-{symlink,dangling,hardlink}-{reject,replace}` | Reject: 1 `output_exists`; replace: 0 | No-overwrite treats link entries as existing; overwrite replaces only the named link entry and preserves the symlink/hardlink referent bytes |
 | `files-atomic-parent-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Destination and entry set remain unchanged; fixture permission is restored during cleanup |
-| `commands-models-remove-permission` | 1; exact `io_error: AccessDenied`, empty stdout | Managed-model deletion failure is not reported as `removed`; registry partial-state rules remain separate |
+| `commands-models-remove-permission` | 1; exact `io_error: AccessDenied`, empty stdout | No `removed` success line; config, registry, and model remain intact |
+| `commands-models-{pull,remove}-read-only-shared-config` | 1; exact `io_error: AccessDenied`, empty stdout | A shared config parent at mode 0555 leaves linked settings, models and registry unchanged |
+| `commands-shared-config-{retarget,concurrent}` | Real subprocess assertions | Retarget a settings link while an import waits after staging; independently run writers from two XDG config directories against one target and verify both edits |
+| `commands-models-{pull-output-linked-registry-target,remove-linked-config-target}` | 2; exact `invalid_arguments`, empty stdout | Reject use of metadata as a model destination or deletion target; preserve both links and their contents |
 
 Finalized initialization regression #9 remains in `smoke.sh` and
 `commands-init-remote-rejected`: URL-only init exits 1 with pull/model-path
@@ -426,7 +429,7 @@ exit status are **N/A**. The CPU unit profile skips only the test requiring
 | `checked close {happy,failure,reuse}` (`file_close`) | A real owned descriptor is consumed once; injected late errno is recorded only after the real close; repeated cleanup cannot close a descriptor reused by an unrelated sentinel |
 | `staged output {happy,failure,gate,race,path,cleanup}` (`staged_output`) | Same-parent exclusive stage, exact finished bytes, captured modes, caller gate, collision/no-replace/path/link behavior, and cleanup ownership. Native prefix writes use real stage bytes; injected flush/sync/close/rename labels remain component evidence. |
 | `writeOutput failure boundaries propagate native errors without publication` (`translate`) | Existing and absent output targets retain the expected state across the staged write boundary; no CLI stream/status is inferred from this component test |
-| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Config preflight fails before mutation; missing managed file remains benign. Native registry-directory reload is `IsDir`, injected reload stays `ModelsInvalid`; realpath/reload/deletion failures propagate without `removed`. Registry removal may already be saved, with config/model retained; no transaction or rollback is added |
+| `models remove strict {baseline normal missing shared external,native directory deletion failure,injected reload failure,native registry directory before reload,managed root realpath failure,candidate realpath failure,remaining reference realpath failure,injected deletion failure}` (`cli/models_cmd`) | Config preflight fails before mutation; missing managed file remains benign. Native registry-directory reload is `IsDir`, injected reload stays `ModelsInvalid`; realpath/reload/deletion failures propagate without `removed`. Config, registry, and model remain intact after checked failures |
 
 | Level | Unproven or deferred guarantee | Owning follow-up |
 | --- | --- | --- |

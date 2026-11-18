@@ -4,6 +4,7 @@ const fs = @import("../fs.zig");
 const errors = @import("../errors.zig");
 const models = @import("../models.zig");
 const sys = @import("../sys.zig");
+const staged_output = @import("../staged_output.zig");
 const xdg = @import("../xdg.zig");
 const args = @import("args.zig");
 
@@ -111,7 +112,8 @@ fn runImportWithStager(
         var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
         defer validation_owner.deinit();
     }
-    try validateConfigLoad(allocator, paths.config_file);
+    const config_target = try preflightConfig(allocator, paths.config_file);
+    defer config_target.deinit();
     const display_name = if (name.len > 0) name else id;
     const model: models.Model = .{
         .id = id,
@@ -158,7 +160,7 @@ fn runImportWithStager(
     var fd_path: [64]u8 = undefined;
     var staged = try stager(allocator, source.fdPath(&fd_path), dest_path, checksum);
     defer staged.deinit();
-    try commitInstall(allocator, paths, &staged, model, expectation, use_model);
+    try commitInstall(allocator, paths, config_target, &staged, model, expectation, use_model);
     try sys.stdoutPrint("imported {s}\n", .{id});
     return 0;
 }
@@ -217,6 +219,8 @@ fn runPullWithAcquirer(
     }
     var m: models.Model = .{};
     var expected: ?models.Model = null;
+    var config_target: ?config.WriteTarget = null;
+    defer if (config_target) |target| target.deinit();
     var pull_owner: ?models.OwnedList = null;
     defer if (pull_owner) |*owner| owner.deinit();
     if (hf_repo.len > 0) {
@@ -229,7 +233,7 @@ fn runPullWithAcquirer(
             var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
             defer validation_owner.deinit();
         }
-        try validateConfigLoad(allocator, paths.config_file);
+        config_target = try preflightConfig(allocator, paths.config_file);
         const file = try models.resolveHfFile(allocator, hf, hf_file);
         const url = try models.hfDownloadUrl(allocator, hf.repo, file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
@@ -244,13 +248,13 @@ fn runPullWithAcquirer(
             var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
             defer validation_owner.deinit();
         }
-        try validateConfigLoad(allocator, paths.config_file);
+        config_target = try preflightConfig(allocator, paths.config_file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
         m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
     } else {
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
         try validateCommandId(positional_id);
-        try validateConfigLoad(allocator, paths.config_file);
+        config_target = try preflightConfig(allocator, paths.config_file);
         pull_owner = try models.load(allocator, paths.models_file);
         const list = pull_owner.?.view();
         m = models.find(list, positional_id) orelse return errors.Error.ModelRegistryInvalid;
@@ -280,7 +284,7 @@ fn runPullWithAcquirer(
     try xdg.ensureDirs(paths);
     var staged = try acquirer(allocator, request_model, output_path, .{ .managed = managed }) orelse return errors.Error.ModelSourceRequired;
     defer staged.deinit();
-    try commitInstall(allocator, paths, &staged, m, if (expected) |previous| .{ .registered_pull = previous } else .latest, use_model);
+    try commitInstall(allocator, paths, config_target.?, &staged, m, if (expected) |previous| .{ .registered_pull = previous } else .latest, use_model);
     try sys.stdoutPrint("pulled {s}\n", .{id});
     return 0;
 }
@@ -298,6 +302,7 @@ const InstallExpectation = union(enum) {
 fn commitInstall(
     allocator: std.mem.Allocator,
     paths: xdg.Paths,
+    config_target: config.WriteTarget,
     stage: *models.StagedModel,
     m: models.Model,
     expected: InstallExpectation,
@@ -305,7 +310,7 @@ fn commitInstall(
 ) !void {
     const writer = try models.beginRegistryWrite(paths.models_file);
     defer writer.close();
-    var entries = try models.loadReadOnly(allocator, paths.models_file);
+    var entries = try writer.loadForWrite(allocator);
     defer entries.deinit();
     const current = models.find(entries.view(), m.id);
     switch (expected) {
@@ -320,13 +325,13 @@ fn commitInstall(
 
     // Recheck after staging under the same lock used for publication. An
     // unreadable configuration cannot rule out a selected-model reference.
-    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
+    var cfg_writer = try beginConfigWrite(allocator, paths, config_target);
+    defer cfg_writer.close();
+    var cfg = try cfg_writer.loadOrDefault(allocator);
     defer cfg.deinit();
     const destination = (try installEntryPath(allocator, m.path)) orelse return errors.Error.PathResolutionFailed;
     defer allocator.free(destination);
-    // A linked config target can have any extension. It must remain
-    // readable even when a caller chooses its name as a model output.
-    if (try referencesInstallEntry(allocator, paths.config_file, destination)) return errors.Error.InvalidArguments;
+    try protectStateEntry(allocator, paths, destination);
     const dest_stat = sys.cwd().statFile(sys.io(), destination, .{}) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -346,10 +351,79 @@ fn commitInstall(
         return errors.Error.ModelPathInUse;
     const update_selection = use_model or (active_id and try followsMovingRegistration(settings, current, m.path));
     if (update_selection) try cfg.selectRegisteredModel(m.id, m.path);
-    try models.ensure(paths.models_file);
-    try stage.publish(m.path);
-    try writer.upsert(allocator, m);
-    if (update_selection) try config.save(paths.config_file, cfg.view());
+    var selection = if (update_selection) try cfg_writer.stage(cfg.view(), .{}) else null;
+    defer if (selection) |*prepared| prepared.deinit();
+    var registry = try writer.stageUpsert(allocator, entries.view(), m);
+    defer registry.deinit();
+    try commitModelState(cfg_writer, if (selection) |*prepared| prepared else null, &registry, .{
+        .install = .{ .stage = stage, .path = destination },
+    });
+}
+
+pub fn beginConfigWrite(allocator: std.mem.Allocator, paths: xdg.Paths, target: config.WriteTarget) !config.Writer {
+    // The registry still publishes to its own directory entry. It must not
+    // replace the linked config or change the file that the config resolves to.
+    const registry_entry = (try installEntryPath(allocator, paths.models_file)) orelse return errors.Error.PathResolutionFailed;
+    defer allocator.free(registry_entry);
+    if (try referencesInstallEntry(allocator, paths.config_file, registry_entry) or
+        try referencesInstallEntry(allocator, paths.models_file, target.path))
+        return errors.Error.InvalidArguments;
+    return target.begin();
+}
+
+fn protectStateEntry(allocator: std.mem.Allocator, paths: xdg.Paths, entry: []const u8) !void {
+    if (try referencesInstallEntry(allocator, paths.config_file, entry) or
+        try referencesInstallEntry(allocator, paths.models_file, entry))
+        return errors.Error.InvalidArguments;
+}
+
+pub const ModelChange = union(enum) {
+    none,
+    install: struct { stage: *models.StagedModel, path: []const u8 },
+    delete: struct { filesystem: *fs.FileSystem, path: []const u8 },
+};
+
+/// Prepare both metadata files first. Publish the model change only after
+/// metadata can be published, and undo metadata if any later operation fails.
+pub fn commitModelState(
+    config_writer: config.Writer,
+    selection: ?*staged_output.Finished,
+    registry: ?*staged_output.Finished,
+    model: ModelChange,
+) !void {
+    try config_writer.requireUnchanged();
+    var selection_undo = if (selection) |prepared| try prepared.publishReversible() else null;
+    defer if (selection_undo) |*published| published.deinit();
+    var registry_undo = if (registry) |prepared| prepared.publishReversible() catch |err|
+        return rollbackState(err, null, if (selection_undo) |*published| published else null) else null;
+    defer if (registry_undo) |*published| published.deinit();
+
+    const result = finishModelChange(config_writer, selection != null, model);
+    result catch |err| return rollbackState(
+        err,
+        if (registry_undo) |*published| published else null,
+        if (selection_undo) |*published| published else null,
+    );
+}
+
+fn finishModelChange(config_writer: config.Writer, updated_config: bool, model: ModelChange) !void {
+    if (updated_config) try config_writer.requireTarget() else try config_writer.requireUnchanged();
+    switch (model) {
+        .none => {},
+        .install => |change| try change.stage.publish(change.path),
+        .delete => |change| _ = try change.filesystem.removeFileIfExists(change.path),
+    }
+}
+
+fn rollbackState(cause: anyerror, registry: ?*staged_output.Published, selection: ?*staged_output.Published) anyerror {
+    var failure = cause;
+    if (registry) |published| published.rollback() catch {
+        failure = errors.Error.StateRollbackFailed;
+    };
+    if (selection) |published| published.rollback() catch {
+        failure = errors.Error.StateRollbackFailed;
+    };
+    return failure;
 }
 
 fn followsMovingRegistration(settings: config.Config, current: ?models.Model, output: []const u8) !bool {
@@ -442,7 +516,8 @@ fn referencesInstallEntry(allocator: std.mem.Allocator, path: []const u8, destin
 fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
     if (cmd_args.len != 1) return errors.Error.InvalidArguments;
     try validateCommandId(cmd_args[0]);
-    try validateConfigLoad(allocator, paths.config_file);
+    const config_target = try preflightConfig(allocator, paths.config_file);
+    defer config_target.deinit();
     var list_owner = try models.load(allocator, paths.models_file);
     defer list_owner.deinit();
     const list = list_owner.view();
@@ -456,8 +531,16 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
         const writer = try models.beginRegistryWrite(paths.models_file);
         defer writer.close();
         try models.verifyModel(.{ .path = m.path });
-        try writer.replaceIfUnchanged(allocator, expected, m);
-        try selectModel(allocator, paths, m.id, m.path);
+        var cfg_writer = try beginConfigWrite(allocator, paths, config_target);
+        defer cfg_writer.close();
+        var cfg = try cfg_writer.loadOrDefault(allocator);
+        defer cfg.deinit();
+        try cfg.selectRegisteredModel(m.id, m.path);
+        var selection = try cfg_writer.stage(cfg.view(), .{});
+        defer selection.deinit();
+        var registry = try writer.stageReplacement(allocator, expected, m);
+        defer if (registry) |*prepared| prepared.deinit();
+        try commitModelState(cfg_writer, &selection, if (registry) |*prepared| prepared else null, .none);
     }
     try sys.stdoutPrint("using {s}\n", .{m.id});
     return 0;
@@ -495,32 +578,45 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     if (cmd_args.len != 2 or !std.mem.eql(u8, cmd_args[1], "--yes")) return errors.Error.InvalidArguments;
     const id = cmd_args[0];
     try validateCommandId(id);
-    try validateConfigLoad(allocator, paths.config_file);
+    const config_target = try preflightConfig(allocator, paths.config_file);
+    defer config_target.deinit();
     try requireRemovalTarget(allocator, paths.models_file, id);
     {
         const writer = try models.beginRegistryWrite(paths.models_file);
         defer writer.close();
-        var cfg = try loadConfigOrDefault(allocator, paths.config_file);
+        var cfg_writer = try beginConfigWrite(allocator, paths, config_target);
+        defer cfg_writer.close();
+        var cfg = try cfg_writer.loadOrDefault(allocator);
         defer cfg.deinit();
-        // Re-check after waiting. The preflight only keeps invalid requests
-        // from touching the config directory's metadata.
-        try requireRemovalTarget(allocator, paths.models_file, id);
-        try xdg.ensureDirs(paths);
-        var removed_owner = try writer.removeById(allocator, id);
-        defer removed_owner.deinit();
-        const removed = removed_owner.view();
-        var remaining_owner = try reload(allocator, paths.models_file);
-        defer remaining_owner.deinit();
-        const remaining = remaining_owner.view();
+        // Re-check after waiting. The preflight keeps invalid requests from
+        // touching the config directory or creating XDG directories.
+        var entries = try reload(allocator, paths.models_file);
+        defer entries.deinit();
+        const removed = models.find(entries.view(), id) orelse return errors.Error.ModelRegistryInvalid;
+        var remaining = std.array_list.Managed(models.Model).init(allocator);
+        defer remaining.deinit();
+        for (entries.view().models) |m| {
+            if (!std.mem.eql(u8, m.id, id)) try remaining.append(m);
+        }
+
         const removing_selected = std.mem.eql(u8, cfg.view().model_id, id);
         const active_path = if (removing_selected) "" else cfg.view().model_path;
-        if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, active_path, filesystem)) {
-            _ = try filesystem.removeFileIfExists(removed.path);
+        var change: ModelChange = .none;
+        if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, .{ .models = remaining.items }, active_path, filesystem)) {
+            const entry = (try installEntryPath(allocator, removed.path)) orelse return errors.Error.PathResolutionFailed;
+            defer allocator.free(entry);
+            try protectStateEntry(allocator, paths, entry);
+            const kind = (try sys.cwd().statFile(sys.io(), entry, .{})).kind;
+            if (kind == .directory) return error.IsDir;
+            change = .{ .delete = .{ .filesystem = filesystem, .path = removed.path } };
         }
-        if (removing_selected) {
-            try cfg.selectRegisteredModel("", "");
-            try config.save(paths.config_file, cfg.view());
-        }
+        try xdg.ensureDirs(paths);
+        if (removing_selected) try cfg.selectRegisteredModel("", "");
+        var selection = if (removing_selected) try cfg_writer.stage(cfg.view(), .{}) else null;
+        defer if (selection) |*prepared| prepared.deinit();
+        var registry = try writer.stage(allocator, .{ .models = remaining.items });
+        defer registry.deinit();
+        try commitModelState(cfg_writer, if (selection) |*prepared| prepared else null, &registry, change);
     }
     try sys.stdoutPrint("removed {s}\n", .{id});
     return 0;
@@ -562,9 +658,12 @@ fn referencesModel(allocator: std.mem.Allocator, filesystem: *fs.FileSystem, pat
     return std.mem.eql(u8, real_model, resolved);
 }
 
-pub fn validateConfigLoad(allocator: std.mem.Allocator, path: []const u8) !void {
-    var cfg = try loadConfigOrDefault(allocator, path);
-    defer cfg.deinit();
+pub fn preflightConfig(allocator: std.mem.Allocator, entry: []const u8) !config.WriteTarget {
+    const target = try config.WriteTarget.capture(allocator, entry);
+    errdefer target.deinit();
+    var cfg = try loadConfigOrDefault(allocator, target.path);
+    cfg.deinit();
+    return target;
 }
 
 pub fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !config.OwnedConfig {
@@ -572,15 +671,6 @@ pub fn loadConfigOrDefault(allocator: std.mem.Allocator, path: []const u8) !conf
         error.NotInitialized => config.OwnedConfig.clone(allocator, config.default()),
         else => return err,
     };
-}
-
-pub fn selectModel(allocator: std.mem.Allocator, paths: xdg.Paths, id: []const u8, model_path: []const u8) !void {
-    var cfg = try loadConfigOrDefault(allocator, paths.config_file);
-    defer cfg.deinit();
-    const absolute_path = try sys.absolutePathAlloc(allocator, model_path);
-    defer allocator.free(absolute_path);
-    try cfg.selectRegisteredModel(id, absolute_path);
-    try config.save(paths.config_file, cfg.view());
 }
 
 // Keep command output out of the Zig test runner's stdout protocol.
@@ -841,7 +931,7 @@ test "secret URL model info renders remote identities only" {
     }
 }
 
-const PreflightCommand = enum { init, use, remove, import_use, pull_use, list, verify, select, pull_hf };
+const PreflightCommand = enum { init, use, remove, import_use, pull_use, list, verify, pull_hf };
 
 fn testStateSnapshot(allocator: std.mem.Allocator, dir: std.Io.Dir) ![]const u8 {
     var entries = std.array_list.Managed([]const u8).init(allocator);
@@ -920,10 +1010,6 @@ fn testPreflight(command: PreflightCommand, registry_failure: bool) !void {
             .pull_hf => runPullWithAcquirer(allocator, paths, &.{ "--hf-repo", "example/repo", "--hf-file", "model.gguf", "--id", "new", "--use" }, Fixture.acquire),
             .list => run(allocator, paths, &.{"list"}),
             .verify => run(allocator, paths, &.{"verify"}),
-            .select => blk: {
-                selectModel(allocator, paths, "fixture", dest) catch |err| break :blk err;
-                break :blk @as(u8, 0);
-            },
         };
         try std.testing.expectError(expected, result);
         try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
@@ -957,10 +1043,9 @@ test "models HF pull use refuses config failures before acquisition" {
     try testPreflight(.pull_hf, false);
 }
 
-test "models list verify and selection preserve config load failures" {
+test "models list and verify preserve config load failures" {
     try testPreflight(.list, false);
     try testPreflight(.verify, false);
-    try testPreflight(.select, false);
 }
 
 test "models acquisition and mutations refuse registry load failures" {
@@ -1079,8 +1164,8 @@ fn testRemoveNative(case: RemoveCase) !void {
     var remaining_owner = try models.load(allocator, paths.models_file);
     defer remaining_owner.deinit();
     const remaining = remaining_owner.view();
-    try std.testing.expect(models.find(remaining, "fixture") == null);
-    try std.testing.expectEqual(@as(usize, if (case == .shared) 1 else 0), remaining.models.len);
+    try std.testing.expectEqual(case == .directory, models.find(remaining, "fixture") != null);
+    try std.testing.expectEqual(@as(usize, if (case == .shared or case == .directory) 1 else 0), remaining.models.len);
     var selected_owner = try config.load(allocator, paths.config_file);
     defer selected_owner.deinit();
     const selected = selected_owner.view();
@@ -1095,6 +1180,51 @@ fn testRemoveNative(case: RemoveCase) !void {
         try std.testing.expect(state == .present and state.present.kind == .directory);
     } else {
         try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
+    }
+}
+
+test "metadata publication failures keep the previous config, registry and model" {
+    const io = sys.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const paths = try testPullPaths(allocator, root);
+    const model_path = try std.fs.path.join(allocator, &.{ root, "fixture.gguf" });
+    try sys.writeFile(model_path, "model bytes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared.toml", .data = "threads = 3\n" });
+    try tmp.dir.symLink(io, "shared.toml", "config.toml", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "registry.toml", .data = "" });
+    try tmp.dir.symLink(io, "registry.toml", "models.toml", .{});
+    for ([_]bool{ true, false }) |fail_in_config| {
+        const target = try preflightConfig(allocator, paths.config_file);
+        defer target.deinit();
+        var writer = try beginConfigWrite(allocator, paths, target);
+        defer writer.close();
+        var cfg = try writer.load(allocator);
+        defer cfg.deinit();
+        cfg.value.threads = 19;
+        var faults = staged_output.Faults{};
+        try faults.arm(.rename, 1, error.AccessDenied);
+        var selection = try writer.stage(cfg.view(), .{ .faults = if (fail_in_config) &faults else null });
+        defer selection.deinit();
+        var pending = try staged_output.begin(allocator, io, tmp.dir, "models.toml", .{ .faults = if (fail_in_config) null else &faults });
+        defer pending.deinit();
+        try pending.writeAll("[[models]]\nid = 'replacement'\n");
+        var registry = try pending.finish();
+        defer registry.deinit();
+        var filesystem = fs.FileSystem.init(io, tmp.dir, null);
+        try std.testing.expectError(error.AccessDenied, commitModelState(writer, &selection, &registry, .{
+            .delete = .{ .filesystem = &filesystem, .path = model_path },
+        }));
+        try std.testing.expectEqualStrings("threads = 3\n", try sys.readFileAlloc(allocator, paths.config_file, 1024));
+        try std.testing.expectEqualStrings("", try sys.readFileAlloc(allocator, paths.models_file, 1024));
+        try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
+        try std.testing.expect((try sys.pathState(paths.config_file)).present.kind == .sym_link);
+        try std.testing.expect((try sys.pathState(paths.models_file)).present.kind == .sym_link);
+        try std.testing.expectEqual(@as(usize, 1), faults.attemptsFor(.rename));
     }
 }
 
@@ -1174,8 +1304,8 @@ fn testRemoveFailure(failure: RemoveFailure) !void {
     var remaining_owner = try models.load(allocator, registry_path);
     defer remaining_owner.deinit();
     const remaining = remaining_owner.view();
-    try std.testing.expect(models.find(remaining, "fixture") == null);
-    try std.testing.expectEqual(@as(usize, 2), remaining.models.len);
+    try std.testing.expect(models.find(remaining, "fixture") != null);
+    try std.testing.expectEqual(@as(usize, 3), remaining.models.len);
     if (failure == .reload_directory) try std.testing.expectError(error.IsDir, models.load(allocator, paths.models_file));
     try std.testing.expectEqualStrings(config_before, try sys.readFileAlloc(allocator, paths.config_file, 8192));
     try std.testing.expectEqualStrings("model bytes", try sys.readFileAlloc(allocator, model_path, 1024));
@@ -1407,7 +1537,7 @@ test "pull rechecks invalid or dangling config after staging even without use" {
         Fixture.path = target;
         Fixture.lost_target = lost_target;
         const checksum = try sys.hexSha256(allocator, Fixture.bytes);
-        try std.testing.expectError(if (lost_target) error.FileNotFound else error.ConfigInvalid, runPullWithAcquirer(
+        try std.testing.expectError(if (lost_target) error.ConfigTargetChanged else error.ConfigInvalid, runPullWithAcquirer(
             allocator,
             paths,
             &.{ "--model-url", "https://example.invalid/incoming.gguf", "--id", "incoming", "--checksum", checksum, "--output", selected },

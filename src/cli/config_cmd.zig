@@ -1,7 +1,6 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const errors = @import("../errors.zig");
-const models = @import("../models.zig");
 const sys = @import("../sys.zig");
 const xdg = @import("../xdg.zig");
 
@@ -26,13 +25,14 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     if (std.mem.eql(u8, cmd_args[0], "set")) {
         if (cmd_args.len != 3) return errors.Error.InvalidArguments;
         try validateConfigSet(allocator, cmd_args[1], cmd_args[2]);
-        {
-            var preflight = try config.load(allocator, paths.config_file);
-            preflight.deinit();
-        }
-        const writer = try models.beginRegistryWrite(paths.config_file);
+        const target = try config.WriteTarget.capture(allocator, paths.config_file);
+        defer target.deinit();
+        // Preserve the missing-config error without creating lock state.
+        var preflight = try config.load(allocator, target.path);
+        preflight.deinit();
+        var writer = try target.begin();
         defer writer.close();
-        var cfg = try config.load(allocator, paths.config_file);
+        var cfg = try writer.load(allocator);
         defer cfg.deinit();
         const sets_path = std.mem.eql(u8, cmd_args[1], "model_path");
         const value = if (sets_path and cmd_args[2].len > 0)
@@ -41,7 +41,10 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             cmd_args[2];
         try cfg.setValue(cmd_args[1], value);
         if (sets_path) cfg.value.model_path_explicit = value.len > 0;
-        try config.save(paths.config_file, cfg.view());
+        var staged = try writer.stage(cfg.view(), .{});
+        defer staged.deinit();
+        try writer.requireUnchanged();
+        try staged.publish(.replace);
         return 0;
     }
     return errors.Error.InvalidArguments;
@@ -104,5 +107,5 @@ test "config set works without directory read permission" {
     var saved = try config.load(allocator, paths.config_file);
     defer saved.deinit();
     try std.testing.expectEqual(@as(u32, 3), saved.view().threads);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".state.lock", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, ".kotoba-config.lock", .{}));
 }

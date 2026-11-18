@@ -53,17 +53,43 @@ config = tomllib.loads(config_path.read_text())
 if variant != 'permission':
     config.update(model_id='', model_path='')
 (directory / 'expected-config.json').write_text(json.dumps(config))
-(directory / 'expected-models.json').write_text(json.dumps({'models': entries[1:]} if len(entries) > 1 else {}))
+expected = entries if variant == 'permission' else entries[1:]
+(directory / 'expected-models.json').write_text(json.dumps({'models': expected} if expected else {}))
 PYREMOVE
   matrix_run models remove fixture --yes
   if [[ "$variant" == permission ]]; then
     commands_streams 1 '' $'kotoba: io_error: AccessDenied\n'
     matrix_assert custom permission-mode test "$(stat -c %a "$managed")" = 555
-    commands_state '' config/kotoba/models.toml ''
+    commands_state '' '' ''
   else
     commands_streams 0 $'removed fixture\n'
     commands_state '' config/kotoba/config.toml,config/kotoba/models.toml ''
   fi
+)
+
+commands_linked_config_permissions() (
+  local operation="$1" selected registry
+  matrix_case "commands-models-$operation-read-only-shared-config"
+  commands_fixture
+  selected="$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  registry="$XDG_CONFIG_HOME/kotoba/models.toml"
+  printf 'different replacement model\n' > replacement.gguf
+  sed -i "s|^download_url = .*|download_url = \"file://$PWD/replacement.gguf\"|" "$registry"
+  mkdir shared
+  mv "$XDG_CONFIG_HOME/kotoba/config.toml" shared/settings.toml
+  ln -s ../../work/shared/settings.toml "$XDG_CONFIG_HOME/kotoba/config.toml"
+  trap 'chmod 0700 "$CASE_ROOT/work/shared"' EXIT
+  chmod 0555 shared
+  if [[ "$operation" == pull ]]; then
+    local checksum
+    checksum="$(sha256sum replacement.gguf | cut -d ' ' -f 1)"
+    matrix_run models pull fixture --output "$selected" --checksum "$checksum" --use
+  else
+    matrix_run models remove fixture --yes
+  fi
+  commands_error io_error AccessDenied
+  matrix_assert custom shared-parent-readonly test ! -w shared
+  commands_state '' '' ''
 )
 
 commands_streams() {
@@ -958,6 +984,35 @@ PYTHON
   matrix_run models pull fixture --output "$PWD/shared.gguf" --use
   commands_error
   commands_state '' '' ''
+
+  matrix_case commands-models-pull-output-linked-registry-target
+  commands_fixture
+  sed -i "s|^download_url = .*|download_url = \"file://$XDG_DATA_HOME/kotoba/models/fixture.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  mv "$XDG_CONFIG_HOME/kotoba/models.toml" registry.gguf
+  ln -s ../../work/registry.gguf "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_run models pull fixture --output "$PWD/registry.gguf" --use
+  commands_error
+  commands_state '' '' ''
+
+  matrix_case commands-models-remove-linked-config-target
+  commands_fixture
+  mv "$XDG_CONFIG_HOME/kotoba/config.toml" "$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+  ln -s "$XDG_DATA_HOME/kotoba/models/fixture.gguf" "$XDG_CONFIG_HOME/kotoba/config.toml"
+  matrix_run models remove fixture --yes
+  commands_error
+  commands_state '' '' ''
+
+  commands_linked_config_permissions pull
+  commands_linked_config_permissions remove
+
+  for variant in retarget concurrent; do
+    matrix_case "commands-shared-config-$variant"
+    commands_fixture
+    matrix_run config get threads
+    commands_streams 0 $'0\n'
+    matrix_assert custom process-coordination python3 "$ROOT/test/integration/shared_config.py" "$variant"
+    matrix_finish
+  done
 
   local destination
   for variant in selected-via-parent registered-via-link selected-via-dangling-link selected-via-40-links; do

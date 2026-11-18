@@ -68,6 +68,7 @@ const Storage = struct {
     writer: std.Io.File.Writer,
     buffer: [8192]u8,
     permissions: ?std.Io.File.Permissions,
+    previous_entry: bool,
     faults: ?*Faults,
     report: ?*CleanupReport,
     state: enum { writing, failed, finished } = .writing,
@@ -104,6 +105,13 @@ const Storage = struct {
         try self.check(.flush);
         self.writer.interface.flush() catch return self.writer.err orelse error.WriteFailed;
         self.completed(.flush);
+    }
+
+    fn removeBackup(self: *Storage, name: []const u8) void {
+        _ = self.filesystem.removeFileIfExists(name) catch |err| {
+            self.recordCleanup(err);
+            return;
+        };
     }
 
     fn destroy(self: *Storage) void {
@@ -203,6 +211,31 @@ pub const Finished = struct {
         s.destroy();
     }
 
+    /// Swap an existing entry into the stage so a later operation can restore
+    /// it exactly, including a symlink, mode, and inode. A new name is undoable
+    /// by unlinking it. The caller holds the writer locks until commit or undo.
+    pub fn publishReversible(self: *Finished) !Published {
+        const s = self.storage orelse return error.InvalidStageState;
+        if (s.state != .finished) return error.InvalidStageState;
+        try s.check(.rename);
+        const previous: PreviousEntry = if (s.previous_entry) prior: {
+            exchange(s) catch |err| switch (err) {
+                error.OperationUnsupported => {
+                    try publishWithHardLink(s);
+                    break :prior .linked;
+                },
+                else => return err,
+            };
+            break :prior .exchanged;
+        } else absent: {
+            try s.filesystem.renameFilePreserve(&s.name, s.destination);
+            break :absent .absent;
+        };
+        s.completed(.rename);
+        self.storage = null;
+        return .{ .storage = s, .previous = previous };
+    }
+
     pub fn abort(self: *Finished) !void {
         try abortStorage(&self.storage);
     }
@@ -211,6 +244,75 @@ pub const Finished = struct {
         dispose(&self.storage);
     }
 };
+
+const PreviousEntry = enum { absent, exchanged, linked };
+
+pub const Published = struct {
+    storage: ?*Storage,
+    previous: PreviousEntry,
+
+    pub fn rollback(self: *Published) !void {
+        const s = self.storage orelse return error.InvalidStageState;
+        const restored = switch (self.previous) {
+            .absent => if (s.filesystem.removeFileIfExists(s.destination)) |_| {} else |err| err,
+            .exchanged => exchange(s),
+            .linked => s.filesystem.renameFile(&backupName(s), s.destination),
+        };
+        restored catch |err| {
+            // Leave the previous entry available if the filesystem now
+            // refuses to restore it. A later deinit must not unlink it.
+            self.storage = null;
+            s.destroy();
+            return err;
+        };
+        self.deinit();
+    }
+
+    pub fn deinit(self: *Published) void {
+        const s = self.storage orelse return;
+        switch (self.previous) {
+            .absent => {},
+            .exchanged => s.removeBackup(&s.name),
+            .linked => s.removeBackup(&backupName(s)),
+        }
+        self.storage = null;
+        s.destroy();
+    }
+};
+
+fn backupName(s: *const Storage) @TypeOf(s.name) {
+    const prefix = ".kotoba-backup-";
+    var name = s.name;
+    @memcpy(name[0..prefix.len], prefix);
+    return name;
+}
+
+fn publishWithHardLink(s: *Storage) !void {
+    const backup = backupName(s);
+    const dir = s.filesystem.dir;
+    try dir.hardLink(s.destination, dir, &backup, s.filesystem.io, .{});
+    errdefer s.removeBackup(&backup);
+    try s.filesystem.renameFile(&s.name, s.destination);
+}
+
+fn exchange(s: *Storage) !void {
+    const linux = std.os.linux;
+    const stage = try std.posix.toPosixPath(&s.name);
+    const destination = try std.posix.toPosixPath(s.destination);
+    const dir = s.filesystem.dir.handle;
+    return switch (linux.errno(linux.renameat2(dir, &stage, dir, &destination, .{ .EXCHANGE = true }))) {
+        .SUCCESS => {},
+        .ACCES, .PERM => error.AccessDenied,
+        .BUSY => error.FileBusy,
+        .NOENT => error.FileNotFound,
+        .ROFS => error.ReadOnlyFileSystem,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .DQUOT => error.DiskQuota,
+        .NOSYS, .OPNOTSUPP, .INVAL => error.OperationUnsupported,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
+}
 
 fn abortStorage(owner: *?*Storage) !void {
     const s = owner.* orelse return;
@@ -276,6 +378,7 @@ pub fn begin(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []
         .writer = undefined,
         .buffer = undefined,
         .permissions = permissions,
+        .previous_entry = state == .present,
         .faults = options.faults,
         .report = options.cleanup_report,
     };
@@ -337,6 +440,31 @@ fn expectEntries(dir: std.Io.Dir, expected: []const []const u8) !void {
         try testing.expect(found);
     }
     try testing.expectEqual(expected.len, count);
+}
+
+test "hard-link fallback restores the previous symbolic link" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try put(tmp.dir, "old.toml", "original");
+    try tmp.dir.symLink(io, "old.toml", "models.toml", .{});
+    const previous = try tmp.dir.statFile(io, "models.toml", .{ .follow_symlinks = false });
+    var pending = try begin(testing.allocator, io, tmp.dir, "models.toml", .{});
+    defer pending.deinit();
+    try pending.writeAll("replacement");
+    var finished = try pending.finish();
+    defer finished.deinit();
+    try publishWithHardLink(finished.storage.?);
+    var published: Published = .{ .storage = finished.storage, .previous = .linked };
+    finished.storage = null;
+    defer published.deinit();
+    try expectBytes(tmp.dir, "models.toml", "replacement");
+    try published.rollback();
+    const restored = try tmp.dir.statFile(io, "models.toml", .{ .follow_symlinks = false });
+    try testing.expectEqual(previous.inode, restored.inode);
+    try testing.expectEqual(.sym_link, restored.kind);
+    try expectBytes(tmp.dir, "models.toml", "original");
+    try expectEntries(tmp.dir, &.{ "old.toml", "models.toml" });
 }
 
 fn fileMode(dir: std.Io.Dir, name: []const u8) !std.posix.mode_t {

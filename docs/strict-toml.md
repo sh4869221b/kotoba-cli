@@ -259,11 +259,23 @@ registry file is published independently through a complete exclusive sibling
 stage in the destination's parent directory. Kotoba flushes, syncs, and
 closes the stage before atomically replacing the destination. For a linked
 config, that destination is the resolved settings file and the symbolic link
-stays in place. A dangling link causes an error. The config and registry
-writes are separate per-file operations. Kotoba writers sharing an XDG
-config directory use a common lock. The lock scope is the config directory,
-and publication does not fsync the parent directory or provide cross-file
-rollback or power-loss recovery.
+stays in place. A dangling link causes an error. Writes hold a lock in the
+resolved settings directory from the final read through publication. XDG
+directories that link to the same settings share that lock. Model writers
+also acquire the XDG registry lock before the settings lock. The directories
+used for these locks must allow writes and path traversal.
+
+Settings updates use the target captured before acquisition or verification
+and check that the config still resolves there. A changed target or settings
+file during publication reports `config_target_changed`. Kotoba stages
+settings and registry updates before replacing or deleting a model. If a
+later step fails, it restores the prior metadata entries, including symlinks.
+On Linux a reversible replacement uses a same-directory rename exchange or
+a hard-link backup. A filesystem supporting neither operation refuses the
+replacement before changing model data. If the filesystem also prevents
+rollback, Kotoba reports the failure and keeps any intact backup. Publication
+does not provide a single atomic view across files, directory fsync, or
+recovery from a crash or power loss.
 
 For a canonical supported model `M`, the invariant is:
 
@@ -325,9 +337,10 @@ are deleted, or the registry is changed. This preflight applies to `init`,
 model selection, removal, and all `models import` and `models pull`
 operations. Registry validation precedes every acquisition or mutation,
 including direct URL and Hugging Face pulls. Installs also recheck
-configuration under the writer lock before publication. Argument-shape
-validation still has precedence. A later failure can leave partial
-cross-resource state because the files are published independently.
+configuration under the resolved settings lock before publication. Model
+commands reject replacing or deleting a directory entry used to reach
+`config.toml` or `models.toml`. Argument-shape validation still has
+precedence.
 
 ## Design choice
 
