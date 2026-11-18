@@ -223,19 +223,13 @@ pub const Writer = struct {
         try saveUpsert(allocator, self.path, &list, model);
     }
 
-    pub fn requireCurrent(self: Writer, allocator: std.mem.Allocator, expected: Model) !void {
-        var list = try load(allocator, self.path);
-        defer list.deinit();
-        try checkCurrent(find(list.view(), expected.id), expected);
-    }
-
     /// A selection verifies its input before taking the lock. Compare all
     /// fields again under the lock and keep the lock through config save.
     pub fn replaceIfUnchanged(self: Writer, allocator: std.mem.Allocator, expected: ?Model, model: Model) !void {
         var list = try load(allocator, self.path);
         defer list.deinit();
         const current = find(list.view(), model.id);
-        try checkCurrent(current, expected);
+        try requireCurrent(current, expected);
         if (current) |old| {
             if (equalModels(old, model)) return;
         }
@@ -285,7 +279,7 @@ pub fn beginWrite(path: []const u8) !Writer {
     }
 }
 
-fn checkCurrent(current: ?Model, expected: ?Model) !void {
+pub fn requireCurrent(current: ?Model, expected: ?Model) !void {
     if (expected) |old| {
         if (current == null or !equalModels(old, current.?)) return errors.Error.ModelSelectionChanged;
     } else if (current != null) return errors.Error.ModelSelectionChanged;

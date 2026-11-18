@@ -215,6 +215,9 @@ PY
   matrix_translate_plain_extra markdown-table-inline-html $'Action | Effect\n- | -\n<kbd>Esc</kbd> | Cancel\n\nBody' $'Action | Effect\n- | -\n<kbd>Esc</kbd> | Cancel\n\nJA:Body' markdown
   matrix_translate_plain_extra markdown-table-list-item $'- | A | B |\n  | - | - |\n  | Left | Right |\n\nAfterward' $'- | A | B |\n  | - | - |\n  | Left | Right |\n\nJA:Afterward' markdown
   matrix_translate_plain_extra markdown-table-textarea-boundary $'| A | B |\n| - | - |\n<textarea>\nLiteral text\n</textarea>\nAfterward' $'| A | B |\n| - | - |\n<textarea>\nLiteral text\n</textarea>\nJA:Afterward' markdown
+  matrix_translate_plain_extra markdown-table-nested-list $'- - | A | B |\n    | - | - |\n    | Left | Right |\n\nAfterward' $'- - | A | B |\n    | - | - |\n    | Left | Right |\n\nJA:Afterward' markdown
+  matrix_translate_plain_extra markdown-table-quote-in-list $'- > | A | B |\r\n  > | - | - |\r\n  > | Left | Right |\r\n\r\nAfterward' $'- > | A | B |\r\n  > | - | - |\r\n  > | Left | Right |\r\n\r\nJA:Afterward' markdown
+  matrix_translate_plain_extra markdown-unclosed-pre-in-list $'1. Item\n   <pre>\n   Literal\nOutside' $'JA:1. Item\n   <pre>\n   Literal\nJA:Outside' markdown
   matrix_translate_plain_extra markdown-pipe-less-table-row $'| A | B |\n| - | - |\nCell\n# Heading' $'| A | B |\n| - | - |\nCell\nJA:# Heading' markdown
   matrix_translate_plain_extra paragraphs-whitespace-crlf $'First\r\n \t\r\nSecond' $'JA:First\r\n \t\r\nJA:Second' plain
 

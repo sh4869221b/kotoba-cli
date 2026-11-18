@@ -33,6 +33,8 @@ pub const verifyModel = checksum_module.verifyModel;
 pub const stagePull = install.stagePull;
 pub const StagedModel = install.StagedModel;
 pub const stageLocalFile = install.stageLocalFile;
+pub const InstallSource = install.InstallSource;
+pub const requireCurrent = registry.requireCurrent;
 pub const AcquireOptions = install.AcquireOptions;
 
 pub const parseHfRepo = huggingface.parseHfRepo;

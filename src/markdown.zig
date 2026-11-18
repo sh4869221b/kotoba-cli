@@ -101,37 +101,49 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
     }
 
     const frontmatter_end = frontMatterEnd(text);
-    var fence: ?Fence = null;
+    var containers = std.array_list.Managed(Container).init(allocator);
+    defer containers.deinit();
+    var fence: ?struct { delimiter: Fence, depth: usize } = null;
     var table: ?Table = null;
-    var raw_html: ?Container = null;
+    var raw_html_depth: ?usize = null;
     var start: usize = 0;
     while (start < text.len) {
         const line = lineAt(text, start);
-        if (raw_html) |container| {
-            if (container.content(quotedLine(line.body)) == null) raw_html = null;
-        }
         if (start < frontmatter_end) {
             try protection.add(line.body);
-        } else if (fence) |open| {
-            try protection.add(line.body);
-            if (fenceAt(line.body)) |close| {
-                if (close.marker == open.marker and close.len >= open.len and close.rest.len == 0) fence = null;
-            }
-        } else if (raw_html != null) {
-            try protection.add(line.body);
-            if (endsRawHtml(line.body)) raw_html = null;
-        } else if (openingFence(line.body)) |open| {
-            table = null;
-            fence = open;
-            try protection.add(line.body);
-        } else if (rawHtmlContainer(line.body, table)) |container| {
-            table = null;
-            if (!endsRawHtml(line.body)) raw_html = container;
-            try protection.add(line.body);
-        } else if (isTableLine(text, line.body, line.next, &table)) {
-            try protection.add(line.body);
         } else {
-            try protectInline(&protection, line.body);
+            const delimiter_depth = if (table) |active| if (active.delimiter_pending) active.depth else null else null;
+            const literal_depth = if (fence) |open| open.depth else raw_html_depth orelse delimiter_depth;
+            const leaf = try advanceContainers(&containers, line.body, literal_depth);
+            const depth = containers.items.len;
+            if (fence) |open| {
+                if (leaf.continued < open.depth) fence = null;
+            }
+            if (raw_html_depth) |open_depth| {
+                if (leaf.continued < open_depth) raw_html_depth = null;
+            }
+
+            if (fence) |open| {
+                try protection.add(line.body);
+                if (fenceAt(leaf.text)) |close| {
+                    if (close.marker == open.delimiter.marker and close.len >= open.delimiter.len and close.rest.len == 0) fence = null;
+                }
+            } else if (raw_html_depth != null) {
+                try protection.add(line.body);
+                if (endsRawHtml(leaf.text)) raw_html_depth = null;
+            } else if (openingFence(leaf.text)) |open| {
+                table = null;
+                fence = .{ .delimiter = open, .depth = depth };
+                try protection.add(line.body);
+            } else if (startsRawHtml(leaf.text)) {
+                table = null;
+                if (!endsRawHtml(leaf.text)) raw_html_depth = depth;
+                try protection.add(line.body);
+            } else if (isTableLine(text, leaf, line.next, containers.items, &table)) {
+                try protection.add(line.body);
+            } else {
+                try protectInline(&protection, line.body);
+            }
         }
         try protection.text.appendSlice(text[start + line.body.len .. line.next]);
         start = line.next;
@@ -193,59 +205,101 @@ fn codeSpanEnd(line: []const u8, start: usize, open_end: usize) ?usize {
     return null;
 }
 
-const Container = struct {
-    depth: usize,
-    indent: usize,
+const Container = union(enum) {
+    quote,
+    list: usize,
+};
 
-    fn content(self: Container, line: QuotedLine) ?[]const u8 {
-        if (self.depth != line.depth) return null;
-        if (std.mem.trim(u8, line.text, " \t").len == 0) return line.text;
-        var column: usize = 0;
-        for (line.text, 0..) |ch, index| {
-            if (column >= self.indent) return line.text[index..];
-            column = switch (ch) {
-                ' ' => column + 1,
-                '\t' => (column / 4 + 1) * 4,
-                else => return null,
-            };
+const Prefix = struct {
+    text: []const u8,
+    column: usize = 0,
+
+    fn consume(self: *Prefix, container: Container) bool {
+        switch (container) {
+            .quote => self.* = self.quote() orelse return false,
+            .list => |indent| {
+                if (std.mem.trim(u8, self.text, " \t").len == 0) {
+                    self.text = self.text[self.text.len..];
+                    self.column += indent;
+                    return true;
+                }
+                const end = self.column + indent;
+                var column = self.column;
+                var index: usize = 0;
+                while (column < end and index < self.text.len) : (index += 1) {
+                    column = switch (self.text[index]) {
+                        ' ' => column + 1,
+                        '\t' => nextTab(column),
+                        else => return false,
+                    };
+                }
+                if (column < end) return false;
+                self.* = .{ .text = self.text[index..], .column = column };
+            },
         }
-        return null;
+        return true;
+    }
+
+    fn quote(self: Prefix) ?Prefix {
+        const trimmed = std.mem.trimStart(u8, self.text, " ");
+        const leading = self.text.len - trimmed.len;
+        if (leading > 3 or !std.mem.startsWith(u8, trimmed, ">")) return null;
+        const spaces: usize = @intFromBool(trimmed.len > 1 and trimmed[1] == ' ');
+        return .{ .text = trimmed[1 + spaces ..], .column = self.column + leading + 1 + spaces };
+    }
+
+    fn listItem(self: Prefix) ?Prefix {
+        const trimmed = std.mem.trimStart(u8, self.text, " ");
+        const leading = self.text.len - trimmed.len;
+        if (leading > 3 or trimmed.len == 0 or isThematicBreak(std.mem.trimEnd(u8, trimmed, " \t"))) return null;
+        const marker = listMarkerWidth(trimmed);
+        if (marker == 0) return null;
+
+        var column = self.column + leading + marker;
+        const after_marker = column;
+        for (trimmed[marker..], marker..) |ch, index| {
+            switch (ch) {
+                ' ' => column += 1,
+                '\t' => column = nextTab(column),
+                else => {
+                    if (column == after_marker or column - after_marker > 4) return null;
+                    return .{ .text = trimmed[index..], .column = column };
+                },
+            }
+        }
+        return .{ .text = trimmed[trimmed.len..], .column = after_marker + 1 };
     }
 };
 
-const Table = struct { container: Container, delimiter_pending: bool = true };
-const QuotedLine = struct { text: []const u8, depth: usize = 0 };
-
-fn quotedLine(line: []const u8) QuotedLine {
-    var result: QuotedLine = .{ .text = line };
-    while (true) {
-        const trimmed = std.mem.trimStart(u8, result.text, " ");
-        if (result.text.len - trimmed.len > 3 or !std.mem.startsWith(u8, trimmed, ">")) return result;
-        result.depth += 1;
-        result.text = if (trimmed.len > 1 and trimmed[1] == ' ') trimmed[2..] else trimmed[1..];
-    }
+fn nextTab(column: usize) usize {
+    return (column / 4 + 1) * 4;
 }
 
-fn listItem(line: []const u8) ?struct { text: []const u8, indent: usize } {
-    const trimmed = std.mem.trimStart(u8, line, " ");
-    const leading = line.len - trimmed.len;
-    if (leading > 3 or trimmed.len == 0) return null;
-    const marker = listMarkerWidth(trimmed);
-    if (marker == 0 or marker == trimmed.len) return null;
+const Leaf = struct { text: []const u8, continued: usize };
+const Table = struct { depth: usize, delimiter_pending: bool = true };
 
-    var column = leading + marker;
-    const start = column;
-    for (trimmed[marker..], marker..) |ch, index| {
-        switch (ch) {
-            ' ' => column += 1,
-            '\t' => column = (column / 4 + 1) * 4,
-            else => {
-                if (column == start or column - start > 4) return null;
-                return .{ .text = trimmed[index..], .indent = column };
-            },
+fn advanceContainers(stack: *std.array_list.Managed(Container), body: []const u8, literal_depth: ?usize) !Leaf {
+    var prefix: Prefix = .{ .text = body };
+    var continued: usize = 0;
+    for (stack.items) |container| {
+        if (!prefix.consume(container)) break;
+        continued += 1;
+    }
+    stack.shrinkRetainingCapacity(continued);
+
+    // Literal lines keep any further list or quote markers as content.
+    if (literal_depth == null or continued < literal_depth.?) {
+        while (true) {
+            if (prefix.quote()) |next| {
+                try stack.append(.quote);
+                prefix = next;
+            } else if (prefix.listItem()) |next| {
+                try stack.append(.{ .list = next.column - prefix.column });
+                prefix = next;
+            } else break;
         }
     }
-    return null;
+    return .{ .text = prefix.text, .continued = continued };
 }
 
 fn listMarkerWidth(line: []const u8) usize {
@@ -256,29 +310,25 @@ fn listMarkerWidth(line: []const u8) usize {
     return 0;
 }
 
-fn isTableLine(text: []const u8, body: []const u8, next: usize, table: *?Table) bool {
-    const current = quotedLine(body);
+fn isTableLine(text: []const u8, leaf: Leaf, next: usize, containers: []const Container, table: *?Table) bool {
     if (table.*) |*active| {
-        if (active.container.content(current)) |content| {
+        if (active.depth == containers.len and active.depth == leaf.continued) {
             if (active.delimiter_pending) {
                 active.delimiter_pending = false;
                 return true;
             }
-            if (!startsTableEndingBlock(content)) return true;
+            if (!startsTableEndingBlock(leaf.text)) return true;
         }
         table.* = null;
     }
-    if (next == text.len) return false;
-    // A thematic break takes precedence over a list marker.
-    if (isThematicBreak(std.mem.trim(u8, current.text, " \t"))) return false;
-    const item = listItem(current.text);
-    const header = if (item) |value| value.text else current.text;
-    if (startsTableEndingBlock(header)) return false;
-    const cells = tableCells(header, false) orelse return false;
-    const container: Container = .{ .depth = current.depth, .indent = if (item) |value| value.indent else 0 };
-    const delimiter = container.content(quotedLine(lineAt(text, next).body)) orelse return false;
-    if (tableCells(delimiter, true) != cells) return false;
-    table.* = .{ .container = container };
+    if (next == text.len or startsTableEndingBlock(leaf.text)) return false;
+    const cells = tableCells(leaf.text, false) orelse return false;
+    var delimiter: Prefix = .{ .text = lineAt(text, next).body };
+    for (containers) |container| {
+        if (!delimiter.consume(container)) return false;
+    }
+    if (tableCells(delimiter.text, true) != cells) return false;
+    table.* = .{ .depth = containers.len };
     return true;
 }
 
@@ -325,20 +375,6 @@ fn endsRawHtml(line: []const u8) bool {
         if (std.ascii.indexOfIgnoreCase(line, "</" ++ tag ++ ">") != null) return true;
     }
     return false;
-}
-
-fn rawHtmlContainer(body: []const u8, table: ?Table) ?Container {
-    const current = quotedLine(body);
-    if (table) |active| {
-        if (active.container.content(current)) |content| {
-            if (startsRawHtml(content)) return active.container;
-        }
-    }
-    if (listItem(current.text)) |item| {
-        if (startsRawHtml(item.text)) return .{ .depth = current.depth, .indent = item.indent };
-    }
-    if (startsRawHtml(current.text)) return .{ .depth = current.depth, .indent = 0 };
-    return null;
 }
 
 /// GFM HTML block types 1–6 can interrupt a table. A generic inline tag
@@ -678,7 +714,7 @@ test "quoted tables keep single-cell rows and stop at a new block or quote depth
 
 test "inline HTML at the start of a table row keeps the whole row protected" {
     const allocator = std.testing.allocator;
-    const source = "| Key | Action |\n| - | - |\n<kbd>Esc</kbd> | Cancel\n| Enter | Run |\n<DIV>Block</DIV>\nProse";
+    const source = "Key | Action\n- | -\n<kbd>Esc</kbd> | Cancel\n| Enter | Run |\n<DIV>Block</DIV>\nProse";
     const doc = try protect(allocator, source);
     defer doc.deinit(allocator);
     try std.testing.expectEqualStrings("<kbd>Esc</kbd> | Cancel", doc.protected[2]);
@@ -707,4 +743,33 @@ test "textarea after a table ends at its own closing tag" {
     try std.testing.expectEqualStrings("Literal text", doc.protected[3]);
     try std.testing.expectEqualStrings("</textarea>", doc.protected[4]);
     try std.testing.expect(std.mem.endsWith(u8, doc.text, "\nTranslate this paragraph."));
+}
+
+test "tables stay in their own nested list and quote containers" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, header: []const u8, tail: []const u8 }{
+        .{ .text = "- - | A | B |\n    | - | - |\n    | a | b |\n  - Sibling\nOutside", .header = "- - | A | B |", .tail = "\n  - Sibling\nOutside" },
+        .{ .text = "- > | A | B |\r\n  > | - | - |\r\n  > | a | b |\r\n  List prose\r\nOutside", .header = "- > | A | B |", .tail = "\r\n  List prose\r\nOutside" },
+        .{ .text = "- Parent\n  - | A | B |\n    | - | - |\n    | a | b |\n  Outdented", .header = "  - | A | B |", .tail = "\n  Outdented" },
+    };
+    for (cases) |case| {
+        const doc = try protect(allocator, case.text);
+        defer doc.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), doc.protected.len);
+        try std.testing.expectEqualStrings(case.header, doc.protected[0]);
+        try std.testing.expect(std.mem.endsWith(u8, doc.text, case.tail));
+    }
+}
+
+test "unclosed raw HTML in a continued list item ends at the outdent or sibling" {
+    const allocator = std.testing.allocator;
+    const source = "- Item\n  <pre>\n  - literal\n  > still literal\n\n- Sibling\nOutside\n\n- > <pre>\n  > literal\n  Back in list";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 5), doc.protected.len);
+    try std.testing.expectEqualStrings("  - literal", doc.protected[1]);
+    try std.testing.expectEqualStrings("  > still literal", doc.protected[2]);
+    try std.testing.expectEqualStrings("- > <pre>", doc.protected[3]);
+    try std.testing.expect(std.mem.indexOf(u8, doc.text, "\n\n- Sibling\nOutside\n\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, doc.text, "\n  Back in list"));
 }

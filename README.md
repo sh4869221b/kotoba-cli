@@ -183,6 +183,12 @@ kotoba glossary validate
 kotoba version
 ```
 
+Model installs reject an output referenced by another registered or selected
+model, including paths that refer to the output through symlinks.
+`models import` and `models pull` preserve an explicitly configured
+`model_path` unless invoked with `--use`. If the active path follows the
+previous registration and that registration moves, the active path follows it.
+
 ## Command side effects
 
 Kotoba validates each command, subcommand, option, required value, argument

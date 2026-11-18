@@ -93,6 +93,7 @@ commands_error() {
     model_missing) message='Configured model file does not exist.' ;;
     checksum_failed) message='Model checksum verification failed.' ;;
     model_registry_invalid) message='Model registry entry is invalid.' ;;
+    model_path_in_use) message='The destination is referenced by another model. Choose a different output path.' ;;
     models_invalid) message='models.toml is invalid.' ;;
     model_not_selected) message='No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`.' ;;
     sqlite_failed) message='SQLite translation memory operation failed.' ;;
@@ -814,6 +815,68 @@ assert Path(config['model_path']) == root / 'work/pulled.gguf'
 assert config['model_id'] == 'relative-pull'
 PYTHON
   commands_unchanged
+
+  matrix_case commands-models-import-preserves-explicit-symlink
+  commands_fixture
+  ln -s "$XDG_DATA_HOME/kotoba/models/fixture.gguf" explicit.gguf
+  matrix_setup config set model_path "$PWD/explicit.gguf"
+  printf 'replacement model\n' > replacement.gguf
+  matrix_run models import --id fixture --path replacement.gguf
+  commands_streams 0 $'imported fixture\n'
+  matrix_assert file "$XDG_DATA_HOME/kotoba/models/fixture.gguf" "$PWD/replacement.gguf"
+  commands_state '' config/kotoba/models.toml,data/kotoba/models/fixture.gguf ''
+
+  matrix_case commands-models-pull-follows-moved-registration
+  commands_fixture
+  sed -i "s|^download_url = .*|download_url = \"file://$XDG_DATA_HOME/kotoba/models/fixture.gguf\"|" "$XDG_CONFIG_HOME/kotoba/models.toml"
+  matrix_run models pull fixture --output ./moved.gguf
+  commands_streams 0 $'pulled fixture\n'
+  matrix_assert custom follows-moved-path python3 - "$CASE_ROOT" <<'PYTHON'
+from pathlib import Path
+import sys, tomllib
+root = Path(sys.argv[1])
+config, registry = (tomllib.loads((root / 'config/kotoba' / name).read_text()) for name in ('config.toml', 'models.toml'))
+assert config['model_id'] == 'fixture'
+assert Path(config['model_path']) == Path(registry['models'][0]['path']) == root / 'work/moved.gguf'
+PYTHON
+  commands_state work/moved.gguf config/kotoba/config.toml,config/kotoba/models.toml ''
+
+  local destination
+  for variant in selected-via-parent registered-via-link selected-via-dangling-link; do
+    matrix_case "commands-models-pull-output-referenced-$variant"
+    commands_fixture
+    printf 'different remote model\n' > replacement.gguf
+    cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "incoming"
+download_url = "file://$PWD/replacement.gguf"
+TOML
+    case "$variant" in
+      selected-via-parent)
+        mkdir selected-models
+        printf 'explicit selected model\n' > selected-models/fixture.gguf
+        ln -s selected-models parent
+        matrix_setup config set model_path "$PWD/parent/fixture.gguf"
+        destination="$PWD/selected-models/fixture.gguf" ;;
+      registered-via-link)
+        matrix_setup config set model_path "$PWD/replacement.gguf"
+        ln -s "$XDG_DATA_HOME/kotoba/models/fixture.gguf" bridge.gguf
+        ln -s bridge.gguf registered.gguf
+        cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "alias"
+path = "$PWD/registered.gguf"
+TOML
+        destination="$PWD/bridge.gguf" ;;
+      selected-via-dangling-link)
+        ln -s missing.gguf selected.gguf
+        matrix_setup config set model_path "$PWD/selected.gguf"
+        destination="$PWD/missing.gguf" ;;
+    esac
+    matrix_run models pull incoming --output "$destination" --use
+    commands_error model_path_in_use
+    commands_state '' '' ''
+  done
 
   for selector in use init active-config; do
     matrix_case "commands-models-remove-active-alias-$selector"

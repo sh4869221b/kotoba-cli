@@ -113,6 +113,54 @@ pub const StagedModel = struct {
     }
 };
 
+/// Pins the source inode for copying and for comparison at publish time.
+pub const InstallSource = struct {
+    file: std.Io.File,
+    stat: std.os.linux.Statx,
+
+    pub fn open(path: []const u8) !?InstallSource {
+        const io = sys.io();
+        const file = sys.cwd().openFile(io, path, .{ .path_only = true }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        errdefer file.close(io);
+        const linux = std.os.linux;
+        var stat = std.mem.zeroes(linux.Statx);
+        const result = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stat);
+        const status = linux.errno(result);
+        if (status != .SUCCESS) return std.posix.unexpectedErrno(status);
+        if (!stat.mask.TYPE or !stat.mask.INO or !stat.mask.SIZE or !stat.mask.MTIME or !stat.mask.CTIME)
+            return error.OperationUnsupported;
+        if (stat.mode & linux.S.IFMT != linux.S.IFREG) return errors.Error.ModelLoadFailed;
+        return .{ .file = file, .stat = stat };
+    }
+
+    pub fn close(self: InstallSource) void {
+        self.file.close(sys.io());
+    }
+
+    pub fn fdPath(self: InstallSource, buffer: []u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "/proc/self/fd/{d}", .{self.file.handle}) catch unreachable;
+    }
+
+    pub fn sameFile(self: InstallSource, other: InstallSource) bool {
+        return self.stat.ino == other.stat.ino and
+            self.stat.dev_major == other.stat.dev_major and self.stat.dev_minor == other.stat.dev_minor;
+    }
+
+    pub fn requireUnchanged(self: InstallSource, name: []const u8) !void {
+        const current = (open(name) catch |err| switch (err) {
+            error.ModelLoadFailed => return errors.Error.ModelSelectionChanged,
+            else => return err,
+        }) orelse return errors.Error.ModelSelectionChanged;
+        defer current.close();
+        if (!self.sameFile(current) or self.stat.size != current.stat.size or
+            !std.meta.eql(self.stat.mtime, current.stat.mtime) or
+            !std.meta.eql(self.stat.ctime, current.stat.ctime)) return errors.Error.ModelSelectionChanged;
+    }
+};
+
 pub fn stageLocalFile(allocator: std.mem.Allocator, src: []const u8, dest: []const u8, expected_checksum: []const u8) !StagedModel {
     var stage = try StagedModel.begin(allocator, dest);
     errdefer stage.deinit();

@@ -70,6 +70,15 @@ fn printModelInfo(allocator: std.mem.Allocator, m: models.Model) !void {
 }
 
 fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
+    return runImportWithStager(allocator, paths, cmd_args, models.stageLocalFile);
+}
+
+fn runImportWithStager(
+    allocator: std.mem.Allocator,
+    paths: xdg.Paths,
+    cmd_args: []const []const u8,
+    stager: *const fn (std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!models.StagedModel,
+) !u8 {
     var cursor = args.ArgCursor.init(cmd_args);
     var id: []const u8 = "";
     var source_path: []const u8 = "";
@@ -103,9 +112,6 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
         defer validation_owner.deinit();
     }
     if (use_model) try validateConfigLoad(allocator, paths.config_file);
-    try xdg.ensureDirs(paths);
-    var staged = try models.stageLocalFile(allocator, source_path, dest_path, checksum);
-    defer staged.deinit();
     const display_name = if (name.len > 0) name else id;
     const model: models.Model = .{
         .id = id,
@@ -119,7 +125,40 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
         .notes = "Imported local GGUF model.",
     };
     try models.validateModel(model);
-    try commitInstall(allocator, paths, &staged, model, null, use_model);
+    try xdg.ensureDirs(paths);
+
+    // Capture the source and, for a self-import, its registration while
+    // other model writers are excluded. Copy and checksum outside the lock.
+    var initial: ?models.OwnedList = null;
+    defer if (initial) |*owner| owner.deinit();
+    var expectation: InstallExpectation = .latest;
+    const source = capture: {
+        const writer = try models.beginRegistryWrite(paths.models_file);
+        defer writer.close();
+        const source = try models.InstallSource.open(source_path) orelse return errors.Error.ModelMissing;
+        errdefer source.close();
+        const destination = models.InstallSource.open(dest_path) catch |err| switch (err) {
+            error.ModelLoadFailed => null,
+            else => return err,
+        };
+        if (destination) |installed| {
+            defer installed.close();
+            if (source.sameFile(installed)) {
+                initial = try models.loadReadOnly(allocator, paths.models_file);
+                expectation = .{ .self_import = .{
+                    .previous = models.find(initial.?.view(), id),
+                    .source = source,
+                    .source_path = source_path,
+                } };
+            }
+        }
+        break :capture source;
+    };
+    defer source.close();
+    var fd_path: [64]u8 = undefined;
+    var staged = try stager(allocator, source.fdPath(&fd_path), dest_path, checksum);
+    defer staged.deinit();
+    try commitInstall(allocator, paths, &staged, model, expectation, use_model);
     try sys.stdoutPrint("imported {s}\n", .{id});
     return 0;
 }
@@ -241,42 +280,120 @@ fn runPullWithAcquirer(
     try xdg.ensureDirs(paths);
     var staged = try acquirer(allocator, request_model, output_path, .{ .managed = managed }) orelse return errors.Error.ModelSourceRequired;
     defer staged.deinit();
-    try commitInstall(allocator, paths, &staged, m, expected, use_model);
+    try commitInstall(allocator, paths, &staged, m, if (expected) |previous| .{ .registered_pull = previous } else .latest, use_model);
     try sys.stdoutPrint("pulled {s}\n", .{id});
     return 0;
 }
+
+const InstallExpectation = union(enum) {
+    latest,
+    registered_pull: models.Model,
+    self_import: struct {
+        previous: ?models.Model,
+        source: models.InstallSource,
+        source_path: []const u8,
+    },
+};
 
 fn commitInstall(
     allocator: std.mem.Allocator,
     paths: xdg.Paths,
     stage: *models.StagedModel,
     m: models.Model,
-    expected: ?models.Model,
+    expected: InstallExpectation,
     use_model: bool,
 ) !void {
     const writer = try models.beginRegistryWrite(paths.models_file);
     defer writer.close();
-    try models.ensure(paths.models_file);
-    if (expected) |previous| try writer.requireCurrent(allocator, previous);
+    var entries = try models.loadReadOnly(allocator, paths.models_file);
+    defer entries.deinit();
+    const current = models.find(entries.view(), m.id);
+    switch (expected) {
+        .latest => {},
+        .registered_pull => |previous| try models.requireCurrent(current, previous),
+        .self_import => |initial| {
+            try models.requireCurrent(current, initial.previous);
+            try initial.source.requireUnchanged(initial.source_path);
+            try initial.source.requireUnchanged(m.path);
+        },
+    }
 
-    // A replacement of the active ID must keep the selected path coherent,
-    // even if the user did not request activation of an inactive model.
     var cfg: ?config.OwnedConfig = loadConfigOrDefault(allocator, paths.config_file) catch |err| switch (err) {
         error.ConfigInvalid, error.ConfigSchemaUnsupported => if (use_model) return err else null,
         else => return err,
     };
     defer if (cfg) |*owner| owner.deinit();
-    const update_selection = if (cfg) |*owner|
-        use_model or (std.mem.eql(u8, owner.view().model_id, m.id) and !std.mem.eql(u8, owner.view().model_path, m.path))
-    else
-        false;
+    const destination = (try installEntryPath(allocator, m.path)) orelse return errors.Error.PathResolutionFailed;
+    defer allocator.free(destination);
+    const dest_stat = sys.cwd().statFile(sys.io(), destination, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    // Replacing a link to a directory could break references to models
+    // below it even if their final components differ from the output.
+    if (dest_stat != null and dest_stat.?.kind == .directory) return error.IsDir;
+    for (entries.view().models) |other| {
+        if (!std.mem.eql(u8, other.id, m.id) and try referencesInstallEntry(allocator, other.path, destination))
+            return errors.Error.ModelPathInUse;
+    }
+    const update_selection = if (cfg) |*owner| update: {
+        const settings = owner.view();
+        const active_id = std.mem.eql(u8, settings.model_id, m.id);
+        if (!active_id and try referencesInstallEntry(allocator, settings.model_path, destination))
+            return errors.Error.ModelPathInUse;
+        if (use_model) break :update true;
+        const previous = current orelse break :update false;
+        break :update active_id and settings.model_path.len != 0 and
+            std.mem.eql(u8, settings.model_path, previous.path) and
+            !try referencesInstallEntry(allocator, previous.path, destination);
+    } else false;
     if (update_selection) {
         try cfg.?.setValue("model_id", m.id);
         try cfg.?.setValue("model_path", m.path);
     }
+    try models.ensure(paths.models_file);
     try stage.publish(m.path);
     try writer.upsert(allocator, m);
     if (update_selection) try config.save(paths.config_file, cfg.?.view());
+}
+
+/// Resolve the directory entry that rename will replace, without following
+/// its final symlink.
+fn installEntryPath(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const parent = sys.realPathIfExistsAlloc(allocator, std.fs.path.dirname(path) orelse ".") catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => return null,
+        else => return err,
+    } orelse return null;
+    defer allocator.free(parent);
+    return try std.fs.path.join(allocator, &.{ parent, std.fs.path.basename(path) });
+}
+
+/// Follow leaf links one at a time so a reference through the destination
+/// is recognized even if it is an intermediate or dangling symlink.
+fn referencesInstallEntry(allocator: std.mem.Allocator, path: []const u8, destination: []const u8) !bool {
+    if (path.len == 0) return false;
+    var current = try allocator.dupe(u8, path);
+    defer allocator.free(current);
+    for (0..40) |_| {
+        const entry = (try installEntryPath(allocator, current)) orelse return false;
+        defer allocator.free(entry);
+        if (std.mem.eql(u8, entry, destination)) return true;
+
+        var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const count = sys.cwd().readLink(sys.io(), entry, &target_buffer) catch |err| switch (err) {
+            error.NotLink, error.FileNotFound => return false,
+            else => return err,
+        };
+        if (count == target_buffer.len) return error.NameTooLong;
+        const target = target_buffer[0..count];
+        const next = if (std.fs.path.isAbsolute(target))
+            try allocator.dupe(u8, target)
+        else
+            try std.fs.path.join(allocator, &.{ std.fs.path.dirname(entry).?, target });
+        allocator.free(current);
+        current = next;
+    }
+    return false;
 }
 
 fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []const u8) !u8 {
@@ -1128,4 +1245,83 @@ test "import of its own installed path publishes the verified stage" {
     var cfg = try config.load(allocator, paths.config_file);
     defer cfg.deinit();
     try std.testing.expectEqualStrings(dest, cfg.view().model_path);
+}
+
+test "self import refuses a staged copy after registry or source changes" {
+    const io = sys.io();
+    const Fixture = struct {
+        var paths: xdg.Paths = undefined;
+        var replacement: []const u8 = undefined;
+        var change: enum { replace, remove, metadata, rewrite } = undefined;
+
+        fn stage(a: std.mem.Allocator, src: []const u8, dest: []const u8, checksum: []const u8) !models.StagedModel {
+            var staged = try models.stageLocalFile(a, src, dest, checksum);
+            errdefer staged.deinit();
+            switch (change) {
+                .replace => try std.testing.expectEqual(@as(u8, 0), try runImport(a, paths, &.{ "--id", "same", "--path", replacement })),
+                .remove => try std.testing.expectEqual(@as(u8, 0), try runRemove(a, paths, &.{ "same", "--yes" })),
+                .metadata => {
+                    var entries = try models.load(a, paths.models_file);
+                    defer entries.deinit();
+                    var changed = models.find(entries.view(), "same").?;
+                    changed.notes = "edited during staging";
+                    try models.upsert(a, paths.models_file, changed);
+                },
+                .rewrite => try sys.writeFile(dest, "mid"),
+            }
+            return staged;
+        }
+    };
+
+    for ([_]@TypeOf(Fixture.change){ .replace, .remove, .metadata, .rewrite }) |change| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        const paths = try testPullPaths(allocator, root);
+        const dest = try models.installedPath(allocator, root, "same");
+        const original = try std.fs.path.join(allocator, &.{ root, "original.gguf" });
+        const replacement = try std.fs.path.join(allocator, &.{ root, "replacement.gguf" });
+        // Match registry fields and size for .replace to exercise inode identity.
+        try sys.writeFile(original, "old");
+        try sys.writeFile(replacement, "new");
+        const output = try tmp.dir.createFile(io, "stdout", .{});
+        defer output.close(io);
+        var capture = try TestStdoutCapture.start(output);
+        defer capture.restore();
+        try std.testing.expectEqual(@as(u8, 0), try runImport(allocator, paths, &.{ "--id", "same", "--path", original, "--use" }));
+        // Use an alternate path for the same installed inode.
+        try tmp.dir.symLink(io, "same.gguf", "alias.gguf", .{});
+        const alias = try std.fs.path.join(allocator, &.{ root, "alias.gguf" });
+        Fixture.paths = paths;
+        Fixture.replacement = replacement;
+        Fixture.change = change;
+        try std.testing.expectError(error.ModelSelectionChanged, runImportWithStager(
+            allocator,
+            paths,
+            &.{ "--id", "same", "--path", alias, "--use" },
+            Fixture.stage,
+        ));
+        const expected = switch (change) {
+            .replace => "new",
+            .remove => null,
+            .metadata => "old",
+            .rewrite => "mid",
+        };
+        var registry = try models.load(allocator, paths.models_file);
+        defer registry.deinit();
+        if (expected) |bytes| {
+            try std.testing.expectEqualStrings(bytes, try sys.readFileAlloc(allocator, dest, 1024));
+            if (change == .metadata)
+                try std.testing.expectEqualStrings("edited during staging", models.find(registry.view(), "same").?.notes);
+        } else {
+            try std.testing.expect(!sys.exists(dest));
+            try std.testing.expect(models.find(registry.view(), "same") == null);
+            var cfg = try config.load(allocator, paths.config_file);
+            defer cfg.deinit();
+            try std.testing.expectEqualStrings("", cfg.view().model_path);
+        }
+    }
 }
