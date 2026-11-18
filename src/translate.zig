@@ -7,6 +7,7 @@ const input = @import("input.zig");
 const lang = @import("lang.zig");
 const markdown = @import("markdown.zig");
 const memory = @import("memory.zig");
+const models = @import("models.zig");
 const output = @import("output.zig");
 const prompt = @import("prompt.zig");
 const segment = @import("segment.zig");
@@ -48,7 +49,7 @@ pub const TranslationContext = struct {
     target_lang: lang.Language,
     mode: config.Mode,
     model_id: []const u8,
-    glossary_hash: u64,
+    profile_hash: [32]u8,
     glossary: glossary.Glossary,
     db_opt: ?*memory.Db,
     cfg: config.Config,
@@ -86,19 +87,23 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     var protected = try protectMarkdown(allocator, source_text, read_kind);
     defer protected.deinit(allocator);
 
-    const segments = try segment.splitParagraphs(allocator, protected.text);
+    const segments = try segment.splitParagraphs(allocator, protected.text, if (protected.doc) |doc| doc.token_prefix else null);
     defer allocator.free(segments);
 
-    var db_opt: ?memory.Db = if (cfg.memory_enabled and !opts.no_memory) try memory.open(session_allocator, paths.memory_file) else null;
+    const cache_enabled = cfg.memory_enabled and !opts.no_memory;
+    const total_segments = countTranslatable(segments);
+    const profile_hash = if (cache_enabled and total_segments > 0)
+        cacheFingerprint(try models.contentSha256(cfg.model_path), glossary.fingerprint(g), read_kind)
+    else
+        [_]u8{0} ** 32;
+    var db_opt: ?memory.Db = if (cache_enabled) try memory.open(session_allocator, paths.memory_file) else null;
     defer if (db_opt) |*db| db.close();
-
-    const gh = glossary.hash(g);
     const translation = try translateSegmentsWithAllocators(result_allocator, scratch_allocator, session_allocator, segments, .{
         .source_lang = pair.source,
         .target_lang = pair.target,
         .mode = mode,
         .model_id = cfg.model_id,
-        .glossary_hash = gh,
+        .profile_hash = profile_hash,
         .glossary = g,
         .db_opt = if (db_opt) |*db| db else null,
         .cfg = cfg,
@@ -108,7 +113,7 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     var final_text = translation.translated_text;
     defer result_allocator.free(final_text);
     if (protected.doc) |doc| {
-        const restored = try markdown.restore(result_allocator, final_text, doc.protected, &warnings);
+        const restored = try doc.restore(result_allocator, final_text, &warnings);
         result_allocator.free(final_text);
         final_text = restored;
     }
@@ -121,12 +126,21 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
         .model_id = cfg.model_id,
         .runtime = "embedded",
         .cached_segments = translation.cached_segments,
-        .total_segments = countTranslatable(segments),
+        .total_segments = total_segments,
         .translated_text = final_text,
         .warnings = warnings.items,
         .elapsed_ms = elapsed,
         .source_text = source_text,
     });
+}
+
+fn cacheFingerprint(model_hash: [32]u8, glossary_hash: [32]u8, read_kind: input.InputKind) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("kotoba-tm-v1\x00");
+    hasher.update(&model_hash);
+    hasher.update(&glossary_hash);
+    hasher.update(&.{@intFromBool(read_kind == .markdown)});
+    return hasher.finalResult();
 }
 
 fn countTranslatable(segments: []const segment.Segment) usize {
@@ -201,7 +215,9 @@ test "full cache metadata counts only two translatable paragraphs" {
     paths.memory_file = memory_file;
     var cfg = config.default();
     cfg.model_id = "fixture";
-    cfg.model_path = "unused-by-test-backend.gguf";
+    cfg.model_path = try std.fs.path.join(allocator, &.{ root, "fixture.gguf" });
+    defer allocator.free(cfg.model_path);
+    try sys.writeFile(cfg.model_path, "first model");
     const opts: Options = .{ .text = "first\n\nsecond", .source_lang = .en, .target_lang = .ja, .no_glossary = true };
 
     var seeded = try run(allocator, paths, cfg, opts);
@@ -232,7 +248,7 @@ test "stdout failure after accepted row performs no compensating memory statemen
         .target_lang = .ja,
         .mode = .default,
         .model_id = cfg.model_id,
-        .glossary_hash = 0,
+        .profile_hash = .{0} ** 32,
         .glossary = .{ .terms = &.{} },
         .db_opt = &db,
         .cfg = cfg,
@@ -319,7 +335,7 @@ fn translateSegmentsWithAllocators(
             .target_lang = ctx.target_lang,
             .mode = ctx.mode,
             .model_id = ctx.model_id,
-            .glossary_hash = ctx.glossary_hash,
+            .profile_hash = ctx.profile_hash,
         };
         if (ctx.db_opt) |db| {
             if (try db.lookup(key)) |hit| {
@@ -435,6 +451,7 @@ test "protectMarkdown protects markdown source" {
         \\# Hello
         \\
         \\| A | B |
+        \\| - | - |
     ;
     const protected = try protectMarkdown(std.testing.allocator, source, .markdown);
     defer protected.deinit(std.testing.allocator);
@@ -623,14 +640,14 @@ test "translateSegments preserves valid borrowed text" {
     };
     var db = try memory.open(allocator, ":memory:");
     defer db.close();
-    const key = memory.Key{ .source_text = unicode, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = unicode, .glossary_hash = 0 };
+    const key = memory.Key{ .source_text = unicode, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = unicode, .profile_hash = .{0} ** 32 };
     try db.upsert(key, unicode);
     var ctx = TranslationContext{
         .source_lang = .en,
         .target_lang = .ja,
         .mode = .default,
         .model_id = unicode,
-        .glossary_hash = 0,
+        .profile_hash = .{0} ** 32,
         .glossary = .{ .terms = &terms },
         .db_opt = &db,
         .cfg = config.default(),
@@ -695,7 +712,7 @@ test "translateSegments validates borrowed text before side effects" {
                     std.testing.expect(c.sqlite3_next_stmt(@ptrCast(db.handle), null) == null) catch @panic("preflight statement leaked");
                     std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(@ptrCast(db.handle))) catch @panic("preflight database did not close");
                 }
-                const key = memory.Key{ .source_text = "first", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+                const key = memory.Key{ .source_text = "first", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .profile_hash = .{0} ** 32 };
                 try db.upsert(key, "saved");
                 const before = try sys.readFileAlloc(allocator, path, 1024 * 1024);
                 defer allocator.free(before);
@@ -709,7 +726,7 @@ test "translateSegments validates borrowed text before side effects" {
                     .target_lang = .ja,
                     .mode = .default,
                     .model_id = "test",
-                    .glossary_hash = 0,
+                    .profile_hash = .{0} ** 32,
                     .glossary = .{ .terms = &terms },
                     .db_opt = if (with_db) &db else null,
                     .cfg = config.default(),
@@ -762,7 +779,7 @@ test "result consumer frees failed partial payloads without appending or caching
     defer db.close();
     var translated = std.array_list.Managed(u8).init(allocator);
     defer translated.deinit();
-    const previous = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+    const previous = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .profile_hash = .{0} ** 32 };
     try consumeResult(allocator, .{ .text = try allocator.dupe(u8, "saved"), .finish_reason = .eog }, &translated, &db, previous);
 
     for ([_]contract.FinishReason{ .context, .timeout, .decode }) |reason| {
@@ -830,7 +847,7 @@ test "translateSegments sqlite lookup and upsert failures retain prior rows and 
                 .target_lang = .ja,
                 .mode = .default,
                 .model_id = cfg.model_id,
-                .glossary_hash = 0,
+                .profile_hash = .{0} ** 32,
                 .glossary = .{ .terms = &.{} },
                 .db_opt = &db,
                 .cfg = cfg,
@@ -892,7 +909,7 @@ test "result consumer accepts valid completed and token-limited text" {
         for ([_][]const u8{ "partial", "日本😀e\u{301}\u{feff}\x01\x1f", "", " \n\t" }, 0..) |bytes, index| {
             const source = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ @tagName(reason), index });
             defer allocator.free(source);
-            const key = memory.Key{ .source_text = source, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+            const key = memory.Key{ .source_text = source, .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .profile_hash = .{0} ** 32 };
             var session = backend.TestSession{ .model_id = "test", .fixture = .{ .text = bytes, .finish_reason = reason } };
             defer session.deinit();
             const result = try session.translate(allocator, .{ .model_id = "test", .source_text = source, .source_lang = .en, .target_lang = .ja, .prompt = "ignored", .timeout_sec = 1 });
@@ -934,7 +951,7 @@ fn testRejectedResultBytes(reason: contract.FinishReason) !void {
             std.testing.expect(c.sqlite3_next_stmt(@ptrCast(db.handle), null) == null) catch @panic("consumer statement leaked");
             std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_close(@ptrCast(db.handle))) catch @panic("consumer database did not close");
         }
-        const key = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .glossary_hash = 0 };
+        const key = memory.Key{ .source_text = "previous", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "test", .profile_hash = .{0} ** 32 };
         try db.upsert(key, "saved");
         const fixed_state = "UPDATE translations SET created_at=123, updated_at=456, hit_count=7";
         var update = try memory.Stmt.prepare(&db, fixed_state);
@@ -978,7 +995,7 @@ fn ownershipConfig() config.Config {
 
 fn ownershipContext(db: ?*memory.Db) TranslationContext {
     const cfg = ownershipConfig();
-    return .{ .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = cfg.model_id, .glossary_hash = 0, .glossary = .{ .terms = &.{} }, .db_opt = db, .cfg = cfg, .diagnostics_enabled = false };
+    return .{ .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = cfg.model_id, .profile_hash = .{0} ** 32, .glossary = .{ .terms = &.{} }, .db_opt = db, .cfg = cfg, .diagnostics_enabled = false };
 }
 
 fn expectReleased(counter: *const CountingAllocator) !void {
@@ -1027,6 +1044,11 @@ test "ownership/translation bounded batches" {
     defer a.free(db_path);
     var paths: xdg.Paths = undefined;
     paths.memory_file = db_path;
+    const model_path = try std.fs.path.join(a, &.{ root, "fixture.gguf" });
+    defer a.free(model_path);
+    try sys.writeFile(model_path, "fixture model");
+    var seed_config = ownershipConfig();
+    seed_config.model_path = model_path;
     const sources = [_][]const u8{ "one\n\ntwo\n\nthree\n\nfour\n\n", "one `code`\n\ntwo\n\nthree\n\nfour\n\n" };
     const expected = [_][]const u8{ "JA:one\n\nJA:two\n\nJA:three\n\nJA:four\n\n", "JA:one `code`\n\nJA:two\n\nJA:three\n\nJA:four\n\n" };
     var results = CountingAllocator.init(a);
@@ -1039,7 +1061,7 @@ test "ownership/translation bounded batches" {
     defer for (owners[0..initialized]) |*owner| owner.deinit();
     // Prime both persisted cache fixtures; measured cache-enabled calls are all hits.
     for (sources, 0..) |source, i| {
-        var seed = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, ownershipConfig(), .{ .text = source, .source_lang = .en, .target_lang = .ja, .input_kind = if (i == 1) .markdown else .text, .no_glossary = true });
+        var seed = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, seed_config, .{ .text = source, .source_lang = .en, .target_lang = .ja, .input_kind = if (i == 1) .markdown else .text, .no_glossary = true });
         seed.deinit();
     }
     for (owners, 0..) |*owner, i| {
@@ -1051,7 +1073,7 @@ test "ownership/translation bounded batches" {
             defer inputs.deinit();
             var cfg = ownershipConfig();
             cfg.model_id = try inputs.allocator().dupe(u8, "owned-model");
-            cfg.model_path = try inputs.allocator().dupe(u8, "unused.gguf");
+            cfg.model_path = try inputs.allocator().dupe(u8, model_path);
             const source = try inputs.allocator().dupe(u8, sources[kind]);
             owner.* = try runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, cfg, .{ .text = source, .source_lang = .en, .target_lang = .ja, .input_kind = if (kind == 1) .markdown else .text, .no_memory = fixture < 2, .no_glossary = true });
             initialized += 1;
@@ -1111,7 +1133,7 @@ test "ownership/translation allocator provenance" {
     {
         var db = try memory.open(stable.allocator(), ":memory:");
         defer db.close();
-        const key = memory.Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "owned-model", .glossary_hash = 0 };
+        const key = memory.Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "owned-model", .profile_hash = .{0} ** 32 };
         try db.upsert(key, "cached");
         var segments = [_]segment.Segment{ .{ .text = "Hello" }, .{ .text = "!", .translatable = false } };
         const translated = try translateSegmentsWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), &segments, ownershipContext(&db));
@@ -1185,7 +1207,7 @@ test "ownership/translation failure segment growth oom" {
     std.debug.print("ownership/segments OOM exercise_invocations={d} varying_sizes=5 long_source_bytes=6144 domains=result,scratch\n", .{runs});
 }
 
-test "ownership/translation failure cleanup and optional fallbacks" {
+test "ownership/translation cleans up after glossary and memory failures" {
     if (!@import("build_options").test_backend) return;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1198,13 +1220,18 @@ test "ownership/translation failure cleanup and optional fallbacks" {
     defer a.free(input_path);
     var paths: xdg.Paths = undefined;
     paths.memory_file = root; // A directory makes optional SQLite open fail.
-    paths.glossary_file = root; // Preserve broad glossary read-error fallback.
+    paths.glossary_file = root; // A directory makes glossary read fail.
     var results = CountingAllocator.init(a);
     var scratch = CountingAllocator.init(a);
     var stable = CountingAllocator.init(a);
     var cfg = ownershipConfig();
     cfg.memory_enabled = true;
     cfg.glossary_enabled = true;
+    try std.testing.expectError(error.IsDir, runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, cfg, .{ .text = "Hello", .source_lang = .en, .target_lang = .ja }));
+    cfg.model_path = try std.fs.path.join(a, &.{ root, "fixture.gguf" });
+    defer a.free(cfg.model_path);
+    try sys.writeFile(cfg.model_path, "fixture model");
+    paths.glossary_file = glossary_path;
     try std.testing.expectError(error.SqliteFailed, runWithAllocators(results.allocator(), scratch.allocator(), stable.allocator(), paths, cfg, .{ .text = "Hello", .source_lang = .en, .target_lang = .ja }));
     cfg.memory_enabled = false;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "glossary.toml", .data = "[[terms]]\nsource = 'old'\ntarget = 'new'\nmode = 'invalid'\n" });
@@ -1225,5 +1252,5 @@ test "ownership/translation failure cleanup and optional fallbacks" {
     try expectReleased(&results);
     try expectReleased(&scratch);
     try expectReleased(&stable);
-    std.debug.print("ownership/failures malformed=utf8,nul,glossary db-open=error glossary-read=fallback recovery=file+glossary+markdown prompt_text=data all_end=0\n", .{});
+    std.debug.print("ownership/failures malformed=utf8,nul,glossary db-open=error glossary-read=error recovery=file+glossary+markdown prompt_text=data all_end=0\n", .{});
 }

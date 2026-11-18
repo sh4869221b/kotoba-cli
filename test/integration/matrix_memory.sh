@@ -111,7 +111,7 @@ for phase, expected in zip(("before", "after"), map(json.loads, sys.argv[2:]), s
         remaining.remove(row)
         assert row[:7] == [hashlib.sha256(source.encode()).hexdigest(), source, "JA:" + source,
                            "en", "ja", "default", "matrix-memory"], "TM row values"
-        assert type(row[7]) is str and re.fullmatch(r"[0-9a-f]+", row[7]), "TM glossary hash type"
+        assert type(row[7]) is str and re.fullmatch(r"[0-9a-f]{64}", row[7]), "TM profile hash type"
         assert all(type(row[index]) is int and row[index] >= 0 for index in (8, 9, 10)), "TM integer fields"
         assert row[10] == hits, "TM hit count"
         hashes[glossary] = row[7]
@@ -187,10 +187,11 @@ matrix_memory() {
   local id kind source translated cache before after error_code error_message
   local -a flags
   matrix_memory_text_contract
+  matrix_memory_legacy_key
   matrix_memory_broken_stdout_pipe
-  for id in tm-miss tm-full-hit tm-partial-hit tm-disabled-flag tm-disabled-config \
+  for id in tm-miss tm-full-hit tm-partial-hit tm-model-replaced tm-disabled-flag tm-disabled-config \
     tm-directory-open-failure tm-corrupt-open-failure tm-statement-failure \
-    glossary-prefer glossary-protect glossary-hash-change glossary-disabled-flag glossary-disabled-config \
+    glossary-prefer glossary-protect glossary-hash-change glossary-field-boundary glossary-disabled-flag glossary-disabled-config \
     glossary-empty-key-reuse glossary-empty-key-reuse-config glossary-invalid-before-tm glossary-invalid-before-tm-absent; do
     kind=healthy source='Matrix cache alpha' cache=none flags=() error_code='' error_message=''
     before='[]' after='[["Matrix cache alpha",0,"empty"]]'
@@ -214,6 +215,20 @@ matrix_memory() {
           source=$'Matrix cache alpha\n\nMatrix cache beta' cache=partial
           after='[["Matrix cache alpha",1,"empty"],["Matrix cache beta",0,"empty"]]'
         fi ;;
+      tm-model-replaced)
+        matrix_memory_prime "$source"
+        # Keep the path, ID, size, and mtime while replacing the model bytes.
+        cp -p "$CASE_ROOT/model.gguf" "$CASE_DIR/previous-model"
+        printf 'different matrix model\n' >"$CASE_ROOT/model.gguf"
+        touch -r "$CASE_DIR/previous-model" "$CASE_ROOT/model.gguf"
+        before='[["Matrix cache alpha",0,"empty"]]'
+        after='[["Matrix cache alpha",0,"empty"],["Matrix cache alpha",0,"new-model"]]' ;;
+      glossary-field-boundary)
+        printf '[[terms]]\nsource = "ab"\ntarget = "c"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+        matrix_memory_prime "$source"
+        printf '[[terms]]\nsource = "a"\ntarget = "bc"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
+        before='[["Matrix glossary CLI",0,"ab-c"]]'
+        after='[["Matrix glossary CLI",0,"ab-c"],["Matrix glossary CLI",0,"a-bc"]]' ;;
       tm-disabled-flag) flags=(--no-memory) ;;
       tm-disabled-config) printf 'memory_enabled = false\n' >>"$XDG_CONFIG_HOME/kotoba/config.toml" ;;
       tm-directory-open-failure|tm-corrupt-open-failure|tm-statement-failure)
@@ -258,6 +273,32 @@ matrix_memory() {
     else matrix_memory_preserved; fi
     matrix_finish
   done
+}
+
+matrix_memory_legacy_key() {
+  matrix_memory_fixture tm-legacy-key healthy
+  python3 - "$CASE_DB" <<'PYTHON'
+import hashlib, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.execute('INSERT INTO translations VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        (hashlib.sha256(b'Hello').hexdigest(), 'Hello', 'old translation',
+         'en', 'ja', 'default', 'matrix-memory', '409638ee2bde459', 11, 13, 7))
+PYTHON
+  matrix_run translate Hello --from en --to ja --format json
+  matrix_memory_success 'JA:Hello' none
+  matrix_assert custom legacy-cache-miss python3 - "$CASE_DIR" <<'PYTHON'
+import json, re, sys
+from pathlib import Path
+directory = Path(sys.argv[1])
+before, after = [json.loads((directory / f'db-{phase}.json').read_text()) for phase in ('before', 'after')]
+assert before['row_count'] == 1 and after['row_count'] == 2
+old = before['rows'][0]
+assert old in after['rows']
+current = next(row for row in after['rows'] if row != old)
+assert current[:7] == [old[0], 'Hello', 'JA:Hello', *old[3:7]]
+assert re.fullmatch(r'[0-9a-f]{64}', current[7]) and current[10] == 0
+PYTHON
+  matrix_finish
 }
 
 matrix_memory_raw_snapshot() {
@@ -333,10 +374,13 @@ assert before['row_count'] == 1
 row = dict(zip(before['columns'], before['rows'][0], strict=True))
 payload = {'utf8': b'A\xffB', 'nul': b'A\x00B'}[defect]
 source, output = (payload, b'JA:Hello') if field == 'source' else (b'Hello', payload)
+empty_glossary = hashlib.sha256(b'kotoba-glossary-v1\x00').digest()
+model = hashlib.sha256(b'synthetic matrix model\n').digest()
+profile = hashlib.sha256(b'kotoba-tm-v1\x00' + model + empty_glossary + b'\x00').hexdigest()
 assert row == dict(source_hash=hashlib.sha256(b'Hello').hexdigest(), source_hex=source.hex().upper(),
     source_bytes=len(source), translated_hex=output.hex().upper(), translated_bytes=len(output),
     source_lang='en', target_lang='ja', mode='default', model_id='matrix-memory',
-    glossary_hash='409638ee2bde459', created_at=11, updated_at=13, hit_count=7)
+    glossary_hash=profile, created_at=11, updated_at=13, hit_count=7)
 print(json.dumps({'raw_equal': True, 'database_sha256': before['database_sha256'], 'row': row}))
 PY
       matrix_finish

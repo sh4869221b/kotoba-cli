@@ -36,6 +36,7 @@ pub const hfDownloadUrl = huggingface.hfDownloadUrl;
 pub const resolveHfFile = huggingface.resolveHfFile;
 
 pub const verifySha256 = checksum_module.verifySha256;
+pub const contentSha256 = checksum_module.contentSha256;
 
 test {
     _ = checksum_module;

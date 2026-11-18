@@ -73,7 +73,13 @@ pub fn ensure(path: []const u8) !void {
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !OwnedGlossary {
-    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch return .{ .allocator = allocator, .value = .{ .terms = &.{} } };
+    const data = sys.readFileAlloc(allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => switch (try sys.pathState(path)) {
+            .not_found => return .{ .allocator = allocator, .value = .{ .terms = &.{} } },
+            .present => return err,
+        },
+        else => return err,
+    };
     defer allocator.free(data);
     return parse(allocator, data);
 }
@@ -113,26 +119,36 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedGlossary {
     return .{ .allocator = allocator, .value = .{ .terms = try terms.toOwnedSlice() } };
 }
 
-pub fn hash(g: Glossary) u64 {
-    var h = std.hash.Wyhash.init(0);
+/// Fingerprint the fields in the order they are sent to the model.
+pub fn fingerprint(g: Glossary) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("kotoba-glossary-v1\x00");
     for (g.terms) |t| {
-        h.update(t.source);
-        h.update(t.target);
-        h.update(@tagName(t.mode));
+        hashField(&hasher, t.source);
+        hashField(&hasher, t.target);
+        hashField(&hasher, @tagName(t.mode));
     }
-    return h.final();
+    return hasher.finalResult();
 }
 
-test "glossary hash changes" {
-    var owner = try parse(std.testing.allocator,
-        \\[[terms]]
-        \\source = "CLI"
-        \\target = "CLI"
-        \\mode = "protect"
-    );
-    defer owner.deinit();
-    const g = owner.view();
-    try std.testing.expect(hash(g) != 0);
+fn hashField(hasher: *std.crypto.hash.sha2.Sha256, field: []const u8) void {
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, field.len, .big);
+    hasher.update(&length);
+    hasher.update(field);
+}
+
+test "glossary fingerprint distinguishes field boundaries and prompt semantics" {
+    var terms = [_]Term{.{ .source = "ab", .target = "c" }};
+    const g = Glossary{ .terms = &terms };
+    const first = fingerprint(g);
+    terms[0].comment = "not in the prompt";
+    try std.testing.expectEqual(first, fingerprint(g));
+    terms[0] = .{ .source = "a", .target = "bc" };
+    const second = fingerprint(g);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    terms[0].mode = .protect;
+    try std.testing.expect(!std.mem.eql(u8, &second, &fingerprint(g)));
 }
 
 test "glossary text contract preserves Unicode fields" {
@@ -155,7 +171,6 @@ test "glossary text contract preserves Unicode fields" {
     try std.testing.expectEqualStrings("用語😀", g.terms[0].target);
     try std.testing.expectEqual(TermMode.protect, g.terms[0].mode);
     try std.testing.expectEqualStrings("e\u{301}", g.terms[0].comment);
-    try std.testing.expectEqual(@as(u64, 0xe9bd77e300dcdb49), hash(g));
 }
 
 test "glossary text contract rejects invalid documents before allocation" {
@@ -237,7 +252,7 @@ test "ownership/glossary lifecycle repeated fields and source lifetime" {
     try std.testing.expectEqualStrings("target", owner.view().terms[0].target);
     try std.testing.expectEqualStrings("comment", owner.view().terms[0].comment);
     var literal_terms = [_]Term{.{ .source = "new", .target = "target", .comment = "comment" }};
-    try std.testing.expectEqual(hash(.{ .terms = &literal_terms }), hash(owner.view()));
+    try std.testing.expectEqual(fingerprint(.{ .terms = &literal_terms }), fingerprint(owner.view()));
 }
 
 fn exerciseGlossary(backing: std.mem.Allocator, data: []const u8, invalid: bool, runs: *usize) !void {
@@ -271,7 +286,7 @@ test "ownership/glossary oom replacement preserves old field" {
     try std.testing.expectEqualStrings("previous", previous);
 }
 
-test "ownership/glossary lifecycle load preserves broad read failure fallback" {
+test "glossary load allows absence and propagates read errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
@@ -282,9 +297,12 @@ test "ownership/glossary lifecycle load preserves broad read failure fallback" {
     var missing = try load(a, path);
     defer missing.deinit();
     try std.testing.expectEqual(@as(usize, 0), missing.view().terms.len);
-    var directory = try load(a, root);
-    defer directory.deinit();
-    try std.testing.expectEqual(@as(usize, 0), directory.view().terms.len);
+    try std.testing.expectError(error.IsDir, load(a, root));
+    const oversized = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    try sys.writeFile(path, oversized);
+    try std.testing.expectError(error.StreamTooLong, load(a, path));
     try sys.writeFile(path, ownership_fixture);
     var loaded = try load(a, path);
     defer loaded.deinit();
@@ -293,7 +311,8 @@ test "ownership/glossary lifecycle load preserves broad read failure fallback" {
     defer file.close(std.testing.io);
     try file.setPermissions(std.testing.io, .fromMode(0));
     defer file.setPermissions(std.testing.io, .fromMode(0o600)) catch unreachable;
-    var denied = try load(a, path);
-    defer denied.deinit();
-    try std.testing.expectEqual(@as(usize, 0), denied.view().terms.len);
+    // Privileged test runners may still be able to open a mode-000 file.
+    if (sys.cwd().access(sys.io(), path, .{ .read = true })) |_| {} else |err| {
+        try std.testing.expectError(err, load(a, path));
+    }
 }

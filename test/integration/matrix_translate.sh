@@ -71,7 +71,12 @@ matrix_translate_plain_extra() {
   local id="$1" source="$2" expected="$3" format="$4"
   matrix_translate_fixture "$id"
   printf '%s\n' "$expected" >"$CASE_DIR/expected.stdout"
-  matrix_run translate "$source" --from en --to ja --format "$format" --no-memory
+  if [[ "$source" == -* ]]; then
+    printf '%s' "$source" >"$CASE_STDIN"
+    matrix_run translate --from en --to ja --format "$format" --no-memory
+  else
+    matrix_run translate "$source" --from en --to ja --format "$format" --no-memory
+  fi
   matrix_assert status 0
   matrix_assert stdout "$CASE_DIR/expected.stdout"
   matrix_assert stderr "$CASE_DIR/empty"
@@ -197,6 +202,13 @@ PY
   matrix_translate_plain_extra markdown-table $'Hello\n\n| A | B |\n| - | - |\n| left | right |' $'JA:Hello\n\n| A | B |\n| - | - |\n| left | right |' markdown
   matrix_translate_plain_extra markdown-link-url 'See [site](https://example.test/a?q=1) now.' 'JA:See [site](https://example.test/a?q=1) now.' markdown
   matrix_translate_plain_extra markdown-all-protected $'```txt\nliteral\n```' $'```txt\nliteral\n```' markdown
+
+  matrix_translate_plain_extra markdown-placeholder-collision 'Keep KOTOBA_PROTECT_000001 and `code`.' 'JA:Keep KOTOBA_PROTECT_000001 and `code`.' markdown
+  matrix_translate_plain_extra markdown-escaped-pipe 'Use A \| B in prose.' 'JA:Use A \| B in prose.' markdown
+  matrix_translate_plain_extra markdown-tilde-only $'~~~zig\r\ncode\r\n~~~' $'~~~zig\r\ncode\r\n~~~' markdown
+  matrix_translate_plain_extra markdown-tilde-crlf $'Hello\r\n  ~~~~zig\r\n~~~\r\nconst answer = 42;\r\n~~~~\r\nWorld' $'JA:Hello\r\n  ~~~~zig\r\n~~~\r\nconst answer = 42;\r\n~~~~\r\nJA:World' markdown
+  matrix_translate_plain_extra markdown-frontmatter-crlf $'---\r\ntitle: Hello\r\n---\r\nBody' $'---\r\ntitle: Hello\r\n---\r\nJA:Body' markdown
+  matrix_translate_plain_extra paragraphs-crlf $'First\r\n\r\nSecond' $'JA:First\r\n\r\nJA:Second' plain
 
   for id in short symbol-only; do
     matrix_translate_fixture "ambiguous-$id"

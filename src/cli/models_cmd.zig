@@ -96,8 +96,7 @@ fn runImport(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
     }
     try validateCommandId(id);
     try models.validateGgufPath(source_path);
-    if (!sys.exists(source_path)) return errors.Error.ModelMissing;
-    if (checksum.len > 0) try models.verifySha256(allocator, source_path, checksum);
+    try models.verifyModel(.{ .path = source_path, .checksum = checksum });
     const dest_path = try models.installedPath(allocator, paths.models_dir, id);
     {
         var validation_owner = try models.loadReadOnly(allocator, paths.models_file);
@@ -191,7 +190,7 @@ fn runPullWithAcquirer(
         const file = try models.resolveHfFile(allocator, hf, hf_file);
         const url = try models.hfDownloadUrl(allocator, hf.repo, file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
-        m = .{ .id = id, .name = id, .profile = "huggingface", .languages_en = true, .languages_ja = true, .format = "gguf", .quantization = hf.quant, .path = output_path, .download_url = url, .checksum = checksum, .notes = "Downloaded from Hugging Face." };
+        m = .{ .id = id, .name = id, .profile = "huggingface", .languages_en = true, .languages_ja = true, .format = "gguf", .quantization = hf.quant, .download_url = url, .checksum = checksum, .notes = "Downloaded from Hugging Face." };
     } else if (model_url.len > 0) {
         if (positional_id.len > 0 or id.len == 0) return errors.Error.InvalidArguments;
         const uri = try models.url.parseRemote(model_url);
@@ -204,7 +203,7 @@ fn runPullWithAcquirer(
         }
         if (use_model) try validateConfigLoad(allocator, paths.config_file);
         if (output_path.len == 0) output_path = try models.installedPath(allocator, paths.models_dir, id);
-        m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .path = output_path, .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
+        m = .{ .id = id, .name = id, .profile = "url", .languages_en = true, .languages_ja = true, .format = "gguf", .download_url = model_url, .checksum = checksum, .notes = "Downloaded from direct HTTPS URL." };
     } else {
         if (positional_id.len == 0 or id.len > 0) return errors.Error.InvalidArguments;
         try validateCommandId(positional_id);
@@ -219,10 +218,11 @@ fn runPullWithAcquirer(
         if (models.url.reusableUrl(m.download_url).len == 0) return errors.Error.ModelSourceRequired;
         id = m.id;
         if (output_path.len == 0) output_path = if (m.path.len > 0) m.path else try models.installedPath(allocator, paths.models_dir, id);
-        m.path = output_path;
         if (checksum.len > 0) m.checksum = checksum;
     }
     try models.validateGgufPath(output_path);
+    output_path = try sys.absolutePathAlloc(allocator, output_path);
+    m.path = output_path;
     var request_model = m;
     if (models.url.isRemote(m.download_url)) {
         request_model.download_url = try models.url.requestUrl(m.download_url);
@@ -232,8 +232,7 @@ fn runPullWithAcquirer(
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
     try acquirer(allocator, request_model, output_path, false);
-    m.path = output_path;
-    try models.verifyModel(allocator, m);
+    try models.verifyModel(m);
     try models.upsert(allocator, paths.models_file, m);
     if (use_model) try selectModel(allocator, paths, id, output_path);
     try sys.stdoutPrint("pulled {s}\n", .{id});
@@ -248,7 +247,7 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
     defer list_owner.deinit();
     const list = list_owner.view();
     const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
-    try models.verifyModel(allocator, m);
+    try models.verifyModel(m);
     try xdg.ensureDirs(paths);
     try selectModel(allocator, paths, m.id, m.path);
     try sys.stdoutPrint("using {s}\n", .{m.id});
@@ -272,7 +271,7 @@ fn runVerify(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const [
         if (cfg.model_path.len == 0) return errors.Error.ModelNotSelected;
         m.path = cfg.model_path;
     }
-    try models.verifyModel(allocator, m);
+    try models.verifyModel(m);
     try sys.stdoutPrint("verified {s}\n", .{id});
     return 0;
 }
@@ -350,7 +349,9 @@ pub fn selectModel(allocator: std.mem.Allocator, paths: xdg.Paths, id: []const u
     var cfg = try loadConfigOrDefault(allocator, paths.config_file);
     defer cfg.deinit();
     try cfg.setValue("model_id", id);
-    try cfg.setValue("model_path", model_path);
+    const absolute_path = try sys.absolutePathAlloc(allocator, model_path);
+    defer allocator.free(absolute_path);
+    try cfg.setValue("model_path", absolute_path);
     try config.save(paths.config_file, cfg.view());
 }
 
@@ -476,7 +477,7 @@ test "secret URL pull pipeline keeps request transient" {
         try std.testing.expectEqualStrings(checksum, saved.checksum);
         try std.testing.expectEqualStrings(dest, saved.path);
         try std.testing.expectEqualStrings(Fixture.bytes, try sys.readFileAlloc(allocator, dest, 1024));
-        try models.verifySha256(allocator, dest, checksum);
+        try models.verifySha256(dest, checksum);
         const registry = try sys.readFileAlloc(allocator, paths.models_file, 8192);
         try std.testing.expect(std.mem.indexOf(u8, registry, "KOTOBA_") == null);
     }
@@ -487,7 +488,7 @@ test "secret URL pull pipeline keeps request transient" {
     try std.testing.expectEqual(@as(usize, 4), Fixture.calls);
     try std.testing.expectEqualStrings(saved_before_failure, try sys.readFileAlloc(allocator, paths.models_file, 8192));
     try std.testing.expectEqualStrings(Fixture.bytes, try sys.readFileAlloc(allocator, dest, 1024));
-    try models.verifySha256(allocator, dest, checksum);
+    try models.verifySha256(dest, checksum);
     Fixture.expected = "https://huggingface.co/example/repo/resolve/main/model.gguf";
     try std.testing.expectEqual(@as(u8, 0), try runPullWithAcquirer(allocator, paths, &.{ "--hf-repo", "example/repo", "--hf-file", "model.gguf", "--id", "hf36", "--checksum", checksum }, Fixture.acquire));
     try std.testing.expectEqual(@as(usize, 5), Fixture.calls);
@@ -496,7 +497,7 @@ test "secret URL pull pipeline keeps request transient" {
     const hf_saved = models.find(hf_owner.view(), "hf36").?;
     try std.testing.expectEqualStrings(Fixture.expected, hf_saved.download_url);
     try std.testing.expectEqualStrings(Fixture.expected, hf_saved.source_url);
-    try models.verifySha256(allocator, hf_saved.path, checksum);
+    try models.verifySha256(hf_saved.path, checksum);
     capture.restore();
     try std.testing.expectEqualStrings("pulled signed36\npulled signed36\npulled signed36\npulled hf36\n", try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 1024));
     var iterator = tmp.dir.iterate();
@@ -542,7 +543,7 @@ test "secret URL pull without reusable source fails before acquirer" {
         try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
         try std.testing.expectEqualStrings(registry, try sys.readFileAlloc(allocator, paths.models_file, 8192));
         try std.testing.expectEqualStrings("installed model bytes", try sys.readFileAlloc(allocator, dest, 1024));
-        try models.verifySha256(allocator, dest, checksum);
+        try models.verifySha256(dest, checksum);
     }
     const oversize = try allocator.alloc(u8, models.url.max_length + 1);
     @memset(oversize, 'a');
@@ -550,7 +551,7 @@ test "secret URL pull without reusable source fails before acquirer" {
     for ([_][]const u8{ "https://@models.example.invalid/a", "https:///a", "https://models.example.invalid/a#\t", oversize }) |source| {
         try std.testing.expectError(error.InvalidArguments, runPullWithAcquirer(allocator, paths, &.{ "--model-url", source, "--id", "signed36", "--checksum", checksum }, Fixture.acquire));
         try std.testing.expectEqual(@as(usize, 0), Fixture.calls);
-        try models.verifySha256(allocator, dest, checksum);
+        try models.verifySha256(dest, checksum);
     }
     capture.restore();
     try std.testing.expectEqualStrings("", try sys.readFileAlloc(allocator, try std.fs.path.join(allocator, &.{ root, "stdout" }), 1024));

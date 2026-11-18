@@ -36,6 +36,13 @@ now exits 1 with an instruction to run `models pull` or provide `--model-path`.
 forms; an HTTPS download completes only when its normal download and checksum
 verification succeed.
 
+When the registry supplies a SHA-256 checksum, `init` verifies it before
+selecting that model. Model paths supplied to `init`, `models pull --output`,
+and `config set model_path` are anchored to the working directory when saved.
+Symlinks are preserved, so a symlink can follow a model update. If an older
+config already contains a relative path, reselect the model from the directory
+where that path resolves.
+
 ### Model URL privacy and migration
 
 Remote model URLs containing userinfo (including an empty userinfo) are rejected.
@@ -360,9 +367,19 @@ KOTOBA_CUDA_MODEL=/path/to/model.gguf bash test/integration/cuda_smoke.sh
 If `KOTOBA_CUDA_MODEL` or `nvidia-smi` is unavailable, the CUDA smoke script
 prints a skip message and exits successfully.
 
-Markdown translation protects code spans, code fences, URLs, frontmatter, and
-Markdown tables. Tables are intentionally left untranslated in v1.0 to avoid
-breaking their structure.
+Markdown translation protects code spans, backtick and tilde code fences,
+URLs, YAML front matter, and tables with a header and delimiter row. Tables
+are kept verbatim. Escaped pipes in prose stay in the translation input.
+Blank lines split paragraphs and keep their original LF or CRLF bytes.
+
+`kotoba glossary validate` prints a SHA-256 fingerprint of the glossary
+fields sent to the model. An absent glossary is treated as empty. Read and
+parse errors in an existing glossary fail validation and translation.
+
+Translation Memory keys include the SHA-256 of the selected model file,
+the glossary fingerprint, and the input format. With memory enabled,
+Kotoba reads the model file before the first cache lookup. Existing rows
+using the old cache key remain in the database and will miss lookups.
 
 Configuration follows XDG paths:
 

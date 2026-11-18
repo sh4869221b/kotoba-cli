@@ -1,93 +1,270 @@
 const std = @import("std");
 
-pub const Protected = struct {
-    token: []const u8,
-    original: []const u8,
-};
+const token_base = "KOTOBA_PROTECT_";
 
 pub const Document = struct {
     text: []const u8,
-    protected: []Protected,
+    token_prefix: []const u8,
+    protected: [][]const u8,
 
     pub fn deinit(self: Document, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
-        for (self.protected) |p| {
-            allocator.free(p.token);
-            allocator.free(p.original);
-        }
+        allocator.free(self.token_prefix);
+        for (self.protected) |original| allocator.free(original);
         allocator.free(self.protected);
+    }
+
+    /// Scan the translation once so restored source bytes are never interpreted as tokens.
+    pub fn restore(self: Document, allocator: std.mem.Allocator, text: []const u8, warnings: *std.array_list.Managed([]const u8)) ![]u8 {
+        if (self.protected.len == 0) return allocator.dupe(u8, text);
+        const seen = try allocator.alloc(bool, self.protected.len);
+        defer allocator.free(seen);
+        @memset(seen, false);
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, text, start, self.token_prefix)) |pos| {
+            const token = tokenAt(text[pos..], self.token_prefix);
+            if (token != null and token.?.index < self.protected.len) {
+                const entry = token.?;
+                try out.appendSlice(text[start..pos]);
+                try out.appendSlice(self.protected[entry.index]);
+                seen[entry.index] = true;
+                start = pos + entry.len;
+            } else {
+                const next = pos + self.token_prefix.len;
+                try out.appendSlice(text[start..next]);
+                start = next;
+            }
+        }
+        try out.appendSlice(text[start..]);
+        for (seen) |found| {
+            if (!found) try warnings.append("protected token missing from translation");
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+pub fn tokenAt(text: []const u8, prefix: []const u8) ?struct { index: usize, len: usize } {
+    if (!std.mem.startsWith(u8, text, prefix) or text.len <= prefix.len) return null;
+    if (text[prefix.len] == '0') return null;
+    var end = prefix.len;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    if (end == prefix.len or end == text.len or text[end] != '_') return null;
+    const number = std.fmt.parseUnsigned(usize, text[prefix.len..end], 10) catch return null;
+    return .{ .index = number - 1, .len = end + 1 };
+}
+
+fn tokenPrefix(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, text, token_base) == null) return allocator.dupe(u8, token_base);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const prefix = try std.fmt.allocPrint(allocator, token_base ++ "{s}_{d}_", .{ &hex, attempt });
+        if (std.mem.indexOf(u8, text, prefix) == null) return prefix;
+        allocator.free(prefix);
+    }
+}
+
+const Protection = struct {
+    text: std.array_list.Managed(u8),
+    originals: std.array_list.Managed([]const u8),
+    token_prefix: []const u8,
+
+    fn add(self: *Protection, original: []const u8) !void {
+        if (original.len == 0) return;
+        const allocator = self.originals.allocator;
+        {
+            const copy = try allocator.dupe(u8, original);
+            errdefer allocator.free(copy);
+            try self.originals.append(copy);
+        }
+        try self.text.print("{s}{d}_", .{ self.token_prefix, self.originals.items.len });
     }
 };
 
 pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
-    var out = std.array_list.Managed(u8).init(allocator);
-    errdefer out.deinit();
-    var protected = std.array_list.Managed(Protected).init(allocator);
+    const prefix = try tokenPrefix(allocator, text);
+    errdefer allocator.free(prefix);
+    var protection: Protection = .{
+        .text = .init(allocator),
+        .originals = .init(allocator),
+        .token_prefix = prefix,
+    };
     errdefer {
-        for (protected.items) |p| {
-            allocator.free(p.token);
-            allocator.free(p.original);
-        }
-        protected.deinit();
+        protection.text.deinit();
+        for (protection.originals.items) |original| allocator.free(original);
+        protection.originals.deinit();
     }
-    var line_no: usize = 0;
-    var in_fence = false;
-    var frontmatter = false;
+
+    const frontmatter_end = frontMatterEnd(text);
+    var fence: ?Fence = null;
+    var table: enum { outside, delimiter, body } = .outside;
     var start: usize = 0;
-    while (start <= text.len) : (line_no += 1) {
-        const nl = std.mem.indexOfScalarPos(u8, text, start, '\n');
-        const end = nl orelse text.len;
-        const line = text[start..end];
-        const is_frontmatter_delim = line_no == 0 and std.mem.eql(u8, line, "---");
-        if (is_frontmatter_delim) frontmatter = true;
-        if (frontmatter or in_fence or std.mem.startsWith(u8, line, "```") or isTableLine(line)) {
-            if (std.mem.startsWith(u8, line, "```")) in_fence = !in_fence;
-            if (frontmatter and line_no > 0 and std.mem.eql(u8, line, "---")) frontmatter = false;
-            try addProtected(allocator, &out, &protected, line);
+    while (start < text.len) {
+        const line = lineAt(text, start);
+        if (start < frontmatter_end) {
+            try protection.add(line.body);
+        } else if (fence) |open| {
+            try protection.add(line.body);
+            if (fenceAt(line.body)) |close| {
+                if (close.marker == open.marker and close.len >= open.len and close.rest.len == 0) fence = null;
+            }
+        } else if (openingFence(line.body)) |open| {
+            table = .outside;
+            fence = open;
+            try protection.add(line.body);
+        } else if (table == .delimiter) {
+            table = .body;
+            try protection.add(line.body);
         } else {
-            try protectInline(allocator, &out, &protected, line);
+            const cells = tableCells(line.body, false);
+            if (cells == null) {
+                table = .outside;
+            } else if (table == .outside and line.next < text.len and
+                tableCells(lineAt(text, line.next).body, true) == cells)
+            {
+                table = .delimiter;
+            }
+            if (table != .outside) {
+                try protection.add(line.body);
+            } else {
+                try protectInline(&protection, line.body);
+            }
         }
-        if (nl == null) break;
-        try out.append('\n');
-        start = end + 1;
+        try protection.text.appendSlice(text[start + line.body.len .. line.next]);
+        start = line.next;
     }
-    const owned_text = try out.toOwnedSlice();
+    const owned_text = try protection.text.toOwnedSlice();
     errdefer allocator.free(owned_text);
-    const owned_protected = try protected.toOwnedSlice();
-    return .{ .text = owned_text, .protected = owned_protected };
+    const originals = try protection.originals.toOwnedSlice();
+    return .{ .text = owned_text, .token_prefix = prefix, .protected = originals };
 }
 
-fn isTableLine(line: []const u8) bool {
+fn lineAt(text: []const u8, start: usize) struct { body: []const u8, next: usize } {
+    const lf = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return .{ .body = text[start..], .next = text.len };
+    const body_end = if (lf > start and text[lf - 1] == '\r') lf - 1 else lf;
+    return .{ .body = text[start..body_end], .next = lf + 1 };
+}
+
+fn frontMatterEnd(text: []const u8) usize {
+    const first = lineAt(text, 0);
+    if (!std.mem.eql(u8, first.body, "---")) return 0;
+    var pos = first.next;
+    while (pos < text.len) {
+        const line = lineAt(text, pos);
+        if (std.mem.eql(u8, line.body, "---")) return line.next;
+        pos = line.next;
+    }
+    return 0;
+}
+
+const Fence = struct { marker: u8, len: usize, rest: []const u8 };
+
+fn fenceAt(line: []const u8) ?Fence {
+    const trimmed = std.mem.trimStart(u8, line, " ");
+    if (line.len - trimmed.len > 3 or trimmed.len == 0) return null;
+    const marker = trimmed[0];
+    if (marker != '`' and marker != '~') return null;
+    const len = runEnd(trimmed, 0);
+    if (len < 3) return null;
+    return .{ .marker = marker, .len = len, .rest = std.mem.trim(u8, trimmed[len..], " \t") };
+}
+
+fn openingFence(line: []const u8) ?Fence {
+    const fence = fenceAt(line) orelse return null;
+    if (fence.marker == '`' and std.mem.indexOfScalar(u8, fence.rest, '`') != null) return null;
+    return fence;
+}
+
+fn runEnd(line: []const u8, start: usize) usize {
+    var end = start + 1;
+    while (end < line.len and line[end] == line[start]) end += 1;
+    return end;
+}
+
+fn codeSpanEnd(line: []const u8, start: usize, open_end: usize) ?usize {
+    var pos = open_end;
+    while (std.mem.indexOfScalarPos(u8, line, pos, '`')) |tick| {
+        pos = runEnd(line, tick);
+        if (pos - tick == open_end - start) return pos;
+    }
+    return null;
+}
+
+/// Count cells separated by unescaped pipes outside matched inline code.
+fn tableCells(line: []const u8, delimiter: bool) ?usize {
     const trimmed = std.mem.trim(u8, line, " \t");
-    return trimmed.len > 0 and std.mem.indexOfScalar(u8, trimmed, '|') != null;
+    if (trimmed.len == 0) return null;
+    var saw_pipe = trimmed[0] == '|';
+    var start: usize = @intFromBool(saw_pipe);
+    var cells: usize = 0;
+    var pos = start;
+    while (pos < trimmed.len) {
+        switch (trimmed[pos]) {
+            '\\' => pos += @min(2, trimmed.len - pos),
+            '`' => {
+                const open_end = runEnd(trimmed, pos);
+                pos = codeSpanEnd(trimmed, pos, open_end) orelse open_end;
+            },
+            '|' => {
+                if (delimiter and !isDelimiterCell(trimmed[start..pos])) return null;
+                saw_pipe = true;
+                cells += 1;
+                pos += 1;
+                start = pos;
+            },
+            else => pos += 1,
+        }
+    }
+    if (start < trimmed.len) {
+        if (delimiter and !isDelimiterCell(trimmed[start..])) return null;
+        cells += 1;
+    }
+    // A delimiter can omit its outer pipes for a one-column header.
+    return if ((saw_pipe or delimiter) and cells > 0) cells else null;
 }
 
-fn protectInline(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), protected: *std.array_list.Managed(Protected), line: []const u8) !void {
+fn isDelimiterCell(text: []const u8) bool {
+    var cell = std.mem.trim(u8, text, " \t");
+    if (std.mem.startsWith(u8, cell, ":")) cell = cell[1..];
+    if (std.mem.endsWith(u8, cell, ":")) cell = cell[0 .. cell.len - 1];
+    if (cell.len == 0) return false;
+    for (cell) |ch| {
+        if (ch != '-') return false;
+    }
+    return true;
+}
+
+fn protectInline(protection: *Protection, line: []const u8) !void {
     var i: usize = 0;
     while (i < line.len) {
         if (std.mem.startsWith(u8, line[i..], "![")) {
             if (findMarkdownLinkEnd(line, i)) |end| {
-                try addProtected(allocator, out, protected, line[i .. end + 1]);
+                try protection.add(line[i .. end + 1]);
                 i = end + 1;
             } else {
-                try out.append(line[i]);
+                try protection.text.append(line[i]);
                 i += 1;
             }
         } else if (line[i] == '`') {
-            const end = std.mem.indexOfScalarPos(u8, line, i + 1, '`') orelse line.len - 1;
-            try addProtected(allocator, out, protected, line[i .. end + 1]);
-            i = end + 1;
+            const end = codeSpanEnd(line, i, runEnd(line, i)) orelse line.len;
+            try protection.add(line[i..end]);
+            i = end;
         } else if (line[i] == '<') {
             const end = std.mem.indexOfScalarPos(u8, line, i + 1, '>') orelse line.len - 1;
-            try addProtected(allocator, out, protected, line[i .. end + 1]);
+            try protection.add(line[i .. end + 1]);
             i = end + 1;
         } else if (std.mem.startsWith(u8, line[i..], "http://") or std.mem.startsWith(u8, line[i..], "https://")) {
             var end = i;
             while (end < line.len and !std.ascii.isWhitespace(line[end])) end += 1;
-            try addProtected(allocator, out, protected, line[i..end]);
+            try protection.add(line[i..end]);
             i = end;
         } else {
-            try out.append(line[i]);
+            try protection.text.append(line[i]);
             i += 1;
         }
     }
@@ -97,37 +274,6 @@ fn findMarkdownLinkEnd(line: []const u8, start: usize) ?usize {
     const close_bracket = std.mem.indexOfScalarPos(u8, line, start, ']') orelse return null;
     if (close_bracket + 1 >= line.len or line[close_bracket + 1] != '(') return null;
     return std.mem.indexOfScalarPos(u8, line, close_bracket + 2, ')');
-}
-
-fn addProtected(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), protected: *std.array_list.Managed(Protected), original: []const u8) !void {
-    const token = try std.fmt.allocPrint(allocator, "KOTOBA_PROTECT_{d:0>6}", .{protected.items.len + 1});
-    var token_owned = true;
-    errdefer if (token_owned) allocator.free(token);
-    const original_copy = try allocator.dupe(u8, original);
-    var original_owned = true;
-    errdefer if (original_owned) allocator.free(original_copy);
-    try protected.append(.{ .token = token, .original = original_copy });
-    token_owned = false;
-    original_owned = false;
-    try out.appendSlice(token);
-}
-
-/// Restores protected bytes into caller-owned output. Warning entries borrow static text.
-/// On error, `warnings` remains valid and deinitializable, and may contain entries appended
-/// before the failing allocation; warning entries are not rolled back.
-pub fn restore(allocator: std.mem.Allocator, text: []const u8, protected: []Protected, warnings: *std.array_list.Managed([]const u8)) ![]u8 {
-    var out = try allocator.dupe(u8, text);
-    errdefer allocator.free(out);
-    for (protected) |p| {
-        if (std.mem.indexOf(u8, out, p.token) == null) {
-            try warnings.append("protected token missing from translation");
-            continue;
-        }
-        const replaced = try std.mem.replaceOwned(u8, allocator, out, p.token, p.original);
-        allocator.free(out);
-        out = replaced;
-    }
-    return out;
 }
 
 test "protects code and table" {
@@ -165,7 +311,7 @@ test "protect and restore round trip preserves protected edge tokens" {
 
     var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
     defer warnings.deinit();
-    const restored = try restore(std.testing.allocator, doc.text, doc.protected, &warnings);
+    const restored = try doc.restore(std.testing.allocator, doc.text, &warnings);
     defer std.testing.allocator.free(restored);
 
     try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
@@ -178,7 +324,7 @@ test "restore appends warning when token missing" {
 
     var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
     defer warnings.deinit();
-    const restored = try restore(std.testing.allocator, "translation without protected tokens", doc.protected, &warnings);
+    const restored = try doc.restore(std.testing.allocator, "translation without protected tokens", &warnings);
     defer std.testing.allocator.free(restored);
 
     try std.testing.expect(warnings.items.len >= 1);
@@ -226,7 +372,7 @@ test "protect and restore preserves nested markdown" {
 
     var warnings = std.array_list.Managed([]const u8).init(std.testing.allocator);
     defer warnings.deinit();
-    const restored = try restore(std.testing.allocator, doc.text, doc.protected, &warnings);
+    const restored = try doc.restore(std.testing.allocator, doc.text, &warnings);
     defer std.testing.allocator.free(restored);
 
     try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
@@ -244,7 +390,7 @@ fn checkRestoreAllocationFailures(allocator: std.mem.Allocator, source: []const 
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     defer warnings.deinit();
     const translation = if (missing) "translated" else doc.text;
-    const restored = try restore(allocator, translation, doc.protected, &warnings);
+    const restored = try doc.restore(allocator, translation, &warnings);
     defer allocator.free(restored);
     if (missing) {
         try std.testing.expectEqualStrings("translated", restored);
@@ -257,17 +403,15 @@ fn checkRestoreAllocationFailures(allocator: std.mem.Allocator, source: []const 
 }
 
 fn checkRepeatedTokenRestoreAllocationFailures(allocator: std.mem.Allocator) !void {
-    var protected = [_]Protected{.{
-        .token = "TOKEN",
-        .original = "expanded protected bytes with enough length to grow output",
-    }};
-    const translated = "TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN TOKEN";
+    const doc = try protect(allocator, "`expanded protected bytes with enough length to grow output`");
+    defer doc.deinit(allocator);
+    const translated = "KOTOBA_PROTECT_1_ " ** 12;
     var warnings = std.array_list.Managed([]const u8).init(allocator);
     defer warnings.deinit();
-    const restored = try restore(allocator, translated, protected[0..], &warnings);
+    const restored = try doc.restore(allocator, translated, &warnings);
     defer allocator.free(restored);
     try std.testing.expect(restored.len > translated.len);
-    try std.testing.expect(std.mem.indexOf(u8, restored, "TOKEN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, restored, doc.token_prefix) == null);
     try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
 }
 
@@ -291,4 +435,54 @@ test "ownership/markdown allocation failures clean partial ownership transfers" 
         true,
     });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRepeatedTokenRestoreAllocationFailures, .{});
+}
+
+test "source placeholder strings survive Markdown protection and restoration" {
+    const allocator = std.testing.allocator;
+    const source = "KOTOBA_PROTECT_000001 `code KOTOBA_PROTECT_2_` and `more` KOTOBA_PROTECT_1_";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), doc.protected.len);
+    try std.testing.expect(std.mem.indexOf(u8, source, doc.token_prefix) == null);
+
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
+    defer warnings.deinit();
+    const restored = try doc.restore(allocator, doc.text, &warnings);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings(source, restored);
+    try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+}
+
+test "Markdown block recognition preserves CRLF and matches code fence markers and lengths" {
+    const allocator = std.testing.allocator;
+    const source = "---\r\ntitle: Example\r\n---\r\n\r\n" ++
+        "   ~~~~sh\r\n~~~\r\n```\r\nstill fenced\r\n ~~ ~\r\n~~~~~ \r\n\r\n" ++
+        "Prose with A \\| B.\r\n";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 9), doc.protected.len);
+    try std.testing.expectEqualStrings("still fenced", doc.protected[6]);
+    try std.testing.expect(std.mem.endsWith(u8, doc.text, "\r\n\r\nProse with A \\| B.\r\n"));
+
+    var warnings = std.array_list.Managed([]const u8).init(allocator);
+    defer warnings.deinit();
+    const restored = try doc.restore(allocator, doc.text, &warnings);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings(source, restored);
+    try std.testing.expectEqual(@as(usize, 0), warnings.items.len);
+}
+
+test "Markdown tables require a header and an aligned delimiter row" {
+    const allocator = std.testing.allocator;
+    const source = "Use A | B in prose.\nUse A \\| B.\nUse `A | B` inline.\n\n" ++
+        "Header \\| A | `B | C`\n:--- | ---:\nSome \\| text | value\n\n" ++
+        "| One |\n---\n| Body |\n";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expect(std.mem.startsWith(u8, doc.text, "Use A | B in prose.\nUse A \\| B.\nUse "));
+    const expected = [_][]const u8{
+        "`A | B`", "Header \\| A | `B | C`", ":--- | ---:", "Some \\| text | value", "| One |", "---", "| Body |",
+    };
+    try std.testing.expectEqual(expected.len, doc.protected.len);
+    for (expected, doc.protected) |original, actual| try std.testing.expectEqualStrings(original, actual);
 }

@@ -87,7 +87,7 @@ fn runChecks(command_allocator: std.mem.Allocator, paths: xdg.Paths, checks: *st
         try checks.append(.{ .name = "models", .status = .@"error", .code = app_err.code.asText(), .message = app_err.message });
         ok = false;
         if (!have_config) return print(command_allocator, checks.items, ok, json);
-        try appendModelChecks(command_allocator, null, cfg, checks, &ok);
+        try appendModelChecks(null, cfg, checks, &ok);
         return continueAfterModelCheck(command_allocator, paths, cfg, checks, ok, json);
     };
     defer list_owner.deinit();
@@ -95,7 +95,7 @@ fn runChecks(command_allocator: std.mem.Allocator, paths: xdg.Paths, checks: *st
     try checks.append(.{ .name = "models", .status = .ok, .message = "models.toml is readable" });
     try appendUnsafeRemoteUrlCheck(list, checks);
     if (!have_config) return print(command_allocator, checks.items, ok, json);
-    try appendModelChecks(command_allocator, list, cfg, checks, &ok);
+    try appendModelChecks(list, cfg, checks, &ok);
     return continueAfterModelCheck(command_allocator, paths, cfg, checks, ok, json);
 }
 
@@ -113,7 +113,7 @@ fn appendUnsafeRemoteUrlCheck(list: models.List, checks: *std.array_list.Managed
     }
 }
 
-fn appendModelChecks(allocator: std.mem.Allocator, list_opt: ?models.List, cfg: config.Config, checks: *std.array_list.Managed(Check), ok: *bool) !void {
+fn appendModelChecks(list_opt: ?models.List, cfg: config.Config, checks: *std.array_list.Managed(Check), ok: *bool) !void {
     if (cfg.model_id.len == 0 or cfg.model_path.len == 0) {
         try checks.append(.{ .name = "selected_model", .status = .@"error", .code = "model_not_selected", .message = "no model is selected" });
         ok.* = false;
@@ -130,7 +130,7 @@ fn appendModelChecks(allocator: std.mem.Allocator, list_opt: ?models.List, cfg: 
         if (models.find(list, cfg.model_id)) |m| {
             try checks.append(.{ .name = "model_registry", .status = .ok, .message = "selected model is registered" });
             if (m.checksum.len > 0) {
-                models.verifySha256(allocator, cfg.model_path, m.checksum) catch {
+                models.verifySha256(cfg.model_path, m.checksum) catch {
                     try checks.append(.{ .name = "model_checksum", .status = .@"error", .code = "checksum_failed", .message = "configured model checksum does not match registry" });
                     ok.* = false;
                     return;

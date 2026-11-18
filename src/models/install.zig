@@ -37,7 +37,7 @@ pub fn acquireWithDownloader(
     } else {
         try copyFile(m.download_url, temp_path);
     }
-    if (m.checksum.len > 0) try checksum.verifySha256(allocator, temp_path, m.checksum);
+    if (m.checksum.len > 0) try checksum.verifySha256(temp_path, m.checksum);
     try sys.renameFile(temp_path, dest_path);
 }
 
@@ -46,7 +46,7 @@ pub fn installLocalFile(allocator: std.mem.Allocator, src: []const u8, dest: []c
     defer allocator.free(temp_path);
     errdefer sys.deleteFile(temp_path);
     try sys.copyFile(src, temp_path);
-    if (expected_checksum.len > 0) try checksum.verifySha256(allocator, temp_path, expected_checksum);
+    if (expected_checksum.len > 0) try checksum.verifySha256(temp_path, expected_checksum);
     try sys.renameFile(temp_path, dest);
 }
 
@@ -164,7 +164,7 @@ test "secret URL acquire preserves signed query and excludes fragment" {
     const installed = try sys.readFileAlloc(std.testing.allocator, dest, 1024);
     defer std.testing.allocator.free(installed);
     try std.testing.expectEqualStrings("remote bytes", installed);
-    try checksum.verifySha256(std.testing.allocator, dest, expected_checksum);
+    try checksum.verifySha256(dest, expected_checksum);
     try expectNoTempEntries(root);
 }
 
@@ -259,7 +259,7 @@ test "secret URL local paths preserve question and hash characters" {
         const identity = try url_policy.sourceIdentity(std.testing.allocator, value);
         defer std.testing.allocator.free(identity);
         try std.testing.expectEqualStrings("", identity);
-        try checksum.verifySha256(std.testing.allocator, dest, expected_checksum);
+        try checksum.verifySha256(dest, expected_checksum);
         try expectNoTempEntries(root);
     }
     try acquireWithDownloader(std.testing.allocator, .{

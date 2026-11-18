@@ -27,7 +27,11 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
         try validateConfigSet(allocator, cmd_args[1], cmd_args[2]);
         var cfg = try config.load(allocator, paths.config_file);
         defer cfg.deinit();
-        try cfg.setValue(cmd_args[1], cmd_args[2]);
+        const value = if (std.mem.eql(u8, cmd_args[1], "model_path") and cmd_args[2].len > 0)
+            try sys.absolutePathAlloc(allocator, cmd_args[2])
+        else
+            cmd_args[2];
+        try cfg.setValue(cmd_args[1], value);
         try config.save(paths.config_file, cfg.view());
         return 0;
     }

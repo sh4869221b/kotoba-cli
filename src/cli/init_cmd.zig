@@ -45,17 +45,17 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     var selected_registry_model: ?models.Model = null;
     if (model_path.len == 0 and model_id.len > 0) {
         if (models.find(list, model_id)) |m| {
-            selected_registry_model = m;
-            if (m.path.len > 0 and sys.exists(m.path)) {
-                model_path = m.path;
-            } else {
+            models.verifyModel(m) catch |err| {
+                if (err != error.ModelMissing) return err;
                 sys.stderrPrint("kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\n", .{}) catch {};
-                return errors.Error.ModelMissing;
-            }
+                return err;
+            };
+            model_path = try sys.absolutePathAlloc(allocator, m.path);
         } else return errors.Error.InvalidArguments;
     }
     if (explicit_model_path) {
-        var registry_model = selected_registry_model orelse models.find(list, model_id) orelse models.Model{
+        model_path = try sys.absolutePathAlloc(allocator, model_path);
+        var registry_model = models.find(list, model_id) orelse models.Model{
             .id = model_id,
             .name = model_id,
             .profile = "local",
@@ -65,7 +65,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
             .notes = "Configured during init.",
         };
         registry_model.path = model_path;
-        if (registry_model.checksum.len > 0) try models.verifySha256(allocator, model_path, registry_model.checksum);
+        try models.verifyModel(registry_model);
         selected_registry_model = registry_model;
     }
     var cfg = config.load(allocator, paths.config_file) catch |err| switch (err) {
@@ -79,7 +79,7 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
     try models.ensure(paths.models_file);
     try glossary.ensure(paths.glossary_file);
     if (selected_registry_model) |registry_model| {
-        if (explicit_model_path) try models.upsert(allocator, paths.models_file, registry_model);
+        try models.upsert(allocator, paths.models_file, registry_model);
     }
     try config.save(paths.config_file, cfg.view());
     var db = try memory.open(allocator, paths.memory_file);

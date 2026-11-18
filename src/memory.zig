@@ -25,7 +25,9 @@ pub const Key = struct {
     target_lang: lang.Language,
     mode: config.Mode,
     model_id: []const u8,
-    glossary_hash: u64,
+    // Stored in the existing glossary_hash TEXT column. Legacy short hashes
+    // miss lookups and remain available to memory status and clear.
+    profile_hash: [32]u8,
 };
 
 pub const Hit = struct {
@@ -148,13 +150,12 @@ pub const Db = struct {
         try text_contract.validate(key.model_id);
         const hash_text = try sourceHash(self.allocator, key.source_text);
         defer self.allocator.free(hash_text);
-        const gh = try std.fmt.allocPrint(self.allocator, "{x}", .{key.glossary_hash});
-        defer self.allocator.free(gh);
+        const profile_hex = std.fmt.bytesToHex(key.profile_hash, .lower);
 
         const sql = "SELECT source_text, translated_text FROM translations WHERE source_hash=? AND source_lang=? AND target_lang=? AND mode=? AND model_id=? AND glossary_hash=?;";
         var stmt = try Stmt.prepare(self, sql);
         defer stmt.deinit();
-        try bindKey(&stmt, key, hash_text, gh);
+        try bindKey(&stmt, key, hash_text, &profile_hex);
 
         const rc = try stmt.step();
         if (rc == c.SQLITE_ROW) {
@@ -173,13 +174,12 @@ pub const Db = struct {
     fn bump(self: *Db, key: Key) !void {
         const hash_text = try sourceHash(self.allocator, key.source_text);
         defer self.allocator.free(hash_text);
-        const gh = try std.fmt.allocPrint(self.allocator, "{x}", .{key.glossary_hash});
-        defer self.allocator.free(gh);
+        const profile_hex = std.fmt.bytesToHex(key.profile_hash, .lower);
 
         const sql = "UPDATE translations SET hit_count=hit_count+1, updated_at=strftime('%s','now') WHERE source_hash=? AND source_lang=? AND target_lang=? AND mode=? AND model_id=? AND glossary_hash=?;";
         var stmt = try Stmt.prepare(self, sql);
         defer stmt.deinit();
-        try bindKey(&stmt, key, hash_text, gh);
+        try bindKey(&stmt, key, hash_text, &profile_hex);
         if (try stmt.step() != c.SQLITE_DONE) return errors.Error.SqliteFailed;
     }
 
@@ -189,8 +189,7 @@ pub const Db = struct {
         try text_contract.validate(translated);
         const hash_text = try sourceHash(self.allocator, key.source_text);
         defer self.allocator.free(hash_text);
-        const gh = try std.fmt.allocPrint(self.allocator, "{x}", .{key.glossary_hash});
-        defer self.allocator.free(gh);
+        const profile_hex = std.fmt.bytesToHex(key.profile_hash, .lower);
 
         const sql =
             \\INSERT INTO translations (source_hash, source_text, translated_text, source_lang, target_lang, mode, model_id, glossary_hash, created_at, updated_at, hit_count)
@@ -207,7 +206,7 @@ pub const Db = struct {
         try stmt.bindText(5, key.target_lang.asText());
         try stmt.bindText(6, key.mode.asText());
         try stmt.bindText(7, key.model_id);
-        try stmt.bindText(8, gh);
+        try stmt.bindText(8, &profile_hex);
         if (try stmt.step() != c.SQLITE_DONE) return errors.Error.SqliteFailed;
     }
 
@@ -226,13 +225,13 @@ pub const Db = struct {
     }
 };
 
-fn bindKey(stmt: *Stmt, key: Key, hash_text: []const u8, glossary_hash_text: []const u8) !void {
+fn bindKey(stmt: *Stmt, key: Key, hash_text: []const u8, profile_hex: []const u8) !void {
     try stmt.bindText(1, hash_text);
     try stmt.bindText(2, key.source_lang.asText());
     try stmt.bindText(3, key.target_lang.asText());
     try stmt.bindText(4, key.mode.asText());
     try stmt.bindText(5, key.model_id);
-    try stmt.bindText(6, glossary_hash_text);
+    try stmt.bindText(6, profile_hex);
 }
 
 pub fn open(allocator: std.mem.Allocator, path: []const u8) !Db {
@@ -315,7 +314,7 @@ test "sqlite memory stores hit" {
     defer std.testing.allocator.free(path);
     var db = try open(std.testing.allocator, path);
     defer db.close();
-    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 0 };
+    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .profile_hash = .{0} ** 32 };
     try std.testing.expect(try db.lookup(key) == null);
     try db.upsert(key, "こんにちは");
     const hit = (try db.lookup(key)).?;
@@ -343,7 +342,7 @@ test "sqlite stores with identical keys remain independent" {
     var right_db = try open(std.testing.allocator, right_path);
     defer right_db.close();
 
-    const key = Key{ .source_text = "same key", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 7 };
+    const key = Key{ .source_text = "same key", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .profile_hash = .{7} ** 32 };
     try std.testing.expect(try left_db.lookup(key) == null);
     try std.testing.expect(try right_db.lookup(key) == null);
     try left_db.upsert(key, "left value");
@@ -428,13 +427,12 @@ test "sqlite database teardown consumes ownership once" {
 fn hitCount(db: *Db, key: Key) !usize {
     const hash_text = try sourceHash(std.testing.allocator, key.source_text);
     defer std.testing.allocator.free(hash_text);
-    const gh = try std.fmt.allocPrint(std.testing.allocator, "{x}", .{key.glossary_hash});
-    defer std.testing.allocator.free(gh);
+    const profile_hex = std.fmt.bytesToHex(key.profile_hash, .lower);
 
     const sql = "SELECT hit_count FROM translations WHERE source_hash=? AND source_lang=? AND target_lang=? AND mode=? AND model_id=? AND glossary_hash=?;";
     var stmt = try Stmt.prepare(db, sql);
     defer stmt.deinit();
-    try bindKey(&stmt, key, hash_text, gh);
+    try bindKey(&stmt, key, hash_text, &profile_hex);
 
     if (try stmt.step() != c.SQLITE_ROW) return 0;
     return @intCast(c.sqlite3_column_int64(stmt.handle, 0));
@@ -450,7 +448,7 @@ test "sqlite upsert updates existing translation without duplicating rows" {
     var db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 0 };
+    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .profile_hash = .{0} ** 32 };
     try db.upsert(key, "こんにちは");
     try db.upsert(key, "やあ");
 
@@ -470,7 +468,7 @@ test "sqlite lookup bumps hit_count" {
     var db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .glossary_hash = 99 };
+    const key = Key{ .source_text = "Hello", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "m", .profile_hash = .{99} ** 32 };
     try db.upsert(key, "こんにちは");
     try std.testing.expectEqual(@as(usize, 0), try hitCount(&db, key));
 
@@ -543,7 +541,7 @@ const TestDatabaseFile = struct {
     }
 };
 
-const test_key = Key{ .source_text = "fixture", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "fixture", .glossary_hash = 0 };
+const test_key = Key{ .source_text = "fixture", .source_lang = .en, .target_lang = .ja, .mode = .default, .model_id = "fixture", .profile_hash = .{0} ** 32 };
 
 fn testStatement(db: *Db, sql: []const u8) !void {
     var stmt = try Stmt.prepare(db, sql);

@@ -91,6 +91,7 @@ commands_error() {
     models_schema_unsupported) message='models.toml uses an unsupported schema or version.' ;;
     io_error) message="$2" ;;
     model_missing) message='Configured model file does not exist.' ;;
+    checksum_failed) message='Model checksum verification failed.' ;;
     model_registry_invalid) message='Model registry entry is invalid.' ;;
     models_invalid) message='models.toml is invalid.' ;;
     model_not_selected) message='No model is selected. Run `kotoba models import --use` or `kotoba models pull --use`.' ;;
@@ -389,9 +390,9 @@ PY
 
 commands_strict61() {
   local target failure operation format value path
-  value=$'C:\\Users\\日本語\\quoted"#=model.gguf\n\t\r\b\f\001\177'
   for operation in set get; do
     matrix_case "strict61-config-roundtrip-$operation"
+    value="$CASE_ROOT/work/"$'C:\\Users\\日本語\\quoted"#=model.gguf\n\t\r\b\f\001\177'
     commands_fixture
     printf '%s' "$value" >"$CASE_DIR/value"
     python3 - <<'PY'
@@ -567,6 +568,49 @@ checksum = "unused"
 TOML
   matrix_run init --model-id remote --yes
   commands_streams 1 '' $'kotoba: init does not download models. Run `kotoba models pull ID --use` first, replacing ID with the model ID, or provide --model-path PATH.\nkotoba: model_missing: Configured model file does not exist.\n'
+  commands_unchanged
+
+  matrix_case commands-init-checksum-mismatch
+  commands_fixture
+  cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "mismatch"
+path = "$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+TOML
+  matrix_run init --model-id mismatch --yes
+  commands_error checksum_failed
+  commands_unchanged
+
+  matrix_case commands-init-relative-model
+  mkdir model-origin
+  printf 'relative model fixture\n' >model-origin/target.gguf
+  ln -s target.gguf model-origin/alias.gguf
+  matrix_setup init --model-id relative --model-path ./model-origin/alias.gguf --yes
+  cd model-origin
+  matrix_run translate Hello --from en --to ja --no-glossary
+  commands_streams 0 $'JA:Hello\n'
+  matrix_assert custom model-paths python3 - "$CASE_ROOT" "$XDG_CONFIG_HOME" <<'PYTHON'
+from pathlib import Path
+import sys
+import tomllib
+
+root, config_home = map(Path, sys.argv[1:])
+config = tomllib.loads((config_home / 'kotoba/config.toml').read_text())
+registry = tomllib.loads((config_home / 'kotoba/models.toml').read_text())
+expected = root / 'work/model-origin/alias.gguf'
+assert Path(config['model_path']) == expected and expected.is_symlink()
+assert next(Path(model['path']) for model in registry['models'] if model['id'] == 'relative') == expected
+PYTHON
+  matrix_finish
+
+  matrix_case commands-config-relative-model
+  commands_fixture
+  matrix_setup config set model_path relative.gguf
+  mkdir elsewhere
+  cd elsewhere
+  matrix_run config get model_path
+  commands_streams 0 "$CASE_ROOT/work/relative.gguf"$'\n'
   commands_unchanged
 
   expected=$'default_source_lang\ndefault_target_lang\ndefault_mode\ndefault_output\nmodel_id\nmodel_path\ngpu_layers\ncontext_length\nthreads\nmax_tokens\ntemperature\ntimeout_sec\nmemory_enabled\nglossary_enabled\nprivacy_mode\nlog_level\n'
@@ -746,6 +790,30 @@ PY
         commands_state '' config/kotoba/config.toml,config/kotoba/models.toml data/kotoba/models/fixture.gguf ;;
     esac
   done
+
+  matrix_case commands-models-pull-relative-output
+  commands_fixture
+  cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "relative-pull"
+download_url = "file://$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+TOML
+  matrix_setup models pull relative-pull --output ./pulled.gguf --use
+  mkdir elsewhere
+  cd elsewhere
+  matrix_run models verify relative-pull
+  commands_streams 0 $'verified relative-pull\n'
+  matrix_assert custom model-path python3 - "$CASE_ROOT" "$XDG_CONFIG_HOME" <<'PYTHON'
+from pathlib import Path
+import sys
+import tomllib
+
+root, config_home = map(Path, sys.argv[1:])
+config = tomllib.loads((config_home / 'kotoba/config.toml').read_text())
+assert Path(config['model_path']) == root / 'work/pulled.gguf'
+assert config['model_id'] == 'relative-pull'
+PYTHON
+  commands_unchanged
 
   matrix_case commands-models-remove-then-use-removed
   commands_fixture
@@ -1049,16 +1117,23 @@ PY
     else commands_error embedded_nul; fi
     commands_unchanged
   done
-  for variant in ready absent invalid-data; do
+  for variant in ready absent invalid-data oversized directory; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi
-    if [[ "$variant" == invalid-data ]]; then printf '[[terms]]\nmode = "bogus"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"; fi
+    case "$variant" in
+      invalid-data) printf '[[terms]]\nmode = "bogus"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+      oversized) truncate -s 1048577 "$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+      directory)
+        rm "$XDG_CONFIG_HOME/kotoba/glossary.toml"
+        mkdir "$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+    esac
     matrix_run glossary validate
-    if [[ "$variant" == invalid-data ]]; then commands_error glossary_invalid
-    else
-      # Zig std/hash/wyhash.zig seed=0, input="" test vector; never captured CLI output.
-      commands_streams 0 $'terms: 0\nhash: 409638ee2bde459\n'
-    fi
+    case "$variant" in
+      invalid-data) commands_error glossary_invalid ;;
+      oversized) commands_error io_error StreamTooLong ;;
+      directory) commands_error io_error IsDir ;;
+      *) commands_streams 0 $'terms: 0\nhash: 97a50f251a2c9ee4b6198d8cd4a2f58ba29d6edc12c0962588f0adb8d3dca7c1\n' ;;
+    esac
     commands_unchanged
   done
   for variant in status clear status-extra; do

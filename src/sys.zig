@@ -39,6 +39,15 @@ pub fn renameFile(src: []const u8, dest: []const u8) !void {
     try filesystem.renameFile(src, dest);
 }
 
+/// Anchor relative paths to the current directory while preserving symlinks
+/// and each path component's filesystem resolution semantics.
+pub fn absolutePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const base = try realPathAlloc(allocator, ".");
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, path });
+}
+
 pub fn realPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return cwd().realPathFileAlloc(io(), path, allocator);
 }

@@ -75,10 +75,13 @@ for state in (db_before, db_after):
     assert state["row_count"] == len(state["rows"])
 assert db_before["row_count"] == 1 and db_after["row_count"] == 1 + added_rows, "TM row delta"
 
-# Empty glossary hash is pinned from the baseline and the unchanged empty template.
+empty_glossary = hashlib.sha256(b"kotoba-glossary-v1\x00").digest()
+model = hashlib.sha256(b"synthetic file matrix model").digest()
+profile = hashlib.sha256(b"kotoba-tm-v1\x00" + model + empty_glossary + b"\x00").hexdigest()
+
 def expected_values(source):
     return [hashlib.sha256(source.encode()).hexdigest(), source, "JA:" + source,
-            "en", "ja", "default", "matrix-files", "409638ee2bde459"]
+            "en", "ja", "default", "matrix-files", profile]
 
 sentinel = db_before["rows"][0]
 assert sentinel[:8] == expected_values("files-sentinel") and sentinel[10] == 0
