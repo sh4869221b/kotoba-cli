@@ -109,7 +109,8 @@ from contextlib import closing
 
 
 def dump(path: Path, value) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    # Filesystem paths may contain surrogate-escaped bytes on Linux.
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="ascii")
 
 
 def digest(path: Path) -> str:
