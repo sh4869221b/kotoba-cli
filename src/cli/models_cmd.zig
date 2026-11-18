@@ -172,7 +172,11 @@ fn runPullWithAcquirer(
             _ = cursor.nextValue();
         } else return errors.Error.InvalidArguments;
     }
-    if (output_path.len > 0) try models.validateGgufPath(output_path);
+    if (output_path.len > 0) {
+        try models.validateGgufPath(output_path);
+        output_path = try sys.absolutePathAlloc(allocator, output_path);
+        try models.validateStoredPath(output_path);
+    }
     var m: models.Model = .{};
     var pull_owner: ?models.OwnedList = null;
     defer if (pull_owner) |*owner| owner.deinit();
@@ -221,7 +225,7 @@ fn runPullWithAcquirer(
         if (checksum.len > 0) m.checksum = checksum;
     }
     try models.validateGgufPath(output_path);
-    output_path = try sys.absolutePathAlloc(allocator, output_path);
+    if (!std.fs.path.isAbsolute(output_path)) output_path = try sys.absolutePathAlloc(allocator, output_path);
     m.path = output_path;
     var request_model = m;
     if (models.url.isRemote(m.download_url)) {
@@ -229,6 +233,7 @@ fn runPullWithAcquirer(
         m.source_url = try models.url.sourceIdentity(allocator, m.download_url);
     }
     m.download_url = models.url.reusableUrl(m.download_url);
+    try models.validateModel(m);
     try xdg.ensureDirs(paths);
     try models.ensure(paths.models_file);
     try acquirer(allocator, request_model, output_path, false);
@@ -246,9 +251,13 @@ fn runUse(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []const []co
     var list_owner = try models.load(allocator, paths.models_file);
     defer list_owner.deinit();
     const list = list_owner.view();
-    const m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
+    var m = models.find(list, cmd_args[0]) orelse return errors.Error.ModelRegistryInvalid;
+    const legacy_path = m.path.len > 0 and !std.fs.path.isAbsolute(m.path);
+    if (legacy_path) m.path = try sys.absolutePathAlloc(allocator, m.path);
+    try models.validateModel(m);
     try models.verifyModel(m);
     try xdg.ensureDirs(paths);
+    if (legacy_path) try models.upsert(allocator, paths.models_file, m);
     try selectModel(allocator, paths, m.id, m.path);
     try sys.stdoutPrint("using {s}\n", .{m.id});
     return 0;
@@ -299,10 +308,12 @@ fn runRemoveWithFileSystem(allocator: std.mem.Allocator, paths: xdg.Paths, cmd_a
     var remaining_owner = try reload(allocator, paths.models_file);
     defer remaining_owner.deinit();
     const remaining = remaining_owner.view();
-    if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, filesystem)) {
+    const removing_selected = std.mem.eql(u8, cfg.view().model_id, id);
+    const active_path = if (removing_selected) "" else cfg.view().model_path;
+    if (try canDeleteManagedModelPath(allocator, paths.models_dir, removed.path, remaining, active_path, filesystem)) {
         _ = try filesystem.removeFileIfExists(removed.path);
     }
-    if (std.mem.eql(u8, cfg.view().model_id, id)) {
+    if (removing_selected) {
         try cfg.setValue("model_id", "");
         try cfg.setValue("model_path", "");
         try config.save(paths.config_file, cfg.view());
@@ -316,7 +327,9 @@ fn validateCommandId(id: []const u8) !void {
     try models.validateId(id);
 }
 
-fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u8, path: []const u8, remaining: models.List, filesystem: *fs.FileSystem) !bool {
+fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u8, path: []const u8, remaining: models.List, active_path: []const u8, filesystem: *fs.FileSystem) !bool {
+    // There is no persisted base directory for an unselected legacy path.
+    if (!std.fs.path.isAbsolute(path)) return false;
     const real_models_dir = (try filesystem.realPathIfExistsAlloc(allocator, models_dir)) orelse return false;
     defer allocator.free(real_models_dir);
     const real_path = (try filesystem.realPathIfExistsAlloc(allocator, path)) orelse return false;
@@ -324,13 +337,19 @@ fn canDeleteManagedModelPath(allocator: std.mem.Allocator, models_dir: []const u
     if (real_path.len <= real_models_dir.len) return false;
     if (!std.mem.startsWith(u8, real_path, real_models_dir)) return false;
     if (real_path[real_models_dir.len] != std.fs.path.sep) return false;
+    if (try referencesModel(allocator, filesystem, active_path, real_path)) return false;
     for (remaining.models) |m| {
-        if (m.path.len == 0) continue;
-        const other_real_path = (try filesystem.realPathIfExistsAlloc(allocator, m.path)) orelse continue;
-        defer allocator.free(other_real_path);
-        if (std.mem.eql(u8, real_path, other_real_path)) return false;
+        if (try referencesModel(allocator, filesystem, m.path, real_path)) return false;
     }
     return true;
+}
+
+fn referencesModel(allocator: std.mem.Allocator, filesystem: *fs.FileSystem, path: []const u8, real_model: []const u8) !bool {
+    if (path.len == 0) return false;
+    if (!std.fs.path.isAbsolute(path)) return true;
+    const resolved = (try filesystem.realPathIfExistsAlloc(allocator, path)) orelse return false;
+    defer allocator.free(resolved);
+    return std.mem.eql(u8, real_model, resolved);
 }
 
 fn validateConfigLoad(allocator: std.mem.Allocator, path: []const u8) !void {

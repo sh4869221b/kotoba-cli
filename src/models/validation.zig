@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("../errors.zig");
+const strict = @import("../strict_toml.zig");
 
 pub fn validateId(id: []const u8) !void {
     if (id.len == 0) return errors.Error.InvalidArguments;
@@ -11,6 +12,10 @@ pub fn validateId(id: []const u8) !void {
 
 pub fn validateGgufPath(path: []const u8) !void {
     if (path.len == 0 or !std.mem.endsWith(u8, path, ".gguf")) return errors.Error.InvalidArguments;
+}
+
+pub fn validateStoredPath(path: []const u8) !void {
+    strict.validateString(path) catch return errors.Error.ModelsInvalid;
 }
 
 pub fn validateHfRfilename(path: []const u8) !void {

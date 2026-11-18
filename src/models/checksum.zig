@@ -28,8 +28,12 @@ pub fn verifySha256(path: []const u8, expected_hex: []const u8) !void {
 }
 
 pub fn contentSha256(path: []const u8) ![32]u8 {
-    var file = try openModel(path);
+    const file = try openModel(path);
     defer file.close(sys.io());
+    return hashFileSha256(file);
+}
+
+pub fn hashFileSha256(file: std.Io.File) ![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var buf: [64 * 1024]u8 = undefined;
     while (true) {

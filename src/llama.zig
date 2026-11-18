@@ -5,6 +5,7 @@ const sys = @import("sys.zig");
 
 const c = @cImport({
     @cInclude("llama.h");
+    @cInclude("gguf.h");
 });
 
 fn llamaLength(len: usize) !c_int {
@@ -76,6 +77,21 @@ const DiagnosticsGuard = struct {
         applyDiagnosticsMode(self.previous);
     }
 };
+
+/// Read only GGUF metadata before the Translation Memory lookup.
+pub fn requireSingleFile(path: [*:0]const u8, diagnostics_enabled: bool) !void {
+    var guard = DiagnosticsGuard.init(diagnostics_enabled);
+    defer guard.deinit();
+    const metadata = c.gguf_init_from_file(path, .{ .no_alloc = true, .ctx = null }) orelse
+        return errors.Error.ModelLoadFailed;
+    defer c.gguf_free(metadata);
+    for ([_][*:0]const u8{ "split.count", "split.no" }, [_]u16{ 1, 0 }) |key, maximum| {
+        const index = c.gguf_find_key(metadata, key);
+        if (index < 0) continue;
+        if (c.gguf_get_kv_type(metadata, index) != c.GGUF_TYPE_UINT16 or c.gguf_get_val_u16(metadata, index) > maximum)
+            return errors.Error.SplitModelUnsupported;
+    }
+}
 
 const Model = struct {
     ptr: *c.llama_model,

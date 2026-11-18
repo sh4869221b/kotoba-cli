@@ -102,7 +102,7 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
 
     const frontmatter_end = frontMatterEnd(text);
     var fence: ?Fence = null;
-    var table: enum { outside, delimiter, body } = .outside;
+    var table: ?Table = null;
     var start: usize = 0;
     while (start < text.len) {
         const line = lineAt(text, start);
@@ -114,26 +114,13 @@ pub fn protect(allocator: std.mem.Allocator, text: []const u8) !Document {
                 if (close.marker == open.marker and close.len >= open.len and close.rest.len == 0) fence = null;
             }
         } else if (openingFence(line.body)) |open| {
-            table = .outside;
+            table = null;
             fence = open;
             try protection.add(line.body);
-        } else if (table == .delimiter) {
-            table = .body;
+        } else if (isTableLine(text, line.body, line.next, &table)) {
             try protection.add(line.body);
         } else {
-            const cells = tableCells(line.body, false);
-            if (cells == null) {
-                table = .outside;
-            } else if (table == .outside and line.next < text.len and
-                tableCells(lineAt(text, line.next).body, true) == cells)
-            {
-                table = .delimiter;
-            }
-            if (table != .outside) {
-                try protection.add(line.body);
-            } else {
-                try protectInline(&protection, line.body);
-            }
+            try protectInline(&protection, line.body);
         }
         try protection.text.appendSlice(text[start + line.body.len .. line.next]);
         start = line.next;
@@ -156,7 +143,7 @@ fn frontMatterEnd(text: []const u8) usize {
     var pos = first.next;
     while (pos < text.len) {
         const line = lineAt(text, pos);
-        if (std.mem.eql(u8, line.body, "---")) return line.next;
+        if (std.mem.eql(u8, line.body, "---") or std.mem.eql(u8, line.body, "...")) return line.next;
         pos = line.next;
     }
     return 0;
@@ -193,6 +180,66 @@ fn codeSpanEnd(line: []const u8, start: usize, open_end: usize) ?usize {
         if (pos - tick == open_end - start) return pos;
     }
     return null;
+}
+
+const Table = struct { depth: usize, delimiter_pending: bool = true };
+
+const QuotedLine = struct { text: []const u8, depth: usize = 0 };
+
+fn quotedLine(line: []const u8) QuotedLine {
+    var result: QuotedLine = .{ .text = line };
+    while (true) {
+        const trimmed = std.mem.trimStart(u8, result.text, " ");
+        if (result.text.len - trimmed.len > 3 or !std.mem.startsWith(u8, trimmed, ">")) return result;
+        result.depth += 1;
+        result.text = if (trimmed.len > 1 and trimmed[1] == ' ') trimmed[2..] else trimmed[1..];
+    }
+}
+
+fn isTableLine(text: []const u8, body: []const u8, next: usize, table: *?Table) bool {
+    const current = quotedLine(body);
+    if (table.*) |*active| {
+        if (active.depth == current.depth) {
+            if (active.delimiter_pending) {
+                active.delimiter_pending = false;
+                return true;
+            }
+            if (!startsTableEndingBlock(current.text)) return true;
+        }
+        table.* = null;
+    }
+    if (next == text.len or startsTableEndingBlock(current.text)) return false;
+    const cells = tableCells(current.text, false) orelse return false;
+    const delimiter = quotedLine(lineAt(text, next).body);
+    if (delimiter.depth != current.depth or tableCells(delimiter.text, true) != cells) return false;
+    table.* = .{ .depth = current.depth };
+    return true;
+}
+
+fn startsTableEndingBlock(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0 or openingFence(line) != null) return true;
+    const first = trimmed[0];
+    const rest = trimmed[1..];
+    if (first == '<' and rest.len > 0 and
+        (std.ascii.isAlphabetic(rest[0]) or rest[0] == '!' or rest[0] == '/' or rest[0] == '?')) return true;
+    if (first == '#') {
+        const end = runEnd(trimmed, 0);
+        if (end <= 6 and (end == trimmed.len or std.ascii.isWhitespace(trimmed[end]))) return true;
+    }
+    if (std.mem.indexOfScalar(u8, "*+-", first) != null and
+        (rest.len == 0 or std.ascii.isWhitespace(rest[0]))) return true;
+    if (std.mem.indexOfScalar(u8, "-_*", first) != null) {
+        var markers: usize = 0;
+        for (trimmed) |ch| {
+            if (ch == first) markers += 1 else if (ch != ' ' and ch != '\t') break;
+        } else if (markers >= 3) return true;
+    }
+    var digits: usize = 0;
+    while (digits < trimmed.len and std.ascii.isDigit(trimmed[digits])) : (digits += 1) {}
+    return digits > 0 and digits <= 9 and digits < trimmed.len and
+        (trimmed[digits] == '.' or trimmed[digits] == ')') and
+        (digits + 1 == trimmed.len or std.ascii.isWhitespace(trimmed[digits + 1]));
 }
 
 /// Count cells separated by unescaped pipes outside matched inline code.
@@ -485,4 +532,14 @@ test "Markdown tables require a header and an aligned delimiter row" {
     };
     try std.testing.expectEqual(expected.len, doc.protected.len);
     for (expected, doc.protected) |original, actual| try std.testing.expectEqualStrings(original, actual);
+}
+
+test "quoted tables keep single-cell rows and stop at a new block or quote depth" {
+    const allocator = std.testing.allocator;
+    const source = "> > | One | Two |\r\n> > | --- | --- |\r\n> > Cell\r\n> > # Heading\r\n> Outside\r\n";
+    const doc = try protect(allocator, source);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), doc.protected.len);
+    try std.testing.expectEqualStrings("> > Cell", doc.protected[2]);
+    try std.testing.expect(std.mem.endsWith(u8, doc.text, "\r\n> > # Heading\r\n> Outside\r\n"));
 }

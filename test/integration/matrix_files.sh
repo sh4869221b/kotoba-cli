@@ -75,9 +75,10 @@ for state in (db_before, db_after):
     assert state["row_count"] == len(state["rows"])
 assert db_before["row_count"] == 1 and db_after["row_count"] == 1 + added_rows, "TM row delta"
 
+import struct
 empty_glossary = hashlib.sha256(b"kotoba-glossary-v1\x00").digest()
 model = hashlib.sha256(b"synthetic file matrix model").digest()
-profile = hashlib.sha256(b"kotoba-tm-v1\x00" + model + empty_glossary + b"\x00").hexdigest()
+profile = hashlib.sha256(b"kotoba-tm-v2\x00\x00\x00\x01" + model + empty_glossary + struct.pack(">IIf", 1024, 4096, 0.2)).hexdigest()
 
 def expected_values(source):
     return [hashlib.sha256(source.encode()).hexdigest(), source, "JA:" + source,

@@ -92,11 +92,20 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
 
     const cache_enabled = cfg.memory_enabled and !opts.no_memory;
     const total_segments = countTranslatable(segments);
-    const profile_hash = if (cache_enabled and total_segments > 0)
-        cacheFingerprint(try models.contentSha256(cfg.model_path), glossary.fingerprint(g), read_kind)
+    const diagnostics_enabled = diagnosticsEnabled(cfg, opts);
+    const model_input = if (cache_enabled and total_segments > 0)
+        try models.CacheInput.open(cfg.model_path, diagnostics_enabled)
     else
-        [_]u8{0} ** 32;
-    var db_opt: ?memory.Db = if (cache_enabled) try memory.open(session_allocator, paths.memory_file) else null;
+        null;
+    defer if (model_input) |input_model| input_model.close();
+
+    var model_path_buffer: [64]u8 = undefined;
+    var inference_cfg = cfg;
+    const profile_hash = if (model_input) |input_model| blk: {
+        inference_cfg.model_path = input_model.path(&model_path_buffer);
+        break :blk cacheFingerprint(input_model.identity, glossary.fingerprint(g), read_kind, cfg);
+    } else [_]u8{0} ** 32;
+    var db_opt: ?memory.Db = if (model_input != null) try memory.open(session_allocator, paths.memory_file) else null;
     defer if (db_opt) |*db| db.close();
     const translation = try translateSegmentsWithAllocators(result_allocator, scratch_allocator, session_allocator, segments, .{
         .source_lang = pair.source,
@@ -106,8 +115,8 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
         .profile_hash = profile_hash,
         .glossary = g,
         .db_opt = if (db_opt) |*db| db else null,
-        .cfg = cfg,
-        .diagnostics_enabled = diagnosticsEnabled(cfg, opts),
+        .cfg = inference_cfg,
+        .diagnostics_enabled = diagnostics_enabled,
     });
 
     var final_text = translation.translated_text;
@@ -134,12 +143,17 @@ fn runWithAllocators(result_allocator: std.mem.Allocator, scratch_allocator: std
     });
 }
 
-fn cacheFingerprint(model_hash: [32]u8, glossary_hash: [32]u8, read_kind: input.InputKind) [32]u8 {
+fn cacheFingerprint(model: models.CacheInput.Identity, glossary_hash: [32]u8, read_kind: input.InputKind, cfg: config.Config) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("kotoba-tm-v1\x00");
-    hasher.update(&model_hash);
+    hasher.update("kotoba-tm-v2\x00");
+    hasher.update(&.{ @intFromEnum(model.kind), @intFromBool(read_kind == .markdown), @intFromBool(@import("build_options").test_backend) });
+    hasher.update(&model.digest);
     hasher.update(&glossary_hash);
-    hasher.update(&.{@intFromBool(read_kind == .markdown)});
+    var generation: [12]u8 = undefined;
+    std.mem.writeInt(u32, generation[0..4], cfg.max_tokens, .big);
+    std.mem.writeInt(u32, generation[4..8], cfg.context_length, .big);
+    std.mem.writeInt(u32, generation[8..12], @bitCast(cfg.temperature), .big);
+    hasher.update(&generation);
     return hasher.finalResult();
 }
 

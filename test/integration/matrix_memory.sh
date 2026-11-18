@@ -188,8 +188,9 @@ matrix_memory() {
   local -a flags
   matrix_memory_text_contract
   matrix_memory_legacy_key
+  matrix_memory_unsafe_models
   matrix_memory_broken_stdout_pipe
-  for id in tm-miss tm-full-hit tm-partial-hit tm-model-replaced tm-disabled-flag tm-disabled-config \
+  for id in tm-miss tm-full-hit tm-partial-hit tm-model-replaced tm-max-tokens tm-disabled-flag tm-disabled-config \
     tm-directory-open-failure tm-corrupt-open-failure tm-statement-failure \
     glossary-prefer glossary-protect glossary-hash-change glossary-field-boundary glossary-disabled-flag glossary-disabled-config \
     glossary-empty-key-reuse glossary-empty-key-reuse-config glossary-invalid-before-tm glossary-invalid-before-tm-absent; do
@@ -223,6 +224,11 @@ matrix_memory() {
         touch -r "$CASE_DIR/previous-model" "$CASE_ROOT/model.gguf"
         before='[["Matrix cache alpha",0,"empty"]]'
         after='[["Matrix cache alpha",0,"empty"],["Matrix cache alpha",0,"new-model"]]' ;;
+      tm-max-tokens)
+        matrix_memory_prime "$source"
+        matrix_setup config set max_tokens 1
+        before='[["Matrix cache alpha",0,"empty"]]'
+        after='[["Matrix cache alpha",0,"empty"],["Matrix cache alpha",0,"new-limit"]]' ;;
       glossary-field-boundary)
         printf '[[terms]]\nsource = "ab"\ntarget = "c"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml"
         matrix_memory_prime "$source"
@@ -301,6 +307,33 @@ PYTHON
   matrix_finish
 }
 
+matrix_memory_unsafe_models() {
+  matrix_memory_fixture tm-large-mutable-model-bypasses-db sentinel
+  truncate -s 134217729 "$CASE_ROOT/model.gguf"
+  matrix_run translate Hello --from en --to ja --format json
+  matrix_memory_success 'JA:Hello' none
+  matrix_memory_preserved
+  matrix_finish
+
+  matrix_memory_fixture tm-split-model-before-db sentinel
+  python3 - "$CASE_ROOT/model.gguf" <<'PYTHON'
+from pathlib import Path
+import struct, sys
+path = Path(sys.argv[1])
+key = b'split.count'
+data = b'GGUF' + struct.pack('<IQQQ', 3, 0, 1, len(key)) + key + struct.pack('<IH', 2, 2)
+path.write_bytes(data.ljust(64, b'\0'))
+PYTHON
+  matrix_run translate Hello --from en --to ja --format json
+  printf '%s\n' '{"error":{"code":"split_model_unsupported","message":"Split GGUF models are not supported by this command yet. Use a single-file GGUF model."}}' >"$CASE_DIR/expected.stdout"
+  matrix_assert status 1
+  matrix_assert stdout "$CASE_DIR/expected.stdout"
+  matrix_assert stderr "$CASE_DIR/empty"
+  matrix_assert json error
+  matrix_memory_preserved
+  matrix_finish
+}
+
 matrix_memory_raw_snapshot() {
   python3 - "$CASE_DB" "$CASE_DIR/raw-$1.json" <<'PY'
 from contextlib import closing
@@ -374,9 +407,10 @@ assert before['row_count'] == 1
 row = dict(zip(before['columns'], before['rows'][0], strict=True))
 payload = {'utf8': b'A\xffB', 'nul': b'A\x00B'}[defect]
 source, output = (payload, b'JA:Hello') if field == 'source' else (b'Hello', payload)
+import struct
 empty_glossary = hashlib.sha256(b'kotoba-glossary-v1\x00').digest()
 model = hashlib.sha256(b'synthetic matrix model\n').digest()
-profile = hashlib.sha256(b'kotoba-tm-v1\x00' + model + empty_glossary + b'\x00').hexdigest()
+profile = hashlib.sha256(b'kotoba-tm-v2\x00\x00\x00\x01' + model + empty_glossary + struct.pack('>IIf', 1024, 4096, 0.2)).hexdigest()
 assert row == dict(source_hash=hashlib.sha256(b'Hello').hexdigest(), source_hex=source.hex().upper(),
     source_bytes=len(source), translated_hex=output.hex().upper(), translated_bytes=len(output),
     source_lang='en', target_lang='ja', mode='default', model_id='matrix-memory',

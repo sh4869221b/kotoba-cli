@@ -815,6 +815,59 @@ assert config['model_id'] == 'relative-pull'
 PYTHON
   commands_unchanged
 
+  for selector in use init active-config; do
+    matrix_case "commands-models-remove-active-alias-$selector"
+    commands_fixture
+    cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<'TOML'
+[[models]]
+id = "legacy"
+path = "fixture.gguf"
+TOML
+    cd "$XDG_DATA_HOME/kotoba/models"
+    case "$selector" in
+      init) matrix_setup init --model-id legacy --yes ;;
+      use) matrix_setup models use legacy ;;
+      active-config)
+        matrix_setup models use legacy
+        # The active configuration is also an independent reference.
+        sed -i '/^id = "legacy"$/,$ s|^path = .*|path = ""|' "$XDG_CONFIG_HOME/kotoba/models.toml" ;;
+    esac
+    cd "$CASE_ROOT/work"
+    matrix_run models remove fixture --yes
+    commands_streams 0 $'removed fixture\n'
+    matrix_assert custom selected-model python3 - "$CASE_ROOT" "$selector" <<'PYTHON'
+from pathlib import Path
+import sys
+import tomllib
+
+root, selector = Path(sys.argv[1]), sys.argv[2]
+config_dir = root / 'config/kotoba'
+model = root / 'data/kotoba/models/fixture.gguf'
+cfg = tomllib.loads((config_dir / 'config.toml').read_text())
+models = tomllib.loads((config_dir / 'models.toml').read_text())['models']
+assert model.read_bytes() == b'synthetic command matrix model\n'
+assert cfg['model_id'] == 'legacy' and Path(cfg['model_path']) == model
+assert [m['id'] for m in models] == ['legacy']
+assert models[0]['path'] == ('' if selector == 'active-config' else str(model))
+PYTHON
+    commands_state '' config/kotoba/models.toml ''
+  done
+
+  matrix_case commands-models-pull-unpersistable-output
+  commands_fixture
+  cat >>"$XDG_CONFIG_HOME/kotoba/models.toml" <<TOML
+[[models]]
+id = "local-pull"
+download_url = "file://$XDG_DATA_HOME/kotoba/models/fixture.gguf"
+TOML
+  local invalid_cwd=$'unpersistable-\377'
+  mkdir "$invalid_cwd"
+  cd "$invalid_cwd"
+  printf 'existing destination\n' >target.gguf
+  matrix_run models pull local-pull --output ./target.gguf --use
+  commands_error models_invalid
+  commands_unchanged
+
   matrix_case commands-models-remove-then-use-removed
   commands_fixture
   matrix_setup models remove fixture --yes
@@ -1117,11 +1170,12 @@ PY
     else commands_error embedded_nul; fi
     commands_unchanged
   done
-  for variant in ready absent invalid-data oversized directory; do
+  for variant in ready absent invalid-data invalid-header oversized directory; do
     matrix_case "commands-glossary-$variant"
     if [[ "$variant" != absent ]]; then commands_fixture; fi
     case "$variant" in
       invalid-data) printf '[[terms]]\nmode = "bogus"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
+      invalid-header) printf '[[terms]\nsource = "CLI"\n' >"$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
       oversized) truncate -s 1048577 "$XDG_CONFIG_HOME/kotoba/glossary.toml" ;;
       directory)
         rm "$XDG_CONFIG_HOME/kotoba/glossary.toml"
@@ -1129,7 +1183,7 @@ PY
     esac
     matrix_run glossary validate
     case "$variant" in
-      invalid-data) commands_error glossary_invalid ;;
+      invalid-data|invalid-header) commands_error glossary_invalid ;;
       oversized) commands_error io_error StreamTooLong ;;
       directory) commands_error io_error IsDir ;;
       *) commands_streams 0 $'terms: 0\nhash: 97a50f251a2c9ee4b6198d8cd4a2f58ba29d6edc12c0962588f0adb8d3dca7c1\n' ;;

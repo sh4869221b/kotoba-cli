@@ -271,12 +271,17 @@ fn validateModels(allocator: std.mem.Allocator, list: List) !void {
     var ids = std.StringHashMap(void).init(allocator);
     defer ids.deinit();
     for (list.models) |m| {
-        try validation.validateId(m.id);
+        try validateModel(m);
         const entry = try ids.getOrPut(m.id);
         if (entry.found_existing) return error.Invalid;
-        inline for (std.meta.fields(Model)) |field| {
-            if (field.type == []const u8) try strict.validateString(@field(m, field.name));
-        }
+    }
+}
+
+/// Check fields that must be serializable before an acquisition changes files.
+pub fn validateModel(m: Model) !void {
+    try validation.validateId(m.id);
+    inline for (std.meta.fields(Model)) |field| {
+        if (field.type == []const u8) strict.validateString(@field(m, field.name)) catch return errors.Error.ModelsInvalid;
     }
 }
 

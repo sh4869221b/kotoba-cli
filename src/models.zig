@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const cache_input = @import("models/cache_input.zig");
 const checksum_module = @import("models/checksum.zig");
 const huggingface = @import("models/huggingface.zig");
 const install = @import("models/install.zig");
@@ -19,11 +20,13 @@ pub const parse = registry.parse;
 pub const find = registry.find;
 pub const installedPath = registry.installedPath;
 pub const upsert = registry.upsert;
+pub const validateModel = registry.validateModel;
 pub const removeById = registry.removeById;
 pub const save = registry.save;
 
 pub const validateId = validation.validateId;
 pub const validateGgufPath = validation.validateGgufPath;
+pub const validateStoredPath = validation.validateStoredPath;
 pub const validateSingleHfGgufFilename = validation.validateSingleHfGgufFilename;
 
 pub const verifyModel = checksum_module.verifyModel;
@@ -36,9 +39,10 @@ pub const hfDownloadUrl = huggingface.hfDownloadUrl;
 pub const resolveHfFile = huggingface.resolveHfFile;
 
 pub const verifySha256 = checksum_module.verifySha256;
-pub const contentSha256 = checksum_module.contentSha256;
+pub const CacheInput = cache_input.CacheInput;
 
 test {
+    _ = cache_input;
     _ = checksum_module;
     _ = huggingface;
     _ = install;

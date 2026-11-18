@@ -20,7 +20,7 @@ pub fn splitParagraphs(allocator: std.mem.Allocator, text: []const u8, token_pre
         }
         var end = i + first;
         while (true) {
-            const next = newlineLength(text[end..]);
+            const next = blankLineLength(text[end..]);
             if (next == 0) break;
             end += next;
         }
@@ -39,6 +39,12 @@ pub fn splitParagraphs(allocator: std.mem.Allocator, text: []const u8, token_pre
     if (start < text.len) try appendSegment(&list, text[start..], token_prefix);
     if (list.items.len == 0) try list.append(.{ .text = text });
     return list.toOwnedSlice();
+}
+
+fn blankLineLength(text: []const u8) usize {
+    const eol = std.mem.trimStart(u8, text, " \t");
+    const ending = newlineLength(eol);
+    return if (ending == 0) 0 else text.len - eol.len + ending;
 }
 
 fn newlineLength(text: []const u8) usize {
@@ -72,7 +78,7 @@ fn isProtectedOnly(text: []const u8, prefix: []const u8) bool {
 }
 
 test "paragraph split preserves LF CRLF and mixed separators" {
-    for ([_][]const u8{ "\n\n", "\r\n\r\n", "\r\n\n\r\n" }) |separator| {
+    for ([_][]const u8{ "\n\n", "\r\n\r\n", "\r\n\n\r\n", "\r\n \t\r\n" }) |separator| {
         const text = try std.fmt.allocPrint(std.testing.allocator, "a{s}b", .{separator});
         defer std.testing.allocator.free(text);
         const segments = try splitParagraphs(std.testing.allocator, text, null);

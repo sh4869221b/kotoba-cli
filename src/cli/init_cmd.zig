@@ -51,6 +51,12 @@ pub fn run(original_allocator: std.mem.Allocator, paths: xdg.Paths, cmd_args: []
                 return err;
             };
             model_path = try sys.absolutePathAlloc(allocator, m.path);
+            if (!std.fs.path.isAbsolute(m.path)) {
+                var anchored = m;
+                anchored.path = model_path;
+                try models.validateModel(anchored);
+                selected_registry_model = anchored;
+            }
         } else return errors.Error.InvalidArguments;
     }
     if (explicit_model_path) {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const sys = @import("sys.zig");
+const strict = @import("strict_toml.zig");
 const toml = @import("toml.zig");
 const text = @import("text.zig");
 
@@ -93,21 +94,23 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !OwnedGlossary {
     }
     var current: ?Term = null;
     errdefer if (current) |term| freeTerm(allocator, term);
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        const clean = toml.trim(toml.stripComment(line));
-        if (std.mem.eql(u8, clean, "[[terms]]")) {
-            if (current) |t| {
-                try terms.append(t);
-                current = null;
-            }
-            current = try termDefaults(allocator);
-            continue;
-        }
-        const p = toml.pair(line) orelse continue;
-        if (current == null) continue;
+    var reader: strict.Reader = .{ .data = data };
+    while (reader.next() catch return errors.Error.GlossaryInvalid) |line| {
+        const p = switch (line) {
+            .header => |header| {
+                if (!header.array or !std.mem.eql(u8, header.name, "terms")) return errors.Error.GlossaryInvalid;
+                if (current) |t| {
+                    try terms.append(t);
+                    current = null;
+                }
+                current = try termDefaults(allocator);
+                continue;
+            },
+            .pair => |pair| pair,
+        };
+        if (current == null) return errors.Error.GlossaryInvalid;
         const t = &current.?;
-        const val = toml.unquote(p.value);
+        const val = toml.unquote(toml.trim(toml.stripComment(p.value)));
         if (std.mem.eql(u8, p.key, "source")) try replaceString(allocator, &t.source, val) else if (std.mem.eql(u8, p.key, "target")) try replaceString(allocator, &t.target, val) else if (std.mem.eql(u8, p.key, "mode")) {
             if (std.mem.eql(u8, val, "prefer")) t.mode = .prefer else if (std.mem.eql(u8, val, "protect")) t.mode = .protect else return errors.Error.GlossaryInvalid;
         } else if (std.mem.eql(u8, p.key, "comment")) try replaceString(allocator, &t.comment, val);
@@ -315,4 +318,16 @@ test "glossary load allows absence and propagates read errors" {
     if (sys.cwd().access(sys.io(), path, .{ .read = true })) |_| {} else |err| {
         try std.testing.expectError(err, load(a, path));
     }
+}
+
+test "glossary validates array headers and allows spacing and comments" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "[[terms]", "[terms]", "[[term]]", "[[terms]] stray", "terms]]" }) |header| {
+        const malformed = try std.fmt.allocPrint(allocator, "{s}\nsource = 'CLI'\n", .{header});
+        defer allocator.free(malformed);
+        try std.testing.expectError(errors.Error.GlossaryInvalid, parse(allocator, malformed));
+    }
+    var glossary = try parse(allocator, " [[ terms ]] # term\r\nsource = \"CLI\" # kept\r\n");
+    defer glossary.deinit();
+    try std.testing.expectEqualStrings("CLI", glossary.view().terms[0].source);
 }

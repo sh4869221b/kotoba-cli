@@ -39,9 +39,11 @@ verification succeed.
 When the registry supplies a SHA-256 checksum, `init` verifies it before
 selecting that model. Model paths supplied to `init`, `models pull --output`,
 and `config set model_path` are anchored to the working directory when saved.
-Symlinks are preserved, so a symlink can follow a model update. If an older
-config already contains a relative path, reselect the model from the directory
-where that path resolves.
+Symlinks are preserved, so a symlink can follow a model update. Reselect an older
+relative registry path from the directory where it resolves to turn it into an
+absolute reference. Physical removal protects files still referenced by the
+active configuration or another registry entry. An unresolved relative registry
+entry can prevent physical removal until its path is resolved.
 
 ### Model URL privacy and migration
 
@@ -368,18 +370,25 @@ If `KOTOBA_CUDA_MODEL` or `nvidia-smi` is unavailable, the CUDA smoke script
 prints a skip message and exits successfully.
 
 Markdown translation protects code spans, backtick and tilde code fences,
-URLs, YAML front matter, and tables with a header and delimiter row. Tables
-are kept verbatim. Escaped pipes in prose stay in the translation input.
-Blank lines split paragraphs and keep their original LF or CRLF bytes.
+URLs, YAML front matter closed by `---` or `...`, and tables with a header
+and delimiter row. Tables stay verbatim, including quoted tables and body
+rows with missing cells. Escaped pipes in prose stay in the translation
+input. Blank lines, including lines containing only spaces or tabs, split
+paragraphs and retain their original LF or CRLF bytes.
 
 `kotoba glossary validate` prints a SHA-256 fingerprint of the glossary
 fields sent to the model. An absent glossary is treated as empty. Read and
 parse errors in an existing glossary fail validation and translation.
 
-Translation Memory keys include the SHA-256 of the selected model file,
-the glossary fingerprint, and the input format. With memory enabled,
-Kotoba reads the model file before the first cache lookup. Existing rows
-using the old cache key remain in the database and will miss lookups.
+Translation Memory keys include an immutable model identity, the glossary
+fingerprint, the input format, and generation settings such as `max_tokens`.
+On Linux, a SHA-256 fs-verity file uses its kernel-provided digest without
+hashing the full model. Other files up to 128 MiB can use a sealed in-memory
+copy. The key and llama.cpp load refer to the same open immutable file.
+If an immutable input is unavailable, translation proceeds without accessing
+Translation Memory. Split GGUF names and split metadata are rejected on the
+cache path. Existing rows remain in the database and miss lookups under the
+new key.
 
 Configuration follows XDG paths:
 
